@@ -55,6 +55,30 @@ function _terminate_all()
 end
 
 """
+Run `f()` with a virtual display when there is none on Linux and Xvfb is installed, so that
+workers can load packages that open windows when they load, such as GLMakie.
+"""
+function with_display(f)
+    Sys.islinux() && isempty(get(ENV, "DISPLAY", "")) || return f()
+    xvfb = Sys.which("Xvfb")
+    xvfb === nothing && return f()
+    output = Pipe()
+    server = run(pipeline(Cmd(`$xvfb -displayfd 1 -nolisten tcp -screen 0 1280x1024x24`; detach=true);
+                          stdin=devnull, stdout=output, stderr=devnull); wait=false)
+    close(output.in)
+    try
+        # Xvfb writes its display number once it accepts connections.
+        number = Ref("")
+        reader = @async number[] = readline(output)
+        timedwait(() -> istaskdone(reader), 30.0; pollint=0.05)
+        isempty(number[]) && return f()
+        return withenv(f, "DISPLAY" => ":" * number[])
+    finally
+        process_exited(server) || kill(server)
+    end
+end
+
+"""
 The worker Julia command. Workers use Julia's default code generation flags, whatever this
 process runs with (`--check-bounds=yes` under `Pkg.test`, say), so they share the package
 images of ordinary sessions and analyze code as it normally runs. With `compile=false` a

@@ -173,6 +173,14 @@ end
     end
 end
 
+@testset "Workers get a virtual display when there is none" begin
+    if Sys.islinux() && Sys.which("Xvfb") !== nothing
+        display = withenv(() -> JETSweep.with_display(() -> ENV["DISPLAY"]), "DISPLAY" => nothing)
+        @test occursin(r"^:\d+$", display)
+        @test withenv(() -> JETSweep.with_display(() -> ENV["DISPLAY"]), "DISPLAY" => ":7") == ":7"
+    end
+end
+
 @testset "Worker Julia command" begin
     command = withenv("JULIA_PROJECT" => "/elsewhere", "JULIA_LOAD_PATH" => "/elsewhere",
                       "OMP_NUM_THREADS" => "8", "JETSWEEP_EXECUTION_MARK" => "inherited") do
@@ -398,7 +406,7 @@ function execution_sweep(unit, root, output)
     includes = [dynamic; [JETSweep.Include(file, 1, true) for file in unit.expected if file != unit.entry]]
     syntax = Dict(unit.entry => JETSweep.Syntax(includes, String[]))
     return JETSweep._Sweep(inventory, output, SweepOptions(), syntax, Dict{String,JETSweep.Unit}(),
-                           Dict{String,Vector{String}}(), Dict{String,Vector{String}}())
+                           Dict{String,Vector{String}}(), Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
 end
 
 "Write `unit`'s JETLS configuration; returns the root its paths are relative to and the configuration."
@@ -602,7 +610,7 @@ end
         inventory = discover(root)
         sweep = JETSweep._Sweep(inventory, root, SweepOptions(), JETSweep.source_syntax(inventory),
                                 Dict{String,JETSweep.Unit}(), Dict{String,Vector{String}}(),
-                                Dict{String,Vector{String}}())
+                                Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
         analyzed(files...) = JETSweep.UnitResult("unit", :incomplete, JETSweep.Finding[], [realpath.(files)...],
                                                  String[], String[], 0.0, "")
         # An extension's orphans load in its context and module, with its run-time settings.
@@ -624,7 +632,7 @@ end
         sub = execution_touch(joinpath(root, "Scoped", "src", "sub.jl"))
         scoped_sweep = JETSweep._Sweep(sweep.inventory, root, SweepOptions(),
                                        Dict(scoped => JETSweep.parse_source(scoped)), Dict{String,JETSweep.Unit}(),
-                                       Dict{String,Vector{String}}(), Dict{String,Vector{String}}())
+                                       Dict{String,Vector{String}}(), Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
         scoped_unit = JETSweep.Unit("package-scoped", :package, scoped, context, [scoped, sub], "", "",
                                     JETSweep.Overrides(), String[])
         @test isempty(JETSweep._followups(scoped_unit, analyzed(scoped), scoped_sweep, Set([scoped])))

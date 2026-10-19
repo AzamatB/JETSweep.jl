@@ -132,7 +132,8 @@ the latest report in `DIRECTORY/.jetsweep` if the same JETSweep version wrote it
 estimated from source size, and assigns GPUs round-robin. Each analysis takes one of the
 `--jobs` slots: package analyses run on `--threads` threads, but use little more than one core
 on average. Workers run with Julia's default code generation flags, so they share the
-package images of ordinary sessions. Analysis is static, but it loads packages and runs their
+package images of ordinary sessions. On Linux without a display, they share a virtual one
+when Xvfb is installed, so packages that open windows when they load, such as GLMakie, load. Analysis is static, but it loads packages and runs their
 initialization, macros and generated functions, and the code JETLS evaluates to analyze
 scripts: use JETSweep only on code you trust.
 

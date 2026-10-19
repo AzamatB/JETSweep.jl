@@ -553,6 +553,29 @@ end
 const _TEST_MACROS = Set(["@test", "@test_broken", "@test_skip", "@test_throws", "@test_logs", "@test_warn",
                           "@test_nowarn", "@test_deprecated", "@inferred"])
 
+const _OUTLINABLE = (:call, :ref, :., :parameters, :kw, :..., :block, :&&, :||, :if, :comparison, :tuple, :vect,
+                     :vcat, :hcat, :ncat, :typed_vcat, :typed_hcat, :typed_ncat, :row, :nrow, :string, :curly, :(::),
+                     :where)
+
+_anonymous(ex) = ex isa Expr && (ex.head in (:->, :generator, :flatten, :comprehension, :typed_comprehension) ||
+    (ex.head === :function && first(ex.args) isa Expr && first(ex.args).head === :tuple))
+
+"Whether `ex` includes or evaluates code: `include`, `include_string` or `eval`."
+_runs_code(ex) = ex isa Expr && ((ex.head === :call && _name(first(ex.args)) in ("include", "include_string", "eval")) ||
+    _macro_name(ex) == "@eval" || any(_runs_code, ex.args))
+
+"""
+Whether the analysis worker outlines the top-level expression `ex` into a closure, as JET
+does a `@test` expression: an expression of calls and control flow, binding no names, so
+that the closures it defines in its branches need no evaluated conditions.
+"""
+function _outlined(ex)
+    outlinable(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) || _anonymous(ex) ||
+        (ex.head === :do && outlinable(first(ex.args)) && _anonymous(last(ex.args))) ||
+        (ex.head in _OUTLINABLE && all(outlinable, ex.args))
+    return ex isa Expr && outlinable(ex) && !_runs_code(ex)
+end
+
 "Whether a method definition is a closure: an anonymous function or a `do` block."
 _closure(ex::Expr) = ex.head === :-> ||
     (ex.head === :function && first(ex.args) isa Expr && first(ex.args).head === :tuple)
@@ -639,6 +662,8 @@ evaluates to define them; with `forced`, only those of `include` and `eval` call
 JETLS evaluates whatever they need. Assignments in `ex` that these names depend on count too.
 """
 function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
+    # Closures in an outlined expression's branches need no conditions.
+    forced = forced || _outlined(ex)
     direct = Set{Symbol}()
     locals = Pair{Set{Symbol},Set{Symbol}}[]
     needs!(parts, controls) =
@@ -657,7 +682,7 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
             !forced && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
                 needs!(Any[first(last(ex.args).args)], controls)
             foreach(arg -> visit(arg, controls, branches), ex.args[2:end])
-        elseif _is_include(ex)
+        elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "include_string")
             needs!(ex.args[2:end], controls)
         elseif head === :call && _name(first(ex.args)) == "eval"
             foreach(arg -> _code_reads!(direct, arg), ex.args[2:end])
@@ -703,10 +728,10 @@ only where needed, or where JETLS evaluates part of them anyway; impure assignme
 where `include` and `eval` calls need them. A need selects the binding of a name that
 reaches the statement needing it. `excluded` statements are not evaluated.
 """
-function _concretized(expressions::Vector{Any}, excluded::Set{Int})
+function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set{Symbol}=Set{Symbol}())
     shadowed = Set{Symbol}()
     foreach(ex -> (_binds!(shadowed, ex); _globals!(shadowed, ex)), expressions)
-    scope = _Scope(Set{Symbol}(), Set{Symbol}(), shadowed)
+    scope = _Scope(setdiff(modules, shadowed), Set{Symbol}(), shadowed)
     variable = setdiff(union(_PROCESS_NAMES, _FILE_READS), shadowed)
     bound = Set{Symbol}()
     selected = Set{Int}()
@@ -722,7 +747,11 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int})
         reads = assignment === nothing ? _symbols(ex) : _symbols(last(assignment))
         known = i in excluded ? nothing : _evaluable(ex, scope, bound)
         setdiff!(scope.known, binds)
-        if known === nothing
+        if known === nothing && !(i in excluded) && Meta.isexpr(ex, :call) && _name(first(ex.args)) == "include_string"
+            # JETLS does not follow `include_string` as it follows `include`: evaluate it.
+            push!(selected, i)
+            need!(reads, i, true)
+        elseif known === nothing
             !(i in excluded) && assignment !== nothing && (deferred[i] = (reads, false))
             need!(_reads!(Set{Symbol}(), ex; forced=true), i, true)
             need!(_reads!(Set{Symbol}(), ex), i, false)
@@ -804,17 +833,18 @@ function _may_match(pattern, ex)
 end
 
 """
-    concretization_patterns(file) -> Vector{String}
+    concretization_patterns(file; modules=Set{Symbol}()) -> Vector{String}
 
 The source text of the top-level statements of `file` that analysis may evaluate, each a
-JETLS concretization pattern.
+JETLS concretization pattern. `modules` names the modules code that runs before the file
+imports, such as a test driver's prelude.
 """
-function concretization_patterns(file::String)
+function concretization_patterns(file::String; modules::Set{Symbol}=Set{Symbol}())
     text, statements = _statements(file; modules=true, blocks=false)
     expressions = Any[last(statement) for statement in statements]
     excluded = Set{Int}()
     while true
-        selected = _concretized(expressions, excluded)
+        selected = _concretized(expressions, excluded, modules)
         # A pattern selects every statement of its file that it matches.
         conflicts = filter(i -> any(j -> !(j in selected) && _may_match(expressions[i], expressions[j]),
                                     eachindex(expressions)), selected)
@@ -947,6 +977,19 @@ function _relative_modules(ex)
                      path.args[2] isa Symbol]
 end
 
+function _drivers_statements(drivers::Vector{String}, target::String)
+    statements = _DriverStatement[]
+    seen = Set{String}()
+    for (i, driver) in pairs(drivers)
+        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen)
+    end
+    return statements
+end
+
+"The modules the prelude of `drivers` for `target` imports, which `target` can read."
+prelude_modules(drivers::Vector{String}, target::String) =
+    union(Set{Symbol}(), (_modules(statement.ex) for statement in _drivers_statements(drivers, target))...)
+
 """
     prelude(drivers, target) -> String
 
@@ -955,11 +998,7 @@ which the last of them includes at run time: imports, definitions and the global
 assignments `target` transitively refers to, also from files the drivers include statically.
 """
 function prelude(drivers::Vector{String}, target::String)
-    statements = _DriverStatement[]
-    seen = Set{String}()
-    for (i, driver) in pairs(drivers)
-        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen)
-    end
+    statements = _drivers_statements(drivers, target)
     needed = Set{Symbol}()
     pending, visited = [target], Set{String}()
     while !isempty(pending)

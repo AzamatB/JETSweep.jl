@@ -439,6 +439,11 @@ end
         """
     files = ("test/runtests.jl" => driver, "test/target.jl" => target,
              "test/part.jl" => "@test FOR_PART == 7\n")
+    @test mktempdir() do directory
+        dir = realpath(directory)
+        foreach(((path, code),) -> syntax_write(dir, path, code), files)
+        JETSweep.prelude_modules([joinpath(dir, "test/runtests.jl")], joinpath(dir, "test/target.jl"))
+    end == Set([:Test])
     syntax_prelude(files...) do text, dir
         names = syntax_names(text)
         @test syntax_parses(text)
@@ -751,6 +756,32 @@ end
         "const ASKED = isempty(ARGS) ? split(get(ENV, \"TESTS\", \"\"), \",\"; keepempty=false) : ARGS",
         "const PICKED = isempty(ASKED) ? [\"a\"] : filter(f -> f in ASKED, [\"a\"])",
         "const MEASURE = get(ARGS, 1, \"\") == \"--measure\"", "if MEASURE\n    using Statistics\nend"]
+end
+
+@testset "concretization_patterns follows what JETLS outlines, includes and imports" begin
+    # The worker outlines expressions of calls and control flow, so the closures in their
+    # branches need no evaluated conditions; one that assigns is not outlined.
+    @test JETSweep._outlined(:(lock === nothing || atexit(() -> close(lock))))
+    @test !JETSweep._outlined(:(x = cond ? 1 : map(y -> y, z)))
+    @test !JETSweep._outlined(:(ready && include(f)))
+    @test syntax_patterns("const LOCK = isempty(ARGS) ? nothing : 1\nLOCK === nothing || atexit(() -> close(LOCK))\n") ==
+          String[]
+    @test syntax_patterns("const PICK = isempty(ARGS) ? 1 : 2\nconst F = PICK > 1 ? map(x -> x, 1:2) : 0\n") ==
+          ["const PICK = isempty(ARGS) ? 1 : 2", "const F = PICK > 1 ? map(x -> x, 1:2) : 0"]
+    # JETLS does not follow `include_string`, so the call and what it needs are evaluated.
+    code = """
+        const SNAPSHOT = snapshot(joinpath(@__DIR__, "helper.jl"))
+        Base.include_string(@__MODULE__, String(copy(SNAPSHOT.bytes)), SNAPSHOT.path)
+        using .Helper
+        """
+    @test syntax_patterns(code) == ["const SNAPSHOT = snapshot(joinpath(@__DIR__, \"helper.jl\"))",
+        "Base.include_string(@__MODULE__, String(copy(SNAPSHOT.bytes)), SNAPSHOT.path)"]
+    # Modules that run before the file, as a driver's prelude imports, are known.
+    mktempdir() do directory
+        file = syntax_write(realpath(directory), "file.jl", "const DATA = joinpath(pkgdir(Pkg1), \"data\")\n")
+        @test JETSweep.concretization_patterns(file) == String[]
+        @test JETSweep.concretization_patterns(file; modules=Set([:Pkg1])) == ["const DATA = joinpath(pkgdir(Pkg1), \"data\")"]
+    end
 end
 
 @testset "concretization_patterns needs only what JETLS evaluates, where it does" begin

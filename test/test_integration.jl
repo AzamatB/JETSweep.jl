@@ -105,6 +105,22 @@ end
               "name = \"Sibling\"\nuuid = \"6f4d0fd2-62a3-4c43-9d6e-0c3fdd2a6f3b\"\nversion = \"0.1.0\"\n")
         write(joinpath(root, "Sibling", "src", "Sibling.jl"), "module Sibling\nsibling_value() = 1\nend\n")
         write(joinpath(root, "uses_sibling.jl"), "using Sibling\nuse() = Sibling.sibling_value() + \"one\"\n")
+        # A closure in a branch of a top-level expression does not stop the analysis, and the
+        # value its condition reads is not evaluated.
+        write(joinpath(root, "locked.jl"), """
+            acquire() = (touch(joinpath(@__DIR__, "acquired.marker")); nothing)
+            const LOCK = acquire()
+            LOCK === nothing || atexit(() -> close(LOCK))
+            after() = 1 + "one"
+            """)
+        # Code loaded with `include_string` is loaded.
+        write(joinpath(root, "bootstrap.jl"), """
+            const CODE = read(joinpath(@__DIR__, "bootstrapped.txt"), String)
+            include_string(@__MODULE__, CODE, "bootstrapped.jl")
+            using .Bootstrapped
+            use() = Bootstrapped.value() + "one"
+            """)
+        write(joinpath(root, "bootstrapped.txt"), "module Bootstrapped\nvalue() = 1\nend\n")
         # A generator in a branch of a `@test` expression does not make JETLS run the test.
         write(joinpath(root, "outlined.jl"), """
             using Test
@@ -133,6 +149,8 @@ end
         @test status("arguments.jl") in (:clean, :findings)
         @test status("selection.jl") === :clean
         @test status("outlined.jl") === :clean && !isfile(joinpath(root, "ran.marker"))
+        @test status("locked.jl") === :findings && !isfile(joinpath(root, "acquired.marker"))
+        @test status("bootstrap.jl") === :findings
         @test status("uses_sibling.jl") === :findings
         sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
         @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)

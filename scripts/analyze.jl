@@ -16,6 +16,7 @@ const LS = Base.require(JETLS, :JETLSCore)
 # closure there concretely executes the conditions before it: the test itself, in JET's
 # interpreter. Generators and comprehensions define closures too, so treat them alike;
 # otherwise `@test r.ok && [a.b for a in r.items] == [1]` runs whatever computes `r`.
+# `JETSweep._outlined` mirrors these rules.
 Core.eval(LS.JET, quote
     function is_anonymous_test_function(@nospecialize(ex))
         isexpr(ex, (:->, :generator, :flatten, :comprehension, :typed_comprehension)) && return true
@@ -27,6 +28,23 @@ Core.eval(LS.JET, quote
         return isexpr(sig, :tuple)
     end
 end)
+"Whether `ex` includes or evaluates code, which JET follows only at top level."
+runs_code(ex) = ex isa Expr && (
+    (ex.head === :call && !isempty(ex.args) && LS.JET.isexpr(first(ex.args), :.) ?
+        last(first(ex.args).args) in (QuoteNode(:include), QuoteNode(:eval), QuoteNode(:include_string)) :
+        ex.head === :call && first(ex.args) in (:include, :eval, :include_string)) ||
+    (ex.head === :macrocall && first(ex.args) === Symbol("@eval")) || any(runs_code, ex.args))
+
+# JET analyzes any top-level expression it can outline the same way, such as
+# `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`.
+Core.eval(LS.JET, quote
+    function desugar_main_macrocall(x::Expr)
+        x = invoke(desugar_main_macrocall, Tuple{Any}, x)
+        should_wrap_test_expression_in_thunk(x) && !$runs_code(x) || return x
+        return wrap_test_expression_in_thunk(x)
+    end
+end)
+
 # JETLS dispatches in the world it was loaded in, to stay clear of analyzed code.
 LS.advance_server_world!()
 
