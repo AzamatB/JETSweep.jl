@@ -160,7 +160,7 @@ exclude = ["vendor", "**/generated/*.jl"]
 match = "tools/check.jl"        # units whose entry matches
 project = "tools"               # environment to analyze in
 setup = ["tools/setup.jl"]      # files included before the entry
-args = ["--fast"]               # ARGS during analysis
+args = ["--fast"]               # ARGS during analysis, which runs in the entry's directory
 env = { MODE = "analysis" }     # environment variables during analysis
 jetls_config = "tools/.JETLSConfig.toml"
 ```
