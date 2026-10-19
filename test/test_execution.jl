@@ -737,6 +737,27 @@ end
     end
 end
 
+@testset "The summary shows an incomplete unit's notes with its reasons" begin
+    mktempdir() do output
+        stop = "analysis stopped at /root/report.jl:1 [toplevel/error]: JET could not execute this top-level code: " *
+               "ArgumentError: Package Humanize not found in current path.\n- Run `import Pkg; Pkg.add(\"Humanize\")`"
+        left_out = "environment: Packages imported without being declared that could not be added: Humanize " *
+                   "(downloads are disabled, and the installed packages do not satisfy this context)."
+        units = execution_script.(["report", "clean"])
+        results = [execution_incomplete("report", :incomplete, [stop], [left_out]; log="/out/units/script-report/log.txt"),
+                   execution_incomplete("clean", :clean, String[], ["environment: Precompilation timed out."])]
+        _, summary = execution_report(output, units, results)
+        @test occursin("""
+            incomplete  report.jl
+                analysis stopped at report.jl:1 [toplevel/error]: JET could not execute this top-level code: \
+            ArgumentError: Package Humanize not found in current path.
+                note: $left_out
+                log: /out/units/script-report/log.txt
+            """, summary)
+        @test !occursin("Precompilation", summary)
+    end
+end
+
 @testset "Files a unit did not reach get follow-up units" begin
     mktempdir() do directory
         root = realpath(directory)

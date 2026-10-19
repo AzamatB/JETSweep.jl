@@ -133,6 +133,8 @@ function _summarize(io::IO, result::SweepResult, findings, statuses, severities,
         for r in incomplete
             println(io, rpad(String(r.status), 11), " ", name(byid[r.unit]))
             foreach(reason -> println(io, "    ", _relative(first(split(reason, '\n')), root)), r.reasons)
+            # Notes can explain the reasons, such as a stop at an import the environment left out.
+            foreach(note -> println(io, "    note: ", _relative(first(split(note, '\n')), root)), r.notes)
             isempty(r.log) || println(io, "    log: ", r.log)
         end
         isempty(unanalyzed) || println(io, "Files no complete analysis covered:")
