@@ -470,6 +470,60 @@ end
     end
 end
 
+@testset "prelude keeps the conditional definitions the target and kept definitions refer to" begin
+    driver = """
+        using Test
+        const NEW = VERSION >= v"1.0"
+        @static if NEW
+            static_helper(x) = x + 1
+        end
+        if VERSION >= v"1.0"
+            if_helper(x) = x + 2
+        elseif VERSION >= v"0.7"
+            if_helper(x) = x + 20
+        else
+            const IF_CONST = 1
+        end
+        uses_nested() = nested_helper()
+        @static if VERSION >= v"1.0"
+            @static if Sys.WORD_SIZE > 0
+                "A nested helper."
+                nested_helper() = 4
+            end
+        end
+        struct Wrapped end
+        if VERSION >= v"1.0"
+            Base.length(::Wrapped) = 5
+        end
+        if VERSION >= v"1.0"
+            unused_helper() = 6
+        end
+        if VERSION >= v"1.0"
+            println("conditional side effect")
+            mixed_helper() = 7
+        end
+        for file in ARGS
+            include(file)
+        end
+        """
+    target = "@test static_helper(1) + if_helper(1) + uses_nested() == 9\n@test mixed_helper() == 7\n"
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => target) do text, dir
+        @test syntax_parses(text)
+        @test occursin("@static if NEW", text) && occursin("const NEW", text)
+        @test occursin("@eval begin\nif VERSION >= v\"1.0\"\n    if_helper(x) = x + 2", text)
+        @test occursin("nested_helper() = 4", text) && occursin("Base.length(::Wrapped)", text)
+        @test !occursin("unused_helper", text) && !occursin("mixed_helper", text) && !occursin("side effect", text)
+        sandbox = syntax_load(text)
+        @test sandbox isa Module
+        if sandbox isa Module
+            @test syntax_call(sandbox, :static_helper, 1) == 2
+            @test syntax_call(sandbox, :if_helper, 1) == 3
+            @test syntax_call(sandbox, :uses_nested) == 4
+            @test Base.invokelatest(length, syntax_call(sandbox, :Wrapped)) == 5
+        end
+    end
+end
+
 @testset "prelude follows the files the driver includes statically at top level" begin
     driver = """
         using Test

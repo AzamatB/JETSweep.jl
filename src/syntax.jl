@@ -250,6 +250,21 @@ function _definition(ex)
     return any(_definition, ex.args)
 end
 
+"""
+Whether `ex` is a conditional, plain or `@static`, whose branches only define, import and
+assign, as definitions that depend on the Julia version are.
+"""
+function _conditional_definitions(ex)
+    ex isa Expr || return false
+    _macro_name(ex) == "@static" && return _conditional_definitions(last(ex.args))
+    ex.head in (:if, :elseif) || return false
+    # A string in a branch is no docstring, nor anything else.
+    member(ex) = ex isa Union{LineNumberNode,String} || ex isa Expr &&
+        (ex.head in (:using, :import) || _definition(ex) || _assignment(ex) !== nothing ||
+         _conditional_definitions(ex) || (ex.head === :block && all(member, ex.args)))
+    return all(member, ex.args[2:end])
+end
+
 "The names a definition or import statement binds."
 function _bound_names(ex)
     ex isa Expr || return Symbol[]
@@ -931,11 +946,12 @@ end
 #
 # A test file that its driver (`test/runtests.jl`) includes from a run-time loop is
 # analyzed as its own unit after a prelude: the driver's imports and definitions, and only
-# those global assignments that the test file or those definitions refer to, transitively.
-# Selection logic such as `const TESTS = isempty(ARGS) ? ALL : ARGS` is left out, since
-# nothing the test file uses depends on it. Statements keep their original source text, with
-# `@__DIR__`, `@__FILE__` and relative include paths pinned to their original file. Pure
-# assignments are wrapped in `@eval`, which analysis always evaluates, since concretization
+# those global assignments, modules and conditional definitions, as in `@static if`, that
+# the test file or those definitions refer to, transitively. Selection logic such as
+# `const TESTS = isempty(ARGS) ? ALL : ARGS` is left out, since nothing the test file uses
+# depends on it. Statements keep their original source text, with `@__DIR__`, `@__FILE__`
+# and relative include paths pinned to their original file. Pure assignments and
+# conditionals are wrapped in `@eval`, which analysis always evaluates, since concretization
 # patterns cannot apply to the generated file.
 
 function _macro_identifier(node::JS.SyntaxNode)
@@ -991,7 +1007,7 @@ struct _DriverStatement
     file::String
     line::Int
     ex::Any
-    "The names an assignment binds; empty for imports and definitions."
+    "The names that select it, those an assignment, module or conditional binds; empty for imports and definitions."
     names::Vector{Symbol}
     text::String
 end
@@ -1032,9 +1048,12 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
             known = length(names) == 1 ? _path(value, file, bindings, Dict{String,Project}()) : nothing
             known === nothing ? foreach(name -> delete!(bindings, name), names) : (bindings[only(names)] = known)
         end
-        if ex isa Expr && (ex.head in (:using, :import) || _definition(ex) || assignment !== nothing)
-            # A module, like an assignment, is kept only where something refers to it.
-            names = assignment !== nothing ? first(assignment) : ex.head === :module ? _bound_names(ex) : Symbol[]
+        conditional = _conditional_definitions(ex)
+        if ex isa Expr && (ex.head in (:using, :import) || _definition(ex) || assignment !== nothing || conditional)
+            # A module or conditional, like an assignment, is kept only where something refers to what it
+            # binds, if anything.
+            names = assignment !== nothing ? first(assignment) : ex.head === :module ? _bound_names(ex) :
+                conditional ? collect(_binds!(Set{Symbol}(), ex)) : Symbol[]
             push!(statements, _DriverStatement(file, JS.source_line(node), ex, names, _relocated(node, text, file)))
         end
     end
@@ -1068,7 +1087,8 @@ prelude_modules(drivers::Vector{String}, target::String) =
 
 Source text recreating the context that `drivers`, outermost first, establish for `target`,
 which the last of them includes at run time: imports, definitions and the global
-assignments `target` transitively refers to, also from files the drivers include statically.
+assignments, modules and conditional definitions `target` transitively refers to, also from
+files the drivers include statically.
 """
 function prelude(drivers::Vector{String}, target::String)
     statements = _drivers_statements(drivers, target)
@@ -1102,8 +1122,7 @@ function prelude(drivers::Vector{String}, target::String)
     io = IOBuffer()
     for (i, statement) in pairs(statements)
         println(io, "#= ", statement.file, ":", statement.line, " =#")
-        evaluate = i in evaluated && !isempty(statement.names) && statement.ex.head !== :module
-        println(io, evaluate ? "@eval begin\n$(statement.text)\nend" : statement.text)
+        println(io, i in evaluated ? "@eval begin\n$(statement.text)\nend" : statement.text)
     end
     return String(take!(io))
 end
