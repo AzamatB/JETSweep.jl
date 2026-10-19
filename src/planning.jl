@@ -76,7 +76,7 @@ function source_syntax(inventory::Inventory)
     projects = Dict(project.dir => project for project in inventory.projects)
     parse(source; exports=Dict{String,Dict{Symbol,String}}()) =
         parse_source(source.path, _packages(source, projects); exports)
-    syntax = Dict(source.path => parse(source) for source in inventory.sources)
+    syntax = Dict{String,Syntax}(source.path => parse(source) for source in inventory.sources)
     # The path constants a file defines, after those of the files it includes at top level.
     exports = Dict{String,Dict{Symbol,String}}()
     function exported(file::String, seen::Set{String})

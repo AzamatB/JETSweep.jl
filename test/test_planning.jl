@@ -294,6 +294,18 @@ end
     end
 end
 
+@testset "a tree without Julia files plans no units" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        @test isempty(last(planning_plan(root)))
+        planning_file(root, "README.md", "# Notes\n")
+        planning_project(root, "env")
+        inventory, units = planning_plan(root)
+        @test isempty(inventory.sources) && !isempty(inventory.projects)
+        @test isempty(units)
+    end
+end
+
 @testset "notes record dynamic includes and parse failures" begin
     mktempdir() do directory
         root = realpath(directory)
