@@ -439,6 +439,11 @@ end
         """
     files = ("test/runtests.jl" => driver, "test/target.jl" => target,
              "test/part.jl" => "@test FOR_PART == 7\n")
+    @test mktempdir() do directory
+        dir = realpath(directory)
+        foreach(((path, code),) -> syntax_write(dir, path, code), files)
+        JETSweep.prelude_modules([joinpath(dir, "test/runtests.jl")], joinpath(dir, "test/target.jl"))
+    end == Set([:Test])
     syntax_prelude(files...) do text, dir
         names = syntax_names(text)
         @test syntax_parses(text)
@@ -753,6 +758,66 @@ end
         "const MEASURE = get(ARGS, 1, \"\") == \"--measure\"", "if MEASURE\n    using Statistics\nend"]
 end
 
+@testset "concretization_patterns follows what JETLS outlines, includes and imports" begin
+    # The worker outlines expressions of calls and control flow, so the closures in their
+    # branches need no evaluated conditions; one that assigns is not outlined.
+    @test JETSweep._outlined(:(lock === nothing || atexit(() -> close(lock))))
+    @test JETSweep._outlined(:(ready || foreach(function (x)::Nothing; println(x); end, xs)))
+    # Lowering evaluates the types of a closure's parameters where it stands.
+    @test !JETSweep._outlined(:(ready || foreach((x::Row) -> x, xs)))
+    @test !JETSweep._outlined(:(ready || foreach((x; y::Row=Row()) -> x, xs)))
+    @test !JETSweep._outlined(:(ready || foreach((x, y::Row=Row()) -> x, xs)))
+    @test !JETSweep._outlined(:(ready || foreach(xs) do x::Row; x; end))
+    @test !JETSweep._outlined(:(ready || foreach(function (x::T) where {T}; x; end, xs)))
+    @test JETSweep._outlined(:(ready || foreach((x=Row()) -> x, xs)))
+    # Loop and `let` bodies are local scopes already, unless they import.
+    @test JETSweep._outlined(:(for (name, entries) in deps; if haskey(m, name); all(e -> e, entries); end; end))
+    @test JETSweep._outlined(:(let r = slow(); if r > 0; g(x) = x + 1; end; end))
+    @test !JETSweep._outlined(:(for x in xs; foreach(y -> y, x); end))
+    @test !JETSweep._outlined(:(for m in ms; using Test; ready && map(x -> x, m); end))
+    @test !JETSweep._outlined(:(for f in fs; ready && include(f); map(x -> x, f); end))
+    @test syntax_patterns("const ITEMS = readdir(ARGS[1])\nfor item in ITEMS\n    isdir(item) && foreach(println, filter(x -> x, item))\nend\n") ==
+          String[]
+    # A function a loop defines is a closure, so its loop needs no values.
+    @test syntax_patterns("const ITEMS = readdir(ARGS[1])\nfor item in ITEMS\n    show_item() = println(item)\nend\n") ==
+          String[]
+    @test !JETSweep._outlined(:(x = cond ? 1 : map(y -> y, z)))
+    @test !JETSweep._outlined(:(ready && include(f)))
+    # A generator's ranges stand outside its closure, as do interpolations into quotes.
+    @test JETSweep._outlined(:(ready && [a.b for a in items] == [1]))
+    @test !JETSweep._outlined(:(ready && [a for a in (items = f(); items)] == [1]))
+    @test !JETSweep._outlined(:(ready && g(:(h($(y = 1)))) && map(x -> x, z)))
+    @test syntax_patterns("const LOCK = isempty(ARGS) ? nothing : 1\nLOCK === nothing || atexit(() -> close(LOCK))\n") ==
+          String[]
+    @test syntax_patterns("const PICK = isempty(ARGS) ? 1 : 2\nconst F = PICK > 1 ? map(x -> x, 1:2) : 0\n") ==
+          ["const PICK = isempty(ARGS) ? 1 : 2", "const F = PICK > 1 ? map(x -> x, 1:2) : 0"]
+    # JETLS evaluates `include_string` calls as it does `eval` calls, so what they need is.
+    code = """
+        const SNAPSHOT = snapshot(joinpath(@__DIR__, "helper.jl"))
+        Base.include_string(@__MODULE__, String(copy(SNAPSHOT.bytes)), SNAPSHOT.path)
+        using .Helper
+        """
+    @test syntax_patterns(code) == ["const SNAPSHOT = snapshot(joinpath(@__DIR__, \"helper.jl\"))"]
+    # Wherever the call stands, and through what command literals interpolate.
+    code = """
+        const SOURCE = joinpath(get(ENV, "SOURCE_ROOT", @__DIR__), "Source.jl")
+        let code = read(`git -C \$SOURCE show HEAD:helper.jl`, String)
+            include_string(@__MODULE__, code, "helper.jl")
+        end
+        """
+    @test syntax_patterns(code) == ["const SOURCE = joinpath(get(ENV, \"SOURCE_ROOT\", @__DIR__), \"Source.jl\")"]
+    @test JETSweep._symbols(Meta.parse("`a \$b \$(c.d):e`")) == Set([:b, :c, :d])
+    # `import A.f` may bind a function, so only whole modules count.
+    @test JETSweep._modules(:(using A.B, C)) == Set([:B, :C])
+    @test JETSweep._modules(:(import D, E.f, F as G, H.i as j)) == Set([:D, :G])
+    # Modules that run before the file, as a driver's prelude imports, are known.
+    mktempdir() do directory
+        file = syntax_write(realpath(directory), "file.jl", "const DATA = joinpath(pkgdir(Pkg1), \"data\")\n")
+        @test JETSweep.concretization_patterns(file) == String[]
+        @test JETSweep.concretization_patterns(file; modules=Set([:Pkg1])) == ["const DATA = joinpath(pkgdir(Pkg1), \"data\")"]
+    end
+end
+
 @testset "concretization_patterns needs only what JETLS evaluates, where it does" begin
     # Default values and argument names are not evaluated when a method is defined, nor is
     # the quoted code `@eval` defines, except what it interpolates.
@@ -910,4 +975,35 @@ end
     @test syntax_patterns("const N = compute()\ng(::Val{N}) = 1\n") == String[]
     # Includes inside functions run only when called, so nothing selects them statically.
     @test syntax_patterns("const FILES = list_tests()\nrun(f) = include(f)\nforeach(run, FILES)\n") == String[]
+end
+
+@testset "includes resolve through path constants other files define" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        bootstrap = syntax_write(root, "lib/bootstrap.jl", "const LIBDIR = @__DIR__\nconst DATA = joinpath(dirname(LIBDIR), \"data\")\n")
+        lib = syntax_write(root, "lib/lib.jl", "include(\"bootstrap.jl\")\n")
+        census = syntax_write(root, "lib/census.jl", "")
+        script = syntax_write(root, "dev/script.jl",
+                              "include(joinpath(dirname(@__DIR__), \"lib\", \"lib.jl\"))\ninclude(joinpath(LIBDIR, \"census.jl\"))\n")
+        inventory = discover(root)
+        syntax = JETSweep.source_syntax(inventory)
+        @test syntax[bootstrap].bindings == Dict(:LIBDIR => dirname(bootstrap), :DATA => joinpath(root, "data"))
+        @test [include.target for include in syntax[script].includes] == [lib, census]
+        @test isempty(syntax[script].notes)
+    end
+end
+
+@testset "parse_source records the packages imports load" begin
+    parsed = syntax_parse("""
+        using A, B.C
+        import D as E
+        import F: g, h as k
+        using .Local, ..Parent
+        quoted() = :(using Q)
+        @eval using Generated
+        if flag
+            using Conditional
+        end
+        """)
+    @test parsed.syntax.imports == ["A", "B", "D", "F", "Generated", "Conditional"]
 end

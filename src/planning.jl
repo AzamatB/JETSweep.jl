@@ -67,11 +67,36 @@ function _test_context(owner::String)
     return Context(project, owner, true, Dict{String,String}())
 end
 
-"The include facts of every inventoried source."
-source_syntax(inventory::Inventory) =
-    let projects = Dict(project.dir => project for project in inventory.projects)
-        Dict(source.path => parse_source(source.path, _package_dirs(source, projects)) for source in inventory.sources)
+"""
+The include facts of every inventoried source. An include that names a path through a
+constant another file defines, as `include(joinpath(LIBDIR, "x.jl"))` after including the
+file that defines `LIBDIR`, resolves on a second pass.
+"""
+function source_syntax(inventory::Inventory)
+    projects = Dict(project.dir => project for project in inventory.projects)
+    parse(source; exports=Dict{String,Dict{Symbol,String}}()) =
+        parse_source(source.path, _package_dirs(source, projects); exports)
+    syntax = Dict(source.path => parse(source) for source in inventory.sources)
+    # The path constants a file defines, after those of the files it includes at top level.
+    exports = Dict{String,Dict{Symbol,String}}()
+    function exported(file::String, seen::Set{String})
+        haskey(exports, file) && return exports[file]
+        (file in seen || !haskey(syntax, file)) && return Dict{Symbol,String}()
+        push!(seen, file)
+        bindings = Dict{Symbol,String}()
+        for include in syntax[file].includes
+            include.depth == 0 && include.followed && !isempty(include.target) &&
+                merge!(bindings, exported(include.target, seen))
+        end
+        return exports[file] = merge!(bindings, syntax[file].bindings)
     end
+    foreach(file -> exported(file, Set{String}()), collect(keys(syntax)))
+    for source in inventory.sources
+        any(include -> isempty(include.target), syntax[source.path].includes) &&
+            (syntax[source.path] = parse(source; exports))
+    end
+    return syntax
+end
 
 """
     plan(inventory, config=Config(); syntax=source_syntax(inventory)) -> Vector{Unit}
@@ -171,7 +196,43 @@ function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String
         end
     end
     sort!(units; by=unit -> (unit.entry, unit.extension))
-    return _configure(units, config, root)
+    return _imports!(_configure(units, config, root), syntax, inventory)
+end
+
+"""
+Give the contexts of scripts and tests the packages their files import without their
+projects declaring them, as code does that runs with another project active or relies on
+its workspace: packages of the workspace from their directories, others from the registry.
+"""
+function _imports!(units::Vector{Unit}, syntax::Dict{String,Syntax}, inventory::Inventory)
+    names = [project.name for project in inventory.projects if ispackage(project)]
+    workspace = Dict(project.name => project.dir for project in inventory.projects
+                     if ispackage(project) && count(==(project.name), names) == 1)
+    # Other modules the tree defines, loaded through `LOAD_PATH`, say, are not packages to look up.
+    defined = setdiff(Set(name for facts in values(syntax) for name in facts.modules), names)
+    available = union(Set(readdir(Sys.STDLIB)), ("Base", "Core", "Main"), defined)
+    imported = Dict{Context,Set{String}}()
+    for unit in units
+        unit.kind in (:script, :test) || continue
+        files = union((_reach(file, syntax; followed_only=true) for file in [unit.entry; unit.overrides.setup])...)
+        union!(get!(imported, unit.context, Set{String}()),
+               (name for file in files if haskey(syntax, file) for name in syntax[file].imports))
+    end
+    extended = Dict{Context,Context}()
+    for (context, names) in imported
+        loadable = try
+            _loadable(context)
+        catch
+            continue   # preparing the environment reports what is wrong with its projects
+        end
+        undeclared = setdiff(names, loadable, available)
+        isempty(undeclared) && continue
+        extended[context] = Context(context.project, context.owner, context.test, context.triggers,
+                                    Dict(name => get(workspace, name, "") for name in undeclared))
+    end
+    return [haskey(extended, unit.context) && unit.kind in (:script, :test) ?
+            Unit(unit.id, unit.kind, unit.entry, extended[unit.context], unit.expected, unit.driver, unit.extension,
+                 unit.overrides, unit.notes) : unit for unit in units]
 end
 
 "Directories of packages a source can name in `pkgdir(Name)`: its owner, statically."

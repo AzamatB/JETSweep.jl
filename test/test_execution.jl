@@ -173,6 +173,20 @@ end
     end
 end
 
+@testset "Workers get a virtual display when there is none" begin
+    if Sys.islinux() && Sys.which("Xvfb") !== nothing
+        withenv("DISPLAY" => nothing) do
+            # Workers get the display; this process's environment stays as it was.
+            command, environment = JETSweep.with_display() do
+                JETSweep.julia_command("/scripts/worker.jl", String[]; project="/environment", threads=1), copy(ENV)
+            end
+            @test any(variable -> occursin(r"^DISPLAY=:\d+$", variable), command.env)
+            @test !haskey(environment, "DISPLAY") && isempty(JETSweep._DISPLAY[])
+        end
+        @test withenv(() -> JETSweep.with_display(() -> JETSweep._DISPLAY[]), "DISPLAY" => ":7") == ""
+    end
+end
+
 @testset "Worker Julia command" begin
     command = withenv("JULIA_PROJECT" => "/elsewhere", "JULIA_LOAD_PATH" => "/elsewhere",
                       "OMP_NUM_THREADS" => "8", "JETSWEEP_EXECUTION_MARK" => "inherited") do
@@ -189,11 +203,11 @@ end
     @test variables["OMP_NUM_THREADS"] == variables["OPENBLAS_NUM_THREADS"] == "1"
     # No code generation flags of this process, such as `--check-bounds=yes`.
     @test command.exec == [joinpath(Sys.BINDIR, Base.julia_exename()), "--startup-file=no", "--history-file=no",
-                           "--compiled-modules=yes", "--threads=3,1", "--project=/environment",
+                           "--compiled-modules=yes", "--threads=3,0", "--project=/environment",
                            "/scripts/worker.jl", "a", "b c"]
     cached = JETSweep.julia_command("/scripts/worker.jl", String[]; project="/environment", threads=1,
                                     compile=false)
-    @test "--compiled-modules=existing" in cached.exec && "--threads=1,1" in cached.exec
+    @test "--compiled-modules=existing" in cached.exec && "--threads=1,0" in cached.exec
     mktempdir() do directory
         script = joinpath(directory, "probe.jl")
         write(script, """
@@ -209,7 +223,7 @@ end
         log = joinpath(directory, "probe.log")
         @test JETSweep.run_worker(command, log, 300.0) == (code=0, timed_out=false)
         # Default code generation (check_bounds 0) even when this process runs `--check-bounds=yes`.
-        @test readlines(log) == ["2 1", "@:@stdlib", "unset", "x|y z", "0"]
+        @test readlines(log) == ["2 0", "@:@stdlib", "unset", "x|y z", "0"]
     end
 end
 
@@ -398,7 +412,7 @@ function execution_sweep(unit, root, output)
     includes = [dynamic; [JETSweep.Include(file, 1, true) for file in unit.expected if file != unit.entry]]
     syntax = Dict(unit.entry => JETSweep.Syntax(includes, String[]))
     return JETSweep._Sweep(inventory, output, SweepOptions(), syntax, Dict{String,JETSweep.Unit}(),
-                           Dict{String,Vector{String}}(), Dict{String,Vector{String}}())
+                           Dict{String,Vector{String}}(), Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
 end
 
 "Write `unit`'s JETLS configuration; returns the root its paths are relative to and the configuration."
@@ -602,7 +616,7 @@ end
         inventory = discover(root)
         sweep = JETSweep._Sweep(inventory, root, SweepOptions(), JETSweep.source_syntax(inventory),
                                 Dict{String,JETSweep.Unit}(), Dict{String,Vector{String}}(),
-                                Dict{String,Vector{String}}())
+                                Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
         analyzed(files...) = JETSweep.UnitResult("unit", :incomplete, JETSweep.Finding[], [realpath.(files)...],
                                                  String[], String[], 0.0, "")
         # An extension's orphans load in its context and module, with its run-time settings.
@@ -624,7 +638,7 @@ end
         sub = execution_touch(joinpath(root, "Scoped", "src", "sub.jl"))
         scoped_sweep = JETSweep._Sweep(sweep.inventory, root, SweepOptions(),
                                        Dict(scoped => JETSweep.parse_source(scoped)), Dict{String,JETSweep.Unit}(),
-                                       Dict{String,Vector{String}}(), Dict{String,Vector{String}}())
+                                       Dict{String,Vector{String}}(), Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
         scoped_unit = JETSweep.Unit("package-scoped", :package, scoped, context, [scoped, sub], "", "",
                                     JETSweep.Overrides(), String[])
         @test isempty(JETSweep._followups(scoped_unit, analyzed(scoped), scoped_sweep, Set([scoped])))

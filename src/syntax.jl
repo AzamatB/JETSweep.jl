@@ -18,7 +18,15 @@ struct Syntax
     includes::Vector{Include}
     "Parse failures and includes that cannot be resolved statically."
     notes::Vector{String}
+    "The packages that `using` and `import` statements load, by name."
+    imports::Vector{String}
+    "The paths top-level constants name at the end of the file, which includes can use."
+    bindings::Dict{Symbol,String}
+    "The modules it defines, by name."
+    modules::Vector{String}
 end
+Syntax(includes::Vector{Include}, notes::Vector{String}, imports::Vector{String}=String[]) =
+    Syntax(includes, notes, imports, Dict{Symbol,String}(), String[])
 
 _name(ex::Symbol) = String(ex)
 _name(ex::GlobalRef) = String(ex.name)
@@ -36,8 +44,15 @@ _method(ex) = ex isa Expr &&
 _is_include(ex) = ex isa Expr && ex.head === :call && _name(first(ex.args)) == "include" &&
     2 <= length(ex.args) <= 4
 
+"What a command literal, in backticks, interpolates; `nothing` for other expressions."
+function _command(ex)
+    _macro_name(ex) == "@cmd" && last(ex.args) isa String || return nothing
+    return try Base.shell_parse(last(ex.args); special=Base.shell_special)[1] catch; nothing end
+end
+
 _symbols!(names::Set{Symbol}, ex::Symbol) = push!(names, ex)
-_symbols!(names::Set{Symbol}, ex::Expr) = (foreach(arg -> _symbols!(names, arg), ex.args); names)
+_symbols!(names::Set{Symbol}, ex::Expr) =
+    (foreach(arg -> _symbols!(names, arg), something(_command(ex), ex).args); names)
 _symbols!(names::Set{Symbol}, ex::QuoteNode) = _symbols!(names, ex.value)
 _symbols!(names::Set{Symbol}, ::Any) = names
 _symbols(ex) = _symbols!(Set{Symbol}(), ex)
@@ -103,13 +118,15 @@ _loop_names(spec) = spec isa Expr && spec.head in (:(=), :block, :filter) ?
     (spec isa Symbol ? Set([spec]) : Set{Symbol}())
 
 """
-    parse_source(file, packages=Dict()) -> Syntax
+    parse_source(file, packages=Dict(); exports=Dict()) -> Syntax
 
 Find the `include` calls of `file`. `packages` maps package names to their directories,
-which resolves `pkgdir(Name)` paths.
+which resolves `pkgdir(Name)` paths; `exports` maps files to the path constants they
+define, which code after including them can use.
 """
-function parse_source(file::String, packages::Dict{String,String}=Dict{String,String}())
-    includes, notes = Include[], String[]
+function parse_source(file::String, packages::Dict{String,String}=Dict{String,String}();
+                      exports::Dict{String,Dict{Symbol,String}}=Dict{String,Dict{Symbol,String}}())
+    includes, notes, imports, modules = Include[], String[], String[], String[]
     tree = try
         Meta.parseall(read(file, String); filename=file)
     catch err
@@ -125,13 +142,22 @@ function parse_source(file::String, packages::Dict{String,String}=Dict{String,St
             return
         elseif head === :quote
             return
+        elseif head in (:using, :import)
+            for path in ex.args
+                path isa Expr && path.head in (:(:), :as) && (path = first(path.args))
+                path isa Expr && path.head === :. && !isempty(path.args) && first(path.args) isa Symbol &&
+                    first(path.args) !== :. && push!(imports, String(first(path.args)))
+            end
+            return
         elseif _is_include(ex)
             target = _path(last(ex.args), file, bindings, packages)
             if target === nothing
                 push!(notes, "$file:$line: include target is only known at run time")
                 push!(includes, Include("", line, followed, depth))
             else
-                push!(includes, Include(normpath(dirname(file), target), line, followed, depth))
+                target = normpath(dirname(file), target)
+                push!(includes, Include(target, line, followed, depth))
+                merge!(bindings, get(exports, target, Dict{Symbol,String}()))
             end
             return
         elseif _method(ex)
@@ -141,6 +167,7 @@ function parse_source(file::String, packages::Dict{String,String}=Dict{String,St
             foreach(arg -> visit(arg, inner, false, depth), ex.args[2:end])
             return
         elseif head === :module
+            ex.args[2] isa Symbol && push!(modules, String(ex.args[2]))
             visit(last(ex.args), Dict{Symbol,String}(), followed, depth + 1)
             return
         elseif head === :(=) || head in _UPDATES
@@ -157,8 +184,9 @@ function parse_source(file::String, packages::Dict{String,String}=Dict{String,St
         scoped && foreach(name -> delete!(bindings, name), _assigned!(Set{Symbol}(), ex))
         return
     end
-    visit(tree, Dict{Symbol,String}(), true)
-    return Syntax(unique!(includes), unique!(notes))
+    top = Dict{Symbol,String}()
+    visit(tree, top, true)
+    return Syntax(unique!(includes), unique!(notes), unique!(imports), top, unique!(modules))
 end
 
 # Top-level statements
@@ -265,7 +293,8 @@ end
 # JETSweep lets JETLS evaluate the top-level statements that cannot have side effects:
 # assignments of values built from literals, paths and pure functions of names already
 # bound, and blocks and conditionals made only of these, definitions and imports. Values
-# that depend on how and where the program runs (`ARGS`, `ENV`, files read) are evaluated
+# that depend on how and where the program runs (`ARGS`, `ENV`, `PROGRAM_FILE`, its
+# directory and the files there) are evaluated
 # only where analysis needs them: in `include` and `eval` arguments, definition signatures,
 # and the conditions JETLS evaluates to define the closures in their branches or to import.
 # Since JETLS always evaluates `include` and `eval` calls, whatever their arguments need is
@@ -273,12 +302,12 @@ end
 
 const _PURE_NAMES = Set([:nothing, :missing, :true, :false, :Inf, :NaN, :pi, :π, :ℯ])
 "Names whose values depend on how the analyzed program is run."
-const _PROCESS_NAMES = Set([:ARGS, :ENV])
-"Pure functions whose values depend on the files present where the program runs."
-const _FILE_READS = Set([:readdir, :read, :readlines, :readchomp, :parsefile])
+const _PROCESS_NAMES = Set([:ARGS, :ENV, :PROGRAM_FILE])
+"Pure functions whose values depend on where the program runs: its directory and files."
+const _RUN_DEPENDENT = Set([:abspath, :realpath, :pwd, :readdir, :read, :readlines, :readchomp, :parsefile])
 const _PURE_CALLS = Set(Symbol.(split("""
     joinpath normpath dirname basename splitext splitdir splitpath relpath isabspath isfile isdir
-    ispath readdir read readlines readchomp parseall parsefile pkgdir pathof string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
+    ispath readdir read readlines readchomp parseall parsefile abspath realpath pwd pkgdir pathof string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
     exp2 exp10 log log2 log10 sin cos tan hypot round floor ceil trunc length Dict Set Pair => :
     range collect Tuple NamedTuple tuple Symbol Int Int8 Int16 Int32 Int64 UInt UInt8 UInt16 UInt32
     UInt64 Float16 Float32 Float64 Bool String Char BigInt BigFloat Rational Complex VersionNumber Vector Matrix
@@ -514,17 +543,21 @@ function _definitions(ex)
 end
 
 """
-Names a statement binds to whole modules of packages, as `using A`, `import A.B` and
-`import A as B` do. Modules the analyzed code defines, which `using .A` names, are left out.
+Names a statement binds to whole modules of packages, as `using A.B`, `import A` and
+`import A as B` do; `import A.f` may bind a function. Modules the analyzed code defines,
+which `using .A` names, are left out.
 """
 function _modules(ex)
     names = Set{Symbol}()
     ex isa Expr || return names
     if ex.head in (:using, :import)
         for path in ex.args
-            path isa Expr && path.head === :as && (path = Expr(:., first(path.args).args..., last(path.args)))
-            path isa Expr && path.head === :. && !isempty(path.args) && first(path.args) !== :. &&
-                last(path.args) isa Symbol && push!(names, last(path.args))
+            alias = nothing
+            path isa Expr && path.head === :as && ((path, alias) = (first(path.args), last(path.args)))
+            path isa Expr && path.head === :. && !isempty(path.args) && first(path.args) !== :. || continue
+            ex.head === :using || length(path.args) == 1 || continue
+            name = something(alias, last(path.args))
+            name isa Symbol && push!(names, name)
         end
     elseif ex.head in (:block, :if, :elseif, :macrocall)
         foreach(arg -> union!(names, _modules(arg)), ex.args)
@@ -543,9 +576,78 @@ end
 const _TEST_MACROS = Set(["@test", "@test_broken", "@test_skip", "@test_throws", "@test_logs", "@test_warn",
                           "@test_nowarn", "@test_deprecated", "@inferred"])
 
-"Whether a method definition is a closure: an anonymous function or a `do` block."
-_closure(ex::Expr) = ex.head === :-> ||
-    (ex.head === :function && first(ex.args) isa Expr && first(ex.args).head === :tuple)
+const _OUTLINABLE = (:call, :ref, :., :parameters, :kw, :..., :block, :&&, :||, :if, :comparison, :tuple, :vect,
+                     :vcat, :hcat, :ncat, :typed_vcat, :typed_hcat, :typed_ncat, :row, :nrow, :string, :curly, :(::),
+                     :where)
+
+"""
+Whether `ex` must stay at top level: it includes or evaluates code, which JETLS follows
+only there, or interpolates into quoted code, which runs where the quote stands.
+"""
+_stays(ex) = ex isa Expr && (ex.head === :$ ||
+    (ex.head === :call && _name(first(ex.args)) in ("include", "include_string", "eval")) ||
+    _macro_name(ex) == "@eval" || any(_stays, ex.args))
+
+"""
+Whether the analysis worker outlines the top-level expression `ex` into a closure, as JET
+does a `@test` expression, so that the closures it defines in its branches need no evaluated
+conditions: an expression of calls and control flow, binding no names, or a loop or `let`
+block, whose body is a local scope already. A generator's ranges stand outside its closure.
+"""
+function _outlined(ex)
+    outlinable(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) || _closure(ex) || generator(ex) ||
+        (ex.head === :do && outlinable(first(ex.args)) && _closure(last(ex.args))) ||
+        (ex.head in _OUTLINABLE && all(outlinable, ex.args))
+    generator(ex) = ex isa Expr && (
+        ex.head in (:comprehension, :flatten) && length(ex.args) == 1 ? generator(only(ex.args)) :
+        ex.head === :typed_comprehension ? outlinable(first(ex.args)) && generator(last(ex.args)) :
+        ex.head === :generator && all(ex.args[2:end]) do spec
+            specs = spec isa Expr && spec.head === :filter ? spec.args[2:end] : Any[spec]
+            all(s -> s isa Expr && s.head === :(=) && outlinable(last(s.args)), specs)
+        end)
+    return ex isa Expr && (outlinable(ex) || _outlinable_scope(ex)) && !_stays(ex) && !_typed_closure(ex)
+end
+
+"Whether `ex` is a loop or `let` block that defines a function in a branch, without imports, which must stand at top level."
+_outlinable_scope(ex::Expr) = ex.head in (:for, :while, :let) && _branch_function(ex) && !_imports(ex)
+_imports(ex) = ex isa Expr && !(ex.head in (:quote, :inert)) && (ex.head in (:using, :import) || any(_imports, ex.args))
+
+"Whether `ex` defines a function, anonymous or local, in a branch."
+function _branch_function(ex, conditional::Bool=false)
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return false
+    (_method(ex) || ex.head === :generator) && return conditional
+    ex.head in (:if, :elseif, :&&, :||) &&
+        return _branch_function(first(ex.args), conditional) || any(arg -> _branch_function(arg, true), ex.args[2:end])
+    return any(arg -> _branch_function(arg, conditional), ex.args)
+end
+
+"Whether parameters declare types, which lowering evaluates where a closure stands."
+_typed(p) = p isa Expr && (p.head in (:(::), :where) ||
+    (p.head in (:tuple, :block, :parameters, :kw, :(=), :...) && any(_typed, p.head in (:kw, :(=)) ? p.args[1:1] : p.args)))
+
+"Whether `ex` defines a closure with typed parameters or a `where` clause."
+function _typed_closure(ex)
+    ex isa Expr || return false
+    ex.head === :-> && _typed(first(ex.args)) && return true
+    if ex.head === :function && length(ex.args) == 2
+        signature = first(ex.args)
+        Meta.isexpr(signature, :(::), 2) && (signature = first(signature.args))
+        (Meta.isexpr(signature, :where) || (Meta.isexpr(signature, :tuple) && _typed(signature))) && return true
+    end
+    return any(_typed_closure, ex.args)
+end
+
+"Whether `ex` defines an anonymous function: `x -> ...`, `function (x)::T ... end` or a `do` block's."
+function _closure(ex)
+    ex isa Expr || return false
+    ex.head === :-> && return true
+    ex.head === :function && length(ex.args) == 2 || return false
+    signature = first(ex.args)
+    while signature isa Expr && signature.head in (:(::), :where) && !isempty(signature.args)
+        signature = first(signature.args)
+    end
+    return signature isa Expr && signature.head === :tuple
+end
 
 "Symbols `ex` evaluates: those outside quoted code, and those interpolated into it."
 function _evaluated_symbols!(names::Set{Symbol}, ex, quoted::Bool=false)
@@ -553,7 +655,7 @@ function _evaluated_symbols!(names::Set{Symbol}, ex, quoted::Bool=false)
         quoted || push!(names, ex)
     elseif ex isa Expr
         quoted = ex.head === :quote ? true : ex.head === :$ ? false : quoted
-        foreach(arg -> _evaluated_symbols!(names, arg, quoted), ex.args)
+        foreach(arg -> _evaluated_symbols!(names, arg, quoted), (quoted ? ex : something(_command(ex), ex)).args)
     end
     return names
 end
@@ -600,7 +702,7 @@ function _code_reads!(names::Set{Symbol}, ex)
             _interpolated!(names, ex)
             ex.head === :-> || (_method(ex) ? _signature_types!(names, first(ex.args)) : _type_symbols!(names, ex))
         else
-            foreach(arg -> _code_reads!(names, arg), ex.args)
+            foreach(arg -> _code_reads!(names, arg), something(_command(ex), ex).args)
         end
     end
     return names
@@ -629,11 +731,14 @@ evaluates to define them; with `forced`, only those of `include` and `eval` call
 JETLS evaluates whatever they need. Assignments in `ex` that these names depend on count too.
 """
 function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
+    # Closures in an outlined expression's branches need no conditions.
+    forced = forced || _outlined(ex)
     direct = Set{Symbol}()
     locals = Pair{Set{Symbol},Set{Symbol}}[]
     needs!(parts, controls) =
         (foreach(part -> _evaluated_symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
-    function visit(ex, controls::Vector{Any}, branches::Vector{Any})
+    # Functions defined in loops and `let` blocks are local: closures.
+    function visit(ex, controls::Vector{Any}, branches::Vector{Any}, scoped::Bool=false)
         ex isa Expr || return
         head = ex.head
         if head in (:quote, :inert, :module)
@@ -646,14 +751,14 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
             # `@static` evaluates its condition when it expands.
             !forced && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
                 needs!(Any[first(last(ex.args).args)], controls)
-            foreach(arg -> visit(arg, controls, branches), ex.args[2:end])
-        elseif _is_include(ex)
+            foreach(arg -> visit(arg, controls, branches, scoped), ex.args[2:end])
+        elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "include_string")
             needs!(ex.args[2:end], controls)
         elseif head === :call && _name(first(ex.args)) == "eval"
             foreach(arg -> _code_reads!(direct, arg), ex.args[2:end])
             needs!(Any[], controls)
         elseif _method(ex)
-            forced || (_closure(ex) ? needs!(branches, Any[]) :
+            forced || (_closure(ex) || scoped ? needs!(branches, Any[]) :
                        (_signature_types!(direct, first(ex.args)); needs!(Any[], controls)))
         elseif head in (:struct, :abstract, :primitive)
             forced || (_type_symbols!(direct, ex); needs!(Any[], controls))
@@ -661,17 +766,20 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
             forced || needs!(Any[], controls)
         elseif head in (:if, :elseif, :&&, :||)
             condition = first(ex.args)
-            visit(condition, controls, branches)
-            foreach(arg -> visit(arg, [controls; condition], [branches; condition]), ex.args[2:end])
+            visit(condition, controls, branches, scoped)
+            foreach(arg -> visit(arg, [controls; condition], [branches; condition], scoped), ex.args[2:end])
         elseif head in (:for, :while)
-            visit(first(ex.args), controls, branches)
-            visit(last(ex.args), [controls; first(ex.args)], branches)
+            visit(first(ex.args), controls, branches, scoped)
+            visit(last(ex.args), [controls; first(ex.args)], branches, true)
+        elseif head === :let
+            visit(first(ex.args), controls, branches, scoped)
+            visit(last(ex.args), controls, branches, true)
         else
             !forced && head in (:generator, :comprehension, :typed_comprehension, :do) && needs!(branches, Any[])
             if head === :(=) && !_signature(first(ex.args))
                 push!(locals, _symbols(first(ex.args)) => union(_symbols(last(ex.args)), (_symbols(c) for c in controls)...))
             end
-            foreach(arg -> visit(arg, controls, branches), ex.args)
+            foreach(arg -> visit(arg, controls, branches, scoped), ex.args)
         end
     end
     visit(ex, Any[], Any[])
@@ -693,11 +801,11 @@ only where needed, or where JETLS evaluates part of them anyway; impure assignme
 where `include` and `eval` calls need them. A need selects the binding of a name that
 reaches the statement needing it. `excluded` statements are not evaluated.
 """
-function _concretized(expressions::Vector{Any}, excluded::Set{Int})
+function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set{Symbol}=Set{Symbol}())
     shadowed = Set{Symbol}()
     foreach(ex -> (_binds!(shadowed, ex); _globals!(shadowed, ex)), expressions)
-    scope = _Scope(Set{Symbol}(), Set{Symbol}(), shadowed)
-    variable = setdiff(union(_PROCESS_NAMES, _FILE_READS), shadowed)
+    scope = _Scope(setdiff(modules, shadowed), Set{Symbol}(), shadowed)
+    variable = setdiff(union(_PROCESS_NAMES, _RUN_DEPENDENT), shadowed)
     bound = Set{Symbol}()
     selected = Set{Int}()
     # Statements to evaluate where needed, with what they read and whether they are pure.
@@ -709,7 +817,7 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int})
     for (i, ex) in pairs(expressions)
         binds = _binds!(Set{Symbol}(), ex)
         assignment = _assignment(ex)
-        reads = assignment === nothing ? _symbols(ex) : _symbols(last(assignment))
+        reads = _evaluated_symbols!(Set{Symbol}(), assignment === nothing ? ex : last(assignment))
         known = i in excluded ? nothing : _evaluable(ex, scope, bound)
         setdiff!(scope.known, binds)
         if known === nothing
@@ -794,17 +902,18 @@ function _may_match(pattern, ex)
 end
 
 """
-    concretization_patterns(file) -> Vector{String}
+    concretization_patterns(file; modules=Set{Symbol}()) -> Vector{String}
 
 The source text of the top-level statements of `file` that analysis may evaluate, each a
-JETLS concretization pattern.
+JETLS concretization pattern. `modules` names the modules code that runs before the file
+imports, such as a test driver's prelude.
 """
-function concretization_patterns(file::String)
+function concretization_patterns(file::String; modules::Set{Symbol}=Set{Symbol}())
     text, statements = _statements(file; modules=true, blocks=false)
     expressions = Any[last(statement) for statement in statements]
     excluded = Set{Int}()
     while true
-        selected = _concretized(expressions, excluded)
+        selected = _concretized(expressions, excluded, modules)
         # A pattern selects every statement of its file that it matches.
         conflicts = filter(i -> any(j -> !(j in selected) && _may_match(expressions[i], expressions[j]),
                                     eachindex(expressions)), selected)
@@ -937,6 +1046,19 @@ function _relative_modules(ex)
                      path.args[2] isa Symbol]
 end
 
+function _drivers_statements(drivers::Vector{String}, target::String)
+    statements = _DriverStatement[]
+    seen = Set{String}()
+    for (i, driver) in pairs(drivers)
+        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen)
+    end
+    return statements
+end
+
+"The modules the prelude of `drivers` for `target` imports, which `target` can read."
+prelude_modules(drivers::Vector{String}, target::String) =
+    union(Set{Symbol}(), (_modules(statement.ex) for statement in _drivers_statements(drivers, target))...)
+
 """
     prelude(drivers, target) -> String
 
@@ -945,11 +1067,7 @@ which the last of them includes at run time: imports, definitions and the global
 assignments `target` transitively refers to, also from files the drivers include statically.
 """
 function prelude(drivers::Vector{String}, target::String)
-    statements = _DriverStatement[]
-    seen = Set{String}()
-    for (i, driver) in pairs(drivers)
-        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen)
-    end
+    statements = _drivers_statements(drivers, target)
     needed = Set{Symbol}()
     pending, visited = [target], Set{String}()
     while !isempty(pending)

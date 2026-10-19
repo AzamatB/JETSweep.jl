@@ -65,12 +65,13 @@ end
 # ============
 
 _context_key(context::Context) = bytes2hex(sha256(string(context.project, '\0', context.owner, '\0', context.test,
-    '\0', join(sort!(["$k=$v" for (k, v) in context.triggers]), '\0'))))[1:12]
+    '\0', join(sort!(["$k=$v" for (k, v) in context.triggers]), '\0'),
+    '\0', join(sort!(["$k=$v" for (k, v) in context.imports]), '\0'))))[1:12]
 
 function _prepare(context::Context, directory::String, options::SweepOptions)
     request = _write_toml(joinpath(directory, "request.toml"), Dict(
         "project" => context.project, "owner" => context.owner, "test" => context.test,
-        "triggers" => context.triggers, "directory" => joinpath(directory, "env"),
+        "triggers" => context.triggers, "imports" => context.imports, "directory" => joinpath(directory, "env"),
         "instantiate" => options.instantiate))
     result = joinpath(directory, "result.toml")
     log = joinpath(directory, "log.txt")
@@ -105,8 +106,8 @@ struct _Sweep
     tests::Dict{String,Unit}
     "Files each test driver includes at run time that are analyzed as their own units."
     separate::Dict{String,Vector{String}}
-    "Concretization patterns by file, since many units load the same files."
-    patterns::Dict{String,Vector{String}}
+    "Concretization patterns by file and the modules imported before it, since many units load the same files."
+    patterns::Dict{Tuple{String,Vector{Symbol}},Vector{String}}
 end
 
 "The `.JETLSConfig.toml` that applies to a unit: configured, or the nearest above its entry."
@@ -162,7 +163,8 @@ effects, and those `include` and `eval` calls need (`concretization_patterns`), 
 definitions and includes depending on their values load. A test driver's unit skips
 including the files it includes at run time that are analyzed as their own units.
 """
-function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separate::Vector{String})
+function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separate::Vector{String},
+                             drivers::Vector{String}=String[])
     root = sweep.inventory.root
     source = _jetls_config(unit, root)
     data = isempty(source) ? Dict{String,Any}() : TOML.parsefile(source)
@@ -179,10 +181,13 @@ function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separ
     if unit.kind in (:test, :script, :orphan)
         patterns = get!(full, "concretization_patterns", Any[])
         loaded = union((_reach(file, sweep.syntax; followed_only=true) for file in [unit.entry; unit.overrides.setup])...)
+        # A test file can read the modules its drivers' prelude imports.
+        modules = isempty(drivers) ? Set{Symbol}() : prelude_modules(drivers, unit.entry)
         for file in sort!(collect(loaded))
             isfile(file) && _within(file, root) || continue
             path = _glob_literal(relpath(file, root))
-            for pattern in get!(() -> concretization_patterns(file), sweep.patterns, file)
+            key = (file, sort!(collect(modules)))
+            for pattern in get!(() -> concretization_patterns(file; modules), sweep.patterns, key)
                 push!(patterns, Dict("pattern" => pattern, "path" => path))
             end
         end
@@ -232,7 +237,7 @@ function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Unio
     name, uuid = _package(unit, sweep.inventory)
     request = _write_toml(joinpath(directory, "request.toml"), Dict(
         "kind" => String(unit.kind), "entry" => unit.entry, "environment" => environment.dir,
-        "generated" => generated, "config" => _write_jetls_config(unit, directory, sweep, separate),
+        "generated" => generated, "config" => _write_jetls_config(unit, directory, sweep, separate, drivers),
         "root" => sweep.inventory.root, "package" => name, "uuid" => uuid, "extension" => unit.extension,
         "triggers" => unit.context.triggers, "args" => unit.overrides.args, "env" => unit.overrides.env))
     result = joinpath(directory, "result.toml")
@@ -392,7 +397,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     separate = Dict{String,Vector{String}}()
     foreach(unit -> isempty(unit.driver) || push!(get!(separate, unit.driver, String[]), unit.entry), units)
     state = _Sweep(inventory, output, options, syntax, Dict(unit.entry => unit for unit in units if unit.kind === :test),
-                   separate, Dict{String,Vector{String}}())
+                   separate, Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
     environments = Dict{Context,Environment}()
     results = Dict{String,UnitResult}()
     # Files some unit's entry already covers need no follow-up units of their own.
@@ -425,7 +430,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
         end
         return [_task(unit, previous) for unit in followups]
     end
-    _dispatch(step, [_task(context, members[context], previous) for context in contexts], options.jobs)
+    with_display(() -> _dispatch(step, [_task(context, members[context], previous) for context in contexts], options.jobs))
     after = _snapshot(discover(root; exclude=[config.exclude; options.exclude], output,
                                include_ignored=options.include_ignored, tracked_only=options.tracked_only), config)
     changed = sort!([file for file in union(keys(before), keys(after)) if get(before, file, "") != get(after, file, "")])

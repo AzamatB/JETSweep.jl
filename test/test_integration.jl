@@ -64,7 +64,7 @@ end
 @testset "incomplete analyses are explicit" begin
     mktempdir() do root
         write(joinpath(root, "missing_package.jl"), "using NotAPackageAnywhere\nf(x::Int) = x\n")
-        write(joinpath(root, "unresolved.jl"), "const PATHS = readdir(pwd())\nstruct S\n    x::typeof(PATHS)\nend\n")
+        write(joinpath(root, "unresolved.jl"), "const PATHS = rand(Bool) ? [\"a\"] : String[]\nstruct S\n    x::typeof(PATHS)\nend\n")
         mkpath(joinpath(root, "Broken", "src"))
         mkpath(joinpath(root, "Broken", "ext"))
         write(joinpath(root, "Broken", "Project.toml"), """
@@ -99,6 +99,46 @@ end
             const RUN = isempty(ASKED) ? ["a"] : filter(name -> name in ASKED, ["a"])
             selected() = RUN
             """)
+        # A script loads a package of its workspace that no project of it declares.
+        mkpath(joinpath(root, "Sibling", "src"))
+        write(joinpath(root, "Sibling", "Project.toml"),
+              "name = \"Sibling\"\nuuid = \"6f4d0fd2-62a3-4c43-9d6e-0c3fdd2a6f3b\"\nversion = \"0.1.0\"\n")
+        write(joinpath(root, "Sibling", "src", "Sibling.jl"), "module Sibling\nsibling_value() = 1\nend\n")
+        write(joinpath(root, "uses_sibling.jl"), "using Sibling\nuse() = Sibling.sibling_value() + \"one\"\n")
+        # A closure in a branch of a top-level expression does not stop the analysis, and the
+        # value its condition reads is not evaluated.
+        write(joinpath(root, "locked.jl"), """
+            acquire() = (touch(joinpath(@__DIR__, "acquired.marker")); nothing)
+            const LOCK = acquire()
+            LOCK === nothing || atexit(() -> close(LOCK))
+            after() = 1 + "one"
+            """)
+        # Nor does one in a branch of a top-level loop.
+        write(joinpath(root, "loop.jl"), """
+            const LISTED = readdir(ARGS[1])
+            for item in LISTED
+                if isdir(item)
+                    foreach(x -> println(x), item)
+                end
+            end
+            after() = 1 + "one"
+            """)
+        # A script runs as the program, so a check for that holds as it would.
+        write(joinpath(root, "main_check.jl"), """
+            const MAIN = abspath(PROGRAM_FILE) == abspath(@__FILE__)
+            if MAIN
+                report() = foreach(x -> println(x), 1:2)
+            end
+            after() = 1 + "one"
+            """)
+        # Code loaded with `include_string` is loaded.
+        write(joinpath(root, "bootstrap.jl"), """
+            const CODE = read(joinpath(@__DIR__, "bootstrapped.txt"), String)
+            include_string(@__MODULE__, CODE, "bootstrapped.jl")
+            using .Bootstrapped
+            use() = Bootstrapped.value() + "one"
+            """)
+        write(joinpath(root, "bootstrapped.txt"), "module Bootstrapped\nvalue() = 1\nend\n")
         # A generator in a branch of a `@test` expression does not make JETLS run the test.
         write(joinpath(root, "outlined.jl"), """
             using Test
@@ -127,6 +167,13 @@ end
         @test status("arguments.jl") in (:clean, :findings)
         @test status("selection.jl") === :clean
         @test status("outlined.jl") === :clean && !isfile(joinpath(root, "ran.marker"))
+        @test status("locked.jl") === :findings && !isfile(joinpath(root, "acquired.marker"))
+        @test status("bootstrap.jl") === :findings
+        @test status("main_check.jl") === :findings
+        @test status("loop.jl") === :findings
+        @test status("uses_sibling.jl") === :findings
+        sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
+        @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)
         @test result.exit_code == 2
         @test !isempty(TOML.parsefile(joinpath(output, "report.toml"))["unanalyzed"])
         # The terminal summary groups incomplete analyses by cause, with paths relative to the root.
