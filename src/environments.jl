@@ -356,8 +356,18 @@ checkout lacks until it is instantiated.
 """
 function _require_tool()
     tool = Pkg.Types.EnvCache(tool_project())
-    all(uuid -> haskey(tool.manifest, uuid), (_JETLS, _TESTRUNNER, _REVISE)) && Pkg.Operations.is_instantiated(tool) &&
-        return nothing
+    pending, seen = [_JETLS, _TESTRUNNER, _REVISE], Set{UUID}()
+    installed = true
+    while installed && !isempty(pending)
+        uuid = pop!(pending)
+        uuid in seen && continue
+        push!(seen, uuid)
+        entry = get(tool.manifest, uuid, nothing)
+        path = entry === nothing ? nothing : Pkg.Operations.source_path(tool.manifest_file, entry)
+        installed = path !== nothing && isdir(path) && Pkg.Operations.check_artifacts_downloaded(path)
+        installed && append!(pending, values(entry.deps))
+    end
+    installed && return nothing
     directory = Base.shell_escape(dirname(tool.project_file))
     error("JETSweep's project $directory is not instantiated; run ",
           "`julia --project=$directory -e 'using Pkg; Pkg.instantiate()'` first")

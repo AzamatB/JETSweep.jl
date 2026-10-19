@@ -1053,17 +1053,25 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
         if ex isa Expr && (ex.head in (:using, :import) || _definition(ex) || assignment !== nothing || conditional)
             # A module or conditional, like an assignment, is kept only where something refers to what it
             # binds, if anything.
+            # A conditional `using` of a whole module binds names that are not known statically, so it
+            # is kept as an import is.
             names = assignment !== nothing ? first(assignment) : ex.head === :module ? _bound_names(ex) :
-                conditional ? collect(_binds!(Set{Symbol}(), ex)) : Symbol[]
+                conditional && !_whole_using(ex) ? collect(_binds!(Set{Symbol}(), ex)) : Symbol[]
             push!(statements, _DriverStatement(file, JS.source_line(node), ex, names, _relocated(node, text, file)))
         end
     end
     return false
 end
 
-"The modules a relative import such as `using .Helpers` or `import ..Tools: f` names."
+"Whether `ex` runs a `using` of a whole module, as in `using Dates`, whose names are not known statically."
+_whole_using(ex) = ex isa Expr && (ex.head === :using ? any(path -> !(path isa Expr && path.head === :(:)), ex.args) :
+    ex.head in (:block, :if, :elseif, :macrocall) && any(_whole_using, ex.args))
+
+"The modules the relative imports in `ex`, such as `using .Helpers` or `import ..Tools: f`, name."
 function _relative_modules(ex)
-    ex isa Expr && ex.head in (:using, :import) || return Symbol[]
+    ex isa Expr || return Symbol[]
+    ex.head in (:block, :if, :elseif, :macrocall) && return reduce(vcat, (_relative_modules(arg) for arg in ex.args); init=Symbol[])
+    ex.head in (:using, :import) || return Symbol[]
     paths = [path isa Expr && path.head in (:(:), :as) ? first(path.args) : path for path in ex.args]
     return Symbol[path.args[2] for path in paths
                   if path isa Expr && path.head === :. && length(path.args) >= 2 && first(path.args) === :. &&
@@ -1114,7 +1122,7 @@ function prelude(drivers::Vector{String}, target::String; packages::Dict{String,
         changed = false
         for (i, statement) in pairs(statements)
             selected[i] && continue
-            any(in(needed), statement.names) || continue
+            any(in(needed), statement.names) && issubset(_relative_modules(statement.ex), defined) || continue
             selected[i] = changed = true
             _symbols!(needed, statement.ex)
         end

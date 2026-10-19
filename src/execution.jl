@@ -246,6 +246,10 @@ function _worker_error(log::String, code::Integer)
     return message
 end
 
+"A unit's notes: its plan's, and its environment's."
+_notes(unit::Unit, environment::Environment) =
+    isempty(environment.message) ? copy(unit.notes) : [unit.notes; "environment: " * environment.message]
+
 function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Union{Nothing,String})
     if !ready(environment)
         # The unit never runs; what preparation logged, if anything, tells why.
@@ -257,7 +261,8 @@ function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Unio
     mkpath(directory)
     log = joinpath(directory, "log.txt")
     started = time()
-    failure(status, reason) = UnitResult(unit.id, status, Finding[], String[], [reason], copy(unit.notes), time() - started, log)
+    notes = _notes(unit, environment)
+    failure(status, reason) = UnitResult(unit.id, status, Finding[], String[], [reason], copy(notes), time() - started, log)
     generated = joinpath(directory, "entry.jl")
     drivers = _drivers(unit, sweep)
     unit.kind in (:test, :script) && write(generated, _generated_entry(unit, drivers, sweep.inventory))
@@ -282,7 +287,6 @@ function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Unio
     haskey(data, "error") && return failure(:failed, first(split(data["error"], '\n')))
     reasons = String[data["reasons"]..., ("logged error: " * error for error in data["errors"])...]
     analyzed = Vector{String}(data["analyzed"])
-    notes = isempty(environment.message) ? copy(unit.notes) : [unit.notes; "environment: " * environment.message]
     # Files the analysis did not reach are analyzed by follow-up units; see `_followups`.
     missed = setdiff(unit.expected, analyzed)
     isempty(missed) || push!(notes, "not reached by this analysis: " * join(_display.(missed, sweep.inventory.root), ", "))
@@ -470,7 +474,8 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
         end
         gpu = isempty(gpus) ? nothing : gpus[mod1(started_units[] += 1, length(gpus))]
         outcome = contained(() -> _analyze(work, environments[work.context], state, gpu),
-                            message -> UnitResult(work.id, :failed, Finding[], String[], [message], String[], 0.0, ""))
+                            message -> UnitResult(work.id, :failed, Finding[], String[], [message],
+                                                  _notes(work, environments[work.context]), 0.0, ""))
         results[work.id] = outcome
         report_progress(io, work, outcome, length(results), length(units), root)
         followups = _followups(work, outcome, state, planned)

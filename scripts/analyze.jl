@@ -344,6 +344,22 @@ function abstract_fields(target::Module, files::Vector{String})
 end
 
 """
+The end of a range that starts at `start` in `text` as the file now is. JETLS ends a whole-line
+range at character typemax(Int32), which LSP reads as the end of the line: before its "\\r\\n"
+or "\\n". A line the file no longer has, or a range the file's changes would turn around, ends
+where it starts.
+"""
+function range_end(text::Vector{UInt8}, starts::Vector{Int}, encoding, start, stop)
+    if stop.character == typemax(Int32)
+        stop.line < length(starts) || return start
+        offset = LS._xy_to_offset(text, stop, encoding, starts)
+        1 < offset <= length(text) && text[offset] == UInt8('\n') && text[offset-1] == UInt8('\r') && (offset -= 1)
+        stop = LS._offset_to_xy(text, offset, encoding, starts)
+    end
+    return (stop.line, stop.character) < (start.line, start.character) ? start : stop
+end
+
+"""
 Diagnostics of original files, with positions in `encoding`. Skipped includes are reported
 as missing coverage instead.
 """
@@ -356,11 +372,8 @@ function findings(uri2diagnostics, generated::String, encoding)
         starts = LS.build_line_starts(text)
         for diagnostic in diagnostics
             diagnostic.code == "toplevel/analysis-skipped" && continue
-            (; start, var"end") = diagnostic.range
-            # JETLS ends a whole-line range at character typemax(Int32), which LSP reads as the
-            # end of the line; so does the report, where it can read the file.
-            stop = isempty(text) ? var"end" :
-                LS._offset_to_xy(text, LS._xy_to_offset(text, var"end", encoding, starts), encoding, starts)
+            (; start) = diagnostic.range
+            stop = range_end(text, starts, encoding, start, diagnostic.range.var"end")
             push!(rows, Dict{String,Any}("file" => file,
                 "line" => start.line + 1, "column" => start.character + 1,
                 "end_line" => stop.line + 1, "end_column" => stop.character + 1,

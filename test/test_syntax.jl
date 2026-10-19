@@ -129,6 +129,38 @@ end
     @test defined.syntax.notes == [syntax_dynamic(defined.file, 2)]
 end
 
+@testset "prelude keeps conditional imports that can load" begin
+    # A whole-module import binds names not known statically; the test file may use any.
+    driver = "using Test\n@static if VERSION >= v\"1.0\"\n    using Dates\nend\nfor f in ARGS\n    include(f)\nend\n"
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "@test year(Date(2020, 1, 1)) == 2020\n") do text, dir
+        @test occursin("using Dates", text)
+        loaded = Module()
+        Core.eval(loaded, :(include_string(@__MODULE__, $text)))
+        @test Core.eval(loaded, :(year(Date(2020, 1, 1)))) == 2020
+    end
+    # A relative import of a module the prelude does not define would fail, inside a conditional too.
+    hidden = "@eval module Helpers
+h() = 1
+end
+@static if VERSION >= v\"1.0\"\n    using .Helpers: h\nend\n" *
+             "for f in ARGS\n    include(f)\nend\n"
+    syntax_prelude("test/runtests.jl" => hidden, "test/target.jl" => "h()\n") do text, dir
+        @test !occursin("using .Helpers", text)
+        @test Core.eval(Module(), :(include_string(@__MODULE__, $text); true))
+    end
+    shown = "module Helpers
+h() = 1
+end
+@static if VERSION >= v\"1.0\"\n    using .Helpers: h\nend\n" *
+            "for f in ARGS\n    include(f)\nend\n"
+    syntax_prelude("test/runtests.jl" => shown, "test/target.jl" => "h()\n") do text, dir
+        @test occursin("using .Helpers: h", text)
+        loaded = Module()
+        Core.eval(loaded, :(include_string(@__MODULE__, $text)))
+        @test Core.eval(loaded, :(h())) == 1
+    end
+end
+
 @testset "prelude follows includes through pkgdir and pathof of the unit's package" begin
     mktempdir() do directory
         dir = realpath(directory)

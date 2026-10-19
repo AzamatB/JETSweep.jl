@@ -401,6 +401,24 @@ end
     end
 end
 
+@testset "only the analyzer needs to be installed" begin
+    # Packages of JETSweep's environment that the analyzer does not depend on may be missing.
+    mktempdir() do tool
+        cp(joinpath(pkgdir(JETSweep), "Project.toml"), joinpath(tool, "Project.toml"))
+        manifest = TOML.parsefile(joinpath(pkgdir(JETSweep), "Manifest.toml"))
+        manifest["deps"]["NeverInstalled"] = [Dict{String,Any}("uuid" => "6a1a2b3c-4d5e-4f60-8a71-92b3c4d5e6f7",
+                                                               "version" => "1.0.0", "git-tree-sha1" => repeat("ab", 20))]
+        open(io -> TOML.print(io, manifest), joinpath(tool, "Manifest.toml"), "w")
+        loaded = JETSweep._LOADED_PROJECT[]
+        JETSweep._LOADED_PROJECT[] = joinpath(tool, "Project.toml")
+        try
+            @test JETSweep._require_tool() === nothing
+        finally
+            JETSweep._LOADED_PROJECT[] = loaded
+        end
+    end
+end
+
 @testset "Sweeps started in the same second get their own report directories" begin
     mktempdir() do directory
         root = realpath(directory)
