@@ -618,6 +618,17 @@ end
         failed = JETSweep.UnitResult("unit", :failed, JETSweep.Finding[], String[], ["load error"], String[], 0.0, "")
         @test isempty(JETSweep._followups(unit, failed, sweep, Set([entry])))
 
+        # A file of a submodule cannot be analyzed in its scope by itself, so it stays uncovered.
+        scoped = execution_touch(joinpath(root, "Scoped", "src", "Scoped.jl"),
+                                 "module Scoped\nmodule Sub\nif false\n    include(\"sub.jl\")\nend\nend\nend\n")
+        sub = execution_touch(joinpath(root, "Scoped", "src", "sub.jl"))
+        scoped_sweep = JETSweep._Sweep(sweep.inventory, root, SweepOptions(),
+                                       Dict(scoped => JETSweep.parse_source(scoped)), Dict{String,JETSweep.Unit}(),
+                                       Dict{String,Vector{String}}(), Dict{String,Vector{String}}())
+        scoped_unit = JETSweep.Unit("package-scoped", :package, scoped, context, [scoped, sub], "", "",
+                                    JETSweep.Overrides(), String[])
+        @test isempty(JETSweep._followups(scoped_unit, analyzed(scoped), scoped_sweep, Set([scoped])))
+
         tests = JETSweep.Context(package, package, true, Dict{String,String}())
         overrides = JETSweep.Overrides(; args=["--quick"])
         unit = JETSweep.Unit("test-unit", :test, test, tests, [test, helper, leaf], "", "", overrides, String[])
@@ -641,10 +652,11 @@ end
         end
         result(unit, seconds, status="clean") = Dict("unit" => unit, "seconds" => seconds, "status" => status)
         report("1", [result("test-slow", 5.0)])
-        report("2", [result("test-slow", 200.0), result("test-stopped", 300.0, "incomplete")])
+        report("2", [result("test-slow", 200.0), result("test-stopped", 300.0, "incomplete"),
+                     result("test-failed", 1.0, "failed")])
         previous = JETSweep._previous_seconds(root)
-        # Only analyses that completed tell how long one takes.
-        @test previous == Dict("test-slow" => 200.0)
+        # Analyses that ran tell how long one takes; failed ones do not.
+        @test previous == Dict("test-slow" => 200.0, "test-stopped" => 300.0)
         # Another version of JETSweep may take differently long.
         report("3", [result("test-slow", 1.0)]; jetsweep="0.0.1")
         @test isempty(JETSweep._previous_seconds(root))

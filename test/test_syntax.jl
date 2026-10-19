@@ -370,7 +370,8 @@ end
         end
         Base.show(io::IO, ::Thing) = print(io, "thing")
         """
-    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "@test true\n") do text, dir
+    # A module is kept where the target refers to it.
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "@test Inner.inner() == 1\n") do text, dir
         @test syntax_parses(text)
         @test syntax_imports(text) == syntax_imports(driver)
         @test syntax_names(text) == Set([:long_form, :short_form, :typed, :declared, Symbol("@twice"),
@@ -423,6 +424,9 @@ end
         for file in TEST_RUN
             include(file)
         end
+        # The target is included before these run.
+        const AFTER = 10
+        after_loop() = AFTER
         """
     target = """
         include("part.jl")
@@ -440,7 +444,7 @@ end
         @test syntax_parses(text)
         @test [:USED_BY_TARGET, :CHAIN_BASE, :CHAIN_TOP, :FOR_HELPER, :helper, :FOR_BODY, :body_helper,
                :DEEP_BASE, :DEEP, :deep_helper, :FOR_PART, :TYPED, :counter] ⊆ names
-        @test isdisjoint(names, [:UNUSED, :ONLY_IN_TESTSET, :TEST_FILES, :TEST_ASKED, :TEST_RUN])
+        @test isdisjoint(names, [:UNUSED, :ONLY_IN_TESTSET, :TEST_FILES, :TEST_ASKED, :TEST_RUN, :AFTER, :after_loop])
         @test :TOL in names
         @test !occursin("ARGS", text) && !occursin("ENV", text)
         sandbox = syntax_load(text)
@@ -465,15 +469,15 @@ end
         begin
             include("block_helpers.jl")
         end
-        include("group.jl")
-        include("target.jl")
-        include("missing.jl")
-        include("helpers.jl")
         @testset "all" begin
             include("nested/runtests.jl")
             include("testset_only.jl")
         end
         skip_conditional() || include("conditional.jl")
+        include("group.jl")
+        include("target.jl")
+        include("missing.jl")
+        include("helpers.jl")
         function later()
             include("function_only.jl")
         end

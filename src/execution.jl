@@ -127,13 +127,27 @@ _glob_literal(path::AbstractString) = replace(_slash(path), r"([\\*?\[\]])" => s
 const _PATH_SETTINGS = (("diagnostic", "patterns"), ("full_analysis", "concretization_patterns"),
                         ("initialization_options", "analysis_overrides"))
 
-"Test drivers that run `unit`'s entry, outermost first."
+"""
+Test drivers that run `unit`'s entry, outermost first: the chain of driver units, and the
+nearest `runtests.jl` when the last of them includes it statically.
+"""
 function _drivers(unit::Unit, sweep::_Sweep)
     drivers = String[]
     driver = unit.driver
     while !isempty(driver) && !(driver in drivers)
         pushfirst!(drivers, driver)
         driver = haskey(sweep.tests, driver) ? sweep.tests[driver].driver : ""
+    end
+    isempty(drivers) && return drivers
+    tests = joinpath(unit.context.owner, "test")
+    directory = dirname(unit.entry)
+    while _within(directory, tests) && directory != dirname(last(drivers))
+        nearest = joinpath(directory, "runtests.jl")
+        if nearest != unit.entry && haskey(sweep.tests, last(drivers)) && nearest in sweep.tests[last(drivers)].expected
+            push!(drivers, nearest)
+            break
+        end
+        directory = dirname(directory)
     end
     return drivers
 end
@@ -252,6 +266,12 @@ other missed files covers them.
 function _followups(unit::Unit, result::UnitResult, sweep::_Sweep, planned::Set{String})
     result.status in (:clean, :findings, :incomplete) && !isempty(result.analyzed) || return Unit[]
     missed = setdiff(unit.expected, result.analyzed, planned)
+    # A file included inside a module block other than its package's own module belongs to
+    # that module, which a follow-up cannot recreate; it stays uncovered.
+    package = unit.kind in (:package, :extension)
+    for file in unit.expected, include in get(sweep.syntax, file, Syntax(Include[], String[])).includes
+        include.depth > (package && file == unit.entry) && setdiff!(missed, [include.target])
+    end
     isempty(missed) && return Unit[]
     root = sweep.inventory.root
     groups = _entries(missed, sweep.syntax)
@@ -267,8 +287,8 @@ end
 
 """
 Seconds each unit took in the latest report below `root/.jetsweep`, if this version of
-JETSweep wrote it, for units it analyzed completely or stopped at the time limit. Unit ids
-are stable across runs, so a repeated sweep can start its longest analyses first.
+JETSweep wrote it, for units whose analysis ran. Unit ids are stable across runs, so a
+repeated sweep can start its longest analyses first.
 """
 function _previous_seconds(root::String)
     directory = joinpath(root, ".jetsweep")
@@ -278,7 +298,7 @@ function _previous_seconds(root::String)
         report = TOML.parsefile(argmax(mtime, reports))
         report["jetsweep"] == string(pkgversion(@__MODULE__)) || return Dict{String,Float64}()
         return Dict{String,Float64}(r["unit"] => r["seconds"] for r in report["results"]
-                                    if r["status"] in ("clean", "findings", "timeout"))
+                                    if r["status"] in ("clean", "findings", "incomplete", "timeout"))
     catch
         return Dict{String,Float64}()
     end

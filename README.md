@@ -70,9 +70,10 @@ grouped into analysis units, each covering its entry file and the files it inclu
 
 Test drivers commonly choose their test files at run time, as in
 `for file in (isempty(ARGS) ? ALL_TESTS : ARGS) include(file) end`, which static analysis cannot
-follow. Each such test file therefore gets its own unit, analyzed after a prelude of the
-drivers' imports and definitions and the constants the test file refers to, copied with their
-original source text; selection logic the test file does not depend on is left out. The
+follow. Each such test file therefore gets its own unit, analyzed after a prelude of what the
+drivers set up before including it: imports, definitions, and the constants and modules the
+test file refers to, copied with their original source text; selection logic the test file
+does not depend on is left out. The
 drivers' own analyses evaluate the selection and skip including the files analyzed
 separately.
 
@@ -104,7 +105,9 @@ JETLS's interpreter.
 
 Files a finished analysis does not reach, such as package files loading leaves out or files
 after an analysis stop, get follow-up units of their own, in the same context: a package's
-missed files are analyzed in its module, each group under the file that includes the rest.
+or extension's missed files are analyzed in its module, each group under the file that
+includes the rest. A missed file that a submodule includes cannot be analyzed in its scope
+by itself and stays uncovered.
 Files of analyses that time out, fail or have no environment are not analyzed elsewhere; the
 summary lists every file no complete analysis covered.
 

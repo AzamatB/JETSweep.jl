@@ -9,7 +9,10 @@ struct Include
     line::Int
     "Whether analysis follows the call: JETLS skips includes inside function bodies."
     followed::Bool
+    "How many `module` blocks of its file enclose the call."
+    depth::Int
 end
+Include(target::String, line::Int, followed::Bool) = Include(target, line, followed, 0)
 
 struct Syntax
     includes::Vector{Include}
@@ -113,7 +116,7 @@ function parse_source(file::String, packages::Dict{String,String}=Dict{String,St
         return Syntax(includes, ["$file: cannot be read: $(sprint(showerror, err))"])
     end
     line = 1
-    function visit(ex, bindings::Dict{Symbol,String}, followed::Bool)
+    function visit(ex, bindings::Dict{Symbol,String}, followed::Bool, depth::Int=0)
         ex isa LineNumberNode && (line = ex.line; return)
         ex isa Expr || return
         head = ex.head
@@ -126,19 +129,19 @@ function parse_source(file::String, packages::Dict{String,String}=Dict{String,St
             target = _path(last(ex.args), file, bindings, packages)
             if target === nothing
                 push!(notes, "$file:$line: include target is only known at run time")
-                push!(includes, Include("", line, followed))
+                push!(includes, Include("", line, followed, depth))
             else
-                push!(includes, Include(normpath(dirname(file), target), line, followed))
+                push!(includes, Include(normpath(dirname(file), target), line, followed, depth))
             end
             return
         elseif _method(ex)
             # Parameters shadow outer bindings; the body is analyzed, never run, at top level.
             inner = copy(bindings)
             foreach(name -> delete!(inner, name), _symbols(first(ex.args)))
-            foreach(arg -> visit(arg, inner, false), ex.args[2:end])
+            foreach(arg -> visit(arg, inner, false, depth), ex.args[2:end])
             return
         elseif head === :module
-            visit(last(ex.args), Dict{Symbol,String}(), followed)
+            visit(last(ex.args), Dict{Symbol,String}(), followed, depth + 1)
             return
         elseif head === :(=) || head in _UPDATES
             _rebind!(bindings, ex, file, packages)
@@ -150,7 +153,7 @@ function parse_source(file::String, packages::Dict{String,String}=Dict{String,St
             specs = head === :generator ? ex.args[2:end] : ex.args[1:1]
             foreach(spec -> foreach(name -> delete!(inner, name), _loop_names(spec)), specs)
         end
-        foreach(arg -> visit(arg, inner, followed), ex.args)
+        foreach(arg -> visit(arg, inner, followed, depth), ex.args)
         scoped && foreach(name -> delete!(bindings, name), _assigned!(Set{Symbol}(), ex))
         return
     end
@@ -765,15 +768,20 @@ struct _DriverStatement
     text::String
 end
 
-"Include calls in `ex` that run when it does, outside function bodies."
+"Include calls in `ex` that run when it does, outside function bodies and modules."
 function _nested_includes!(includes::Vector{Expr}, ex)
     ex isa Expr && !(ex.head in (:quote, :inert, :module)) && !_method(ex) || return includes
     _is_include(ex) ? push!(includes, ex) : foreach(arg -> _nested_includes!(includes, arg), ex.args)
     return includes
 end
 
+"""
+Collect the statements of `file` that set up what it includes as `next`: those before the
+include of `next`, or before its first run-time include, also from the files it includes
+statically before then. Returns whether that include was reached.
+"""
 function _driver_statements!(statements::Vector{_DriverStatement}, file::String, next::String, seen::Set{String})
-    file in seen && return statements
+    file in seen && return false
     push!(seen, file)
     text, nodes = _statements(file)
     bindings = Dict{Symbol,String}()
@@ -783,10 +791,11 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
         # included inside a `@testset`, say.
         for include in _nested_includes!(Expr[], ex)
             path = _path(last(include.args), file, bindings, Dict{String,String}())
-            path === nothing && continue
+            path === nothing && return true
             path = normpath(dirname(file), path)
-            (_is_include(ex) || basename(path) == "runtests.jl") && path != next && isfile(path) &&
-                _driver_statements!(statements, path, next, seen)
+            path == next && return true
+            (_is_include(ex) || basename(path) == "runtests.jl") && isfile(path) &&
+                _driver_statements!(statements, path, next, seen) && return true
         end
         _is_include(ex) && continue
         assignment = _assignment(ex)
@@ -796,12 +805,21 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
             known === nothing ? foreach(name -> delete!(bindings, name), names) : (bindings[only(names)] = known)
         end
         if ex isa Expr && (ex.head in (:using, :import) || _definition(ex) || assignment !== nothing)
-            push!(statements, _DriverStatement(file, JS.source_line(node), ex,
-                                               assignment === nothing ? Symbol[] : first(assignment),
-                                               _relocated(node, text, file)))
+            # A module, like an assignment, is kept only where something refers to it.
+            names = assignment !== nothing ? first(assignment) : ex.head === :module ? _bound_names(ex) : Symbol[]
+            push!(statements, _DriverStatement(file, JS.source_line(node), ex, names, _relocated(node, text, file)))
         end
     end
-    return statements
+    return false
+end
+
+"The modules a relative import such as `using .Helpers` or `import ..Tools: f` names."
+function _relative_modules(ex)
+    ex isa Expr && ex.head in (:using, :import) || return Symbol[]
+    paths = [path isa Expr && path.head in (:(:), :as) ? first(path.args) : path for path in ex.args]
+    return Symbol[path.args[2] for path in paths
+                  if path isa Expr && path.head === :. && length(path.args) >= 2 && first(path.args) === :. &&
+                     path.args[2] isa Symbol]
 end
 
 """
@@ -826,7 +844,9 @@ function prelude(drivers::Vector{String}, target::String)
         _symbols!(needed, Meta.parseall(read(file, String); filename=file))
         append!(pending, (i.target for i in parse_source(file).includes if !isempty(i.target)))
     end
-    selected = [isempty(statement.names) for statement in statements]
+    # A relative import of a module the prelude does not define would fail.
+    defined = Set{Symbol}(name for statement in statements if statement.ex.head === :module for name in statement.names)
+    selected = [isempty(statement.names) && issubset(_relative_modules(statement.ex), defined) for statement in statements]
     for (statement, keep) in zip(statements, selected)
         keep && _symbols!(needed, statement.ex)
     end

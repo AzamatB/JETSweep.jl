@@ -145,10 +145,16 @@ function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String
         end
     end
 
+    # Extension sources no extension includes: in `ext/Name/`, those of extension `Name`.
     for source in inventory.sources
         source.path in covered && continue
         source.kind === :extension && haskey(projects, source.owner) && ispackage(projects[source.owner]) || continue
-        add!(:orphan, source.path, Context(source.owner, source.owner, false, Dict{String,String}()), [source.path])
+        package = projects[source.owner]
+        parts = splitpath(relpath(source.path, joinpath(package.dir, "ext")))
+        name = length(parts) > 1 && haskey(package.extensions, first(parts)) &&
+            !isempty(_extension_entry(package, first(parts))) ? first(parts) : ""
+        triggers = isempty(name) ? Dict{String,String}() : package.extensions[name]
+        add!(:orphan, source.path, Context(package.dir, package.dir, false, triggers), [source.path]; extension=name)
     end
 
     # Everything else is a script, analyzed in its nearest environment.

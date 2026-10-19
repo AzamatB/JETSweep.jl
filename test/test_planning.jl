@@ -116,6 +116,7 @@ end
         flat = planning_file(host, "ext/FlatExt.jl", "module FlatExt\nend\n")
         nested = planning_file(host, "ext/DirExt/DirExt.jl", "module DirExt\ninclude(\"helper.jl\")\nend\n")
         helper = planning_file(host, "ext/DirExt/helper.jl")
+        stray = planning_file(host, "ext/DirExt/stray.jl")
         both_flat = planning_file(host, "ext/BothExt.jl", "module BothExt\nend\n")
         both_nested = planning_file(host, "ext/BothExt/BothExt.jl", "module BothExt\nend\n")
         undeclared = planning_file(host, "ext/Undeclared.jl")
@@ -136,8 +137,13 @@ end
         @test planning_unit(units, both_nested).kind === :orphan
         @test planning_unit(units, undeclared).kind === :orphan
         @test planning_unit(units, undeclared).context == planning_context(host, host)
+        # A source in an extension's directory that it does not include belongs to it.
+        @test planning_unit(units, stray).kind === :orphan
+        @test planning_unit(units, stray).extension == "DirExt"
+        @test planning_unit(units, stray).context == extensions["DirExt"].context
+        @test planning_unit(units, undeclared).extension == ""
         @test !any(unit -> unit.extension == "AbsentExt", units)
-        @test length(units) == 6
+        @test length(units) == 7
         planning_invariants(inventory, units)
     end
 end
