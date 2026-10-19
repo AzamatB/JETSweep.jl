@@ -73,27 +73,27 @@ Test drivers commonly choose their test files at run time, as in
 follow. Each such test file therefore gets its own unit, analyzed after a prelude of what the
 drivers set up before including it: imports, definitions, and the constants and modules the
 test file refers to, copied with their original source text; selection logic the test file
-does not depend on is left out. The
-drivers' own analyses evaluate the selection and skip including the files analyzed
-separately.
+does not depend on is left out. The drivers' own analyses evaluate the selection and skip
+including the files analyzed separately.
 
 Script analysis evaluates definitions, imports and includes but not assignments, so a
 definition or `include` that needs an assigned value stops JETLS
 (`toplevel/missing-concretization`), and other code sees assigned values only as types.
-JETSweep lets JETLS evaluate the top-level statements of the files a unit loads that cannot
-have side effects: assignments of literals, paths and pure functions of names already bound,
-such as `const ROOT = normpath(joinpath(@__DIR__, ".."))`, and blocks and conditionals made
-only of these, definitions and imports, such as `if !@isdefined(Alias) const Alias = Package end`.
+JETSweep therefore lets JETLS evaluate the top-level statements of the files a unit loads
+that cannot have side effects: assignments of literals, paths and pure functions of names
+already bound, such as `const ROOT = normpath(joinpath(@__DIR__, ".."))`, and blocks and
+conditionals made only of these, definitions and imports, such as
+`if !@isdefined(Alias) const Alias = Package end`.
+
 Values that depend on how and where the program runs (`ARGS`, `ENV`, files read) are
-evaluated only where analysis needs them: in `include` and `eval` arguments, definition
-signatures, and conditions of branches that define closures or choose imports, which JETLS
-evaluates itself. Since JETLS always evaluates `include` and `eval` calls,
-whatever their arguments need is evaluated too, side effects or not, as a test driver's
-selection of its files is. A value that code left unevaluated may change,
-as `push!` or an indexed assignment does, is no longer evaluated from there on, and neither is
-a name the file rebinds, even one Base defines. Since JETLS matches these statements as
-patterns, in which names such as `x_` and `@__DIR__` are wildcards, a statement whose
-pattern would also match another statement of its file is not evaluated.
+evaluated only where JETLS needs them: in the arguments of `include` and `eval` calls, in
+definition signatures, and in conditions that define closures or choose imports. And since
+JETLS always evaluates `include` and `eval` calls, whatever their arguments need is evaluated,
+side effects or not, as a test driver's selection of its files is. A value that code left
+unevaluated may change, as `push!` or an indexed assignment does, is not evaluated from there
+on, and neither is a name the file rebinds, even one Base defines. JETLS matches these
+statements as patterns, in which names such as `x_` and `@__DIR__` are wildcards, so a
+statement whose pattern would also match another statement of its file is not evaluated.
 
 JETSweep extends one JETLS rule. To define a closure in a branch, JETLS evaluates the
 branch's condition, and with it everything the condition depends on: in a test set, the
