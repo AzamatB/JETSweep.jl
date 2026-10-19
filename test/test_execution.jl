@@ -330,8 +330,15 @@ end
             (["--gpus", "0", "--gpus", "1", "a"], "--gpus given more than once"))
         @test_throws ArgumentError(message) JETSweep.parse_arguments(arguments)
     end
-    @test_throws ArgumentError JETSweep.parse_arguments(["--jobs", "many", "a"])
-    @test_throws ArgumentError JETSweep.parse_arguments(["--timeout", "soon", "a"])
+    # A value that is not a number names its option.
+    for (arguments, message) in (
+            (["--jobs", "many", "a"], "--jobs needs an integer, not \"many\""),
+            (["--jobs=1.5", "a"], "--jobs needs an integer, not \"1.5\""),
+            (["--jobs", "99999999999999999999", "a"], "--jobs needs an integer, not \"99999999999999999999\""),
+            (["--threads=two", "a"], "--threads needs an integer, not \"two\""),
+            (["--timeout", "soon", "a"], "--timeout needs a number, not \"soon\""))
+        @test_throws ArgumentError(message) JETSweep.parse_arguments(arguments)
+    end
 end
 
 "Call `f` with standard output and error redirected; return its value and both outputs."

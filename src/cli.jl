@@ -33,6 +33,13 @@ const HELP = """
     use JETSweep only on code you trust.
     """
 
+"The value of option `name` as a `T`, or an error naming both."
+function _number(::Type{T}, name::AbstractString, value::String) where {T<:Real}
+    number = tryparse(T, value)
+    number === nothing && throw(ArgumentError("$name needs $(T <: Integer ? "an integer" : "a number"), not $(repr(value))"))
+    return number
+end
+
 function parse_arguments(arguments::Vector{String})
     values = Dict{Symbol,Any}()
     exclude = String[]
@@ -59,9 +66,9 @@ function parse_arguments(arguments::Vector{String})
                 i += 1
                 continue
             end
-            key, parsed = name == "--jobs" ? (:jobs, parse(Int, value)) :
-                name == "--threads" ? (:threads, parse(Int, value)) :
-                name == "--timeout" ? (:timeout, parse(Float64, value)) :
+            key, parsed = name == "--jobs" ? (:jobs, _number(Int, name, value)) :
+                name == "--threads" ? (:threads, _number(Int, name, value)) :
+                name == "--timeout" ? (:timeout, _number(Float64, name, value)) :
                 name == "--gpus" ? (:gpus, String.(strip.(split(value, ',')))) :
                 name == "--output" ? (:output, abspath(value)) :
                 name == "--config" ? (:config, abspath(value)) : (:fail_on, Symbol(value))
