@@ -1,0 +1,9 @@
+name = "BackendWitness"
+uuid = "4b656040-21d6-4560-9bd0-3816743acc86"
+version = "0.1.0"
+
+[weakdeps]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[extensions]
+BackendWitnessTestExt = "Test"
