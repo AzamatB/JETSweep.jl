@@ -652,6 +652,24 @@ end
     end
 end
 
+@testset "Report directories are tagged as caches, so later sweeps skip them" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        script = execution_touch(joinpath(root, "script.jl"), "f() = 1\n")
+        earlier = sweep(root; options=SweepOptions(plan_only=true, output=joinpath(root, "reports", "a")), io=devnull)
+        @test startswith(read(joinpath(earlier.output, "CACHEDIR.TAG"), String),
+                         "Signature: 8a477f597d28d172789f06886806bc55\n")
+        # What an analysis leaves there: generated entries and prepared environments.
+        execution_touch(joinpath(earlier.output, "units", "script-1", "entry.jl"), "include($(repr(script)))\n")
+        execution_touch(joinpath(earlier.output, "environments", "1", "env", "Project.toml"), "")
+        later = sweep(root; options=SweepOptions(plan_only=true, output=joinpath(root, "reports", "b")), io=devnull)
+        @test [source.path for source in later.inventory.sources] == [script]
+        @test isempty(later.inventory.projects)
+        @test only(later.units).entry == script
+        @test isfile(joinpath(sweep(root; options=SweepOptions(plan_only=true), io=devnull).output, "CACHEDIR.TAG"))
+    end
+end
+
 @testset "Files a unit did not reach get follow-up units" begin
     mktempdir() do directory
         root = realpath(directory)

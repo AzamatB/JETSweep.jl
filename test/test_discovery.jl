@@ -345,6 +345,24 @@ end
     end
 end
 
+@testset "Directories tagged as caches are excluded, such as earlier reports (Git: $git)" for git in (false, true)
+    mktempdir() do root
+        discovery_write(root, "input.jl")
+        # An earlier report: its tag, generated entries and environments.
+        discovery_write(root, "reports/a/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n# A tag.\n")
+        discovery_write(root, "reports/a/units/script-1/entry.jl")
+        discovery_write(root, "reports/a/environments/1/env/Project.toml", "")
+        # Only the signature marks a cache.
+        discovery_write(root, "notes/CACHEDIR.TAG", "Signature: none\n")
+        discovery_write(root, "notes/kept.jl")
+        git && discovery_git(root, "reports/a/units/script-1/entry.jl")
+        inventory = discover(root)
+        @test discovery_files(inventory) == ["input.jl", "notes/kept.jl"]
+        @test isempty(inventory.projects) && isempty(inventory.issues)
+        @test discovery_reasons(inventory) == Dict("reports/a" => "tagged cache directory")
+    end
+end
+
 @testset "Symlinks are never followed: cycles, aliases, outside targets and broken links" begin
     mktempdir() do sandbox
         root = mkpath(joinpath(sandbox, "root"))

@@ -414,6 +414,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     units = plan(inventory, config; syntax)
     output = isempty(output) ? _new_directory(joinpath(root, ".jetsweep"), Libc.strftime("%Y%m%d-%H%M%S", time())) :
              mkpath(output)
+    write_tag(output)
     write_inventory(joinpath(output, "inventory.toml"), inventory)
     write_plan(joinpath(output, "plan.toml"), units, inventory.root)
     contexts = unique(unit.context for unit in units)

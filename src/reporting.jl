@@ -1,5 +1,12 @@
 _display(path::String, root::String) = _within(path, root) ? relpath(path, root) : path
 
+"Tag a report directory as a cache, which keeps later sweeps, and backup tools, out of it."
+write_tag(directory::String) = write(joinpath(directory, "CACHEDIR.TAG"), _CACHE_SIGNATURE, """
+
+    # This file is a cache directory tag created by JETSweep for its report directory.
+    # For information about cache directory tags, see https://bford.info/cachedir/
+    """)
+
 function write_inventory(file::String, inventory::Inventory)
     _write_toml(file, Dict(
         "root" => inventory.root,

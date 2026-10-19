@@ -60,9 +60,11 @@ jetsweep --exclude vendor --exclude '**/generated/*.jl' DIRECTORY
 Discovery walks the directory with each Git repository's own ignore rules (nested
 repositories included); outside Git everything is included. Hidden directories are skipped
 unless Git tracks files inside them, so editor and tool state stays out while, for example,
-a JLL package's tracked `.pkg` scripts stay in. Symlinks are not followed: inside the root
-they only alias what discovery reaches anyway, or what it excludes. The files are then
-grouped into analysis units, each covering its entry file and the files it includes:
+a JLL package's tracked `.pkg` scripts stay in. Directories a `CACHEDIR.TAG` marks as caches
+are skipped, tracked or not; JETSweep tags its report directories so, and a later sweep does
+not analyze one that `--output` put inside the directory. Symlinks are not followed: inside
+the root they only alias what discovery reaches anyway, or what it excludes. The files are
+then grouped into analysis units, each covering its entry file and the files it includes:
 
 | Unit | Entry | Analysis |
 | --- | --- | --- |
@@ -198,8 +200,9 @@ jetls_config = "tools/.JETLSConfig.toml"
 The report directory contains `report.toml` (every unit's status, reasons, notes and
 timing, and the deduplicated diagnostics), `summary.txt` (the diagnostics as
 `file:line:column` with messages, every incomplete unit with its reasons and log, and the
-files no complete analysis covered), the inventory and plan, and each unit's and
-environment's request, result and log. The terminal summary groups incomplete units by cause.
+files no complete analysis covered), the inventory and plan, each unit's and environment's
+request, result and log, and the `CACHEDIR.TAG` that keeps sweeps and backups out of it. The
+terminal summary groups incomplete units by cause.
 Lines and columns count from 1, columns in UTF-16 code units as LSP positions do; a
 diagnostic ends before its `end_column`, at the end of its line for a whole-line diagnostic.
 Messages name what scripts, tests and orphan sources define as JETLS names what `Main`
