@@ -1,91 +1,141 @@
-"A Julia project, including unnamed environments and nested packages."
-Base.@kwdef struct ProjectRecord
-    path::String
-    name::String = ""
-    uuid::String = ""
-    entry::String = ""
-    deps::Dict{String,String} = Dict{String,String}()
-    weakdeps::Dict{String,String} = Dict{String,String}()
-    extensions::Dict{String,Vector{String}} = Dict{String,Vector{String}}()
+"""
+A Julia project file. A project is a package when it declares a name, a UUID and an entry
+file; unnamed projects are plain environments, such as test or script environments.
+"""
+struct Project
+    dir::String
+    file::String
+    name::String
+    uuid::String
+    entry::String
+    "Declared extensions, each mapping its trigger names to UUIDs."
+    extensions::Dict{String,Dict{String,String}}
 end
 
-"An inventoried Julia file and the project/package which owns its context."
-Base.@kwdef struct SourceRecord
+ispackage(project::Project) = !isempty(project.entry)
+
+"A discovered Julia file with its nearest project and owning package directories."
+struct Source
     path::String
-    project::String = ""
-    owner::String = ""
-    kind::Symbol = :script
+    "`:package`, `:extension`, `:test` or `:script`, from the file's place in its package."
+    kind::Symbol
+    project::String
+    owner::String
 end
 
+"Every Julia project and source below a root, with the paths excluded from discovery."
 struct Inventory
     root::String
-    projects::Vector{ProjectRecord}
-    files::Vector{SourceRecord}
+    projects::Vector{Project}
+    sources::Vector{Source}
     excluded::Vector{String}
     issues::Vector{String}
 end
 
-"Explicit additions to an automatically selected analysis context."
-Base.@kwdef struct ContextSpec
-    project::String = ""
-    setup::Vector{String} = String[]
-    arguments::Vector{String} = String[]
-    variables::Dict{String,String} = Dict{String,String}()
-    configuration::String = ""
-    test_entry::String = ""
-    containing_files::Vector{String} = String[]
+"""
+The dependency context a unit is loaded in: the selected project, the package that owns
+the unit, whether the package's test dependencies apply, and extension triggers. Units
+with equal contexts share one prepared environment.
+"""
+struct Context
+    project::String
+    owner::String
+    test::Bool
+    triggers::Dict{String,String}
 end
 
-"One independently isolated package, extension, test, or script analysis."
-Base.@kwdef struct AnalysisJob
+Base.:(==)(a::Context, b::Context) =
+    a.project == b.project && a.owner == b.owner && a.test == b.test && a.triggers == b.triggers
+Base.hash(context::Context, h::UInt) =
+    hash((context.project, context.owner, context.test, context.triggers), h)
+
+"Configured additions to a unit's runtime context, from `.JETSweep.toml`."
+Base.@kwdef struct Overrides
+    setup::Vector{String} = String[]
+    args::Vector{String} = String[]
+    env::Dict{String,String} = Dict{String,String}()
+    jetls_config::String = ""
+end
+
+"""
+One JETLS analysis, run in its own process: a package, an extension, a test or script
+file, or a package source file that its package never includes (`:orphan`).
+"""
+struct Unit
     id::String
     kind::Symbol
     entry::String
-    project::String
-    owner::String = ""
-    expected_files::Vector{String} = String[]
-    extension::String = ""
-    triggers::Dict{String,String} = Dict{String,String}()
-    context::ContextSpec = ContextSpec()
-    issues::Vector{String} = String[]
-    blocking_issues::Vector{String} = String[]
+    context::Context
+    "Files the analysis must cover: the entry and everything it statically includes."
+    expected::Vector{String}
+    "Test driver whose declarations precede a test file it includes dynamically, or \"\"."
+    driver::String
+    extension::String
+    overrides::Overrides
+    "Static planning observations, such as includes that cannot be resolved."
+    notes::Vector{String}
 end
 
-"An isolated resolved environment; preparation failures are explicit."
-Base.@kwdef struct EnvironmentResult
+"A diagnostic reported by JETLS for an original source file."
+struct Finding
+    file::String
+    line::Int
+    column::Int
+    end_line::Int
+    end_column::Int
+    severity::Int
+    code::String
+    message::String
+end
+
+const SEVERITIES = (:error, :warning, :info, :hint)
+
+"""
+The outcome of one unit. `status` is `:clean` or `:findings` only for a complete
+analysis; otherwise it is `:incomplete`, `:timeout`, `:failed` or `:unavailable`, and
+`reasons` explains why. `notes` record what does not affect completeness, such as
+package files that loading left out, which are then analyzed as `:orphan` units.
+"""
+struct UnitResult
+    unit::String
     status::Symbol
-    project::String = ""
-    load_paths::Vector{String} = String[]
-    message::String = ""
-    fingerprints::Dict{String,String} = Dict{String,String}()
-    tool_project::String = ""
+    findings::Vector{Finding}
+    analyzed::Vector{String}
+    reasons::Vector{String}
+    notes::Vector{String}
+    seconds::Float64
+    log::String
 end
 
-"Execution controls shared by the CLI and Julia API."
+complete(result::UnitResult) = result.status in (:clean, :findings)
+
+"Controls shared by the command line and the Julia API."
 Base.@kwdef struct SweepOptions
-    jobs::Int = min(12, max(1, min(Sys.CPU_THREADS ÷ 4, Int(Sys.total_memory() ÷ (4 * 1024^3)))))
-    threads::Int = 2
-    timeout::Float64 = 1200.0
+    jobs::Int = default_jobs()
+    threads::Int = 4
+    timeout::Float64 = 1800.0
     output::String = ""
     config::String = ""
-    excludes::Vector{String} = String[]
-    gpu_devices::Vector{String} = String[]
+    exclude::Vector{String} = String[]
+    gpus::Vector{String} = ["auto"]
     instantiate::Bool = true
     plan_only::Bool = false
-    fail_severity::Symbol = :hint
+    fail_on::Symbol = :hint
     include_ignored::Bool = false
-    include_untracked::Bool = true
+    tracked_only::Bool = false
 end
 
-"A complete sweep record; diagnostics retain the backend's structured payload."
+"Parallel workers that fit the machine: one per core, at most one per 3 GiB of memory."
+default_jobs() = max(1, min(Sys.CPU_THREADS, Int(Sys.total_memory() ÷ (3 * 1024^3))))
+
+"A finished sweep: its inventory, units, their results, and the derived exit code."
 struct SweepResult
     root::String
     output::String
     inventory::Inventory
-    jobs::Vector{AnalysisJob}
-    results::Vector{Dict{String,Any}}
-    started::String
-    finished::String
-    input_changes::Vector{String}
+    units::Vector{Unit}
+    results::Vector{UnitResult}
+    changed::Vector{String}
+    seconds::Float64
     exit_code::Int
 end

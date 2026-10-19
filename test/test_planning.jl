@@ -1,210 +1,559 @@
-using Test, JETSweep
-isdefined(@__MODULE__, :discovery_tree) || include("test_discovery_fixtures.jl")
+using Test, JETSweep, TOML, UUIDs
 
-@testset "Complete source planning and inferred helper context" begin
-    mktempdir() do root
-        paths = discovery_tree(root)
-        inventory = discover(root; output=joinpath(root, "audit output"))
-        jobs = plan(inventory)
-        package = only(filter(job -> job.kind == :package && job.owner == paths.first, jobs))
-        @test !(joinpath(paths.first, "src/disconnected.jl") in package.expected_files)
-        disconnected = only(filter(job -> job.entry == joinpath(paths.first, "src/disconnected.jl"), jobs))
-        @test disconnected.kind == :source
-        @test disconnected.owner == paths.first
-        @test disconnected.expected_files == [disconnected.entry]
-        @test isempty(disconnected.blocking_issues)
-        @test !(joinpath(paths.nested, "src/Nested.jl") in package.expected_files)
-        @test length(filter(job -> job.kind == :package, jobs)) == 4
-        @test length(unique(job.id for job in jobs)) == length(jobs)
-        extension = only(filter(job -> job.kind == :extension, jobs))
-        @test extension.owner == paths.first
-        @test extension.triggers == Dict("Dates" => "ade2ca70-3891-5945-98fb-dc099432e06a")
-        @test joinpath(paths.first, "ext/RepeatedDatesExt/helper.jl") in extension.expected_files
-        helper = only(filter(job -> job.entry == joinpath(paths.first, "test/groups/helper.jl"), jobs))
-        @test helper.kind == :test
-        @test helper.project == joinpath(paths.first, "test")
-        @test helper.context.test_entry == joinpath(paths.first, "test/runtests.jl")
-        @test helper.context.containing_files == [joinpath(paths.first, "test/groups/basic.jl")]
-        @test isempty(helper.issues)
-        @test all(source -> any(job -> source.path in job.expected_files, jobs), inventory.files)
-        @test [job.id for job in jobs] == [job.id for job in plan(inventory)]
-        discovery_file(paths.first, "test/runtests.jl", "using Test\ninclude(\"groups/basic.jl\")\nfor path in ARGS\n include(path)\nend\n")
-        updated = plan(discover(root; output=joinpath(root, "audit output")))
-        leaf = only(filter(job -> job.entry == joinpath(paths.first, "test/groups/helper.jl"), updated))
-        driver = only(filter(job -> job.entry == joinpath(paths.first, "test/runtests.jl"), updated))
-        @test isempty(leaf.issues)
-        @test any(issue -> occursin("dynamic include", issue), driver.issues)
-    end
+const PLANNING_DATES = "ade2ca70-3891-5945-98fb-dc099432e06a"
+const PLANNING_TEST = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+const PLANNING_OTHER = "5c0d4e38-7f43-4d0b-9a49-3b5bfbd1f6a1"
+
+function planning_file(root::String, relative::String, content::String="")
+    path = joinpath(root, relative)
+    mkpath(dirname(path))
+    write(path, content)
+    return path
 end
 
-@testset "Alternate package entries retain their included source context" begin
-    mktempdir() do root
-        package = discovery_project(root, "alternate"; name="AlternateRoot",
-            uuid="18825ed6-68b4-4278-8fd7-c3d5d3abe818", entry="lib/Main.jl")
-        mv(joinpath(package, "Project.toml"), joinpath(package, "JuliaProject.toml"))
-        entry = discovery_file(package, "lib/Main.jl", """
-            module AlternateRoot
-            struct InternalValue
-                value::Int
-            end
-            include("helper.jl")
-            include("nested/src/Nested.jl")
-            end
-            """)
-        helper = discovery_file(package, "lib/helper.jl", "read_value(value::InternalValue) = value.value\n")
-        orphan = discovery_file(package, "src/orphan.jl", "orphan(x::Int) = x + 1\n")
-        nested = discovery_project(package, "lib/nested"; name="Nested",
-            uuid="0190370f-ac35-4269-bcd4-2db89560c177")
-        inventory = discover(root)
-        jobs = plan(inventory)
-        package_job = only(filter(job -> job.kind === :package && job.owner == package, jobs))
-        helper_record = only(filter(file -> file.path == helper, inventory.files))
-        @test helper_record.kind === :script
-        @test helper_record.owner == package
-        @test package_job.entry == entry
-        @test package_job.expected_files == sort([entry, helper])
-        @test count(job -> helper in job.expected_files, jobs) == 1
-        @test all(job -> job.entry != helper, jobs)
-        @test !(joinpath(nested, "src/Nested.jl") in package_job.expected_files)
-        @test only(filter(job -> job.entry == orphan, jobs)).kind === :source
-        @test all(file -> any(job -> file.path in job.expected_files, jobs), inventory.files)
-    end
+function planning_project(root::String, relative::String=".", data::Dict{String}=Dict{String,Any}();
+                          file::String="Project.toml")
+    directory = relative == "." ? root : joinpath(root, relative)
+    mkpath(directory)
+    open(io -> TOML.print(io, data), joinpath(directory, file), "w")
+    return directory
 end
 
-@testset "Syntax discovery records dynamic and unavailable contexts" begin
-    mktempdir() do root
-        discovery_file(root, "entry.jl", "const directory = joinpath(@__DIR__, \"helpers\")\ninclude(joinpath(directory, \"target.jl\"))\n")
-        discovery_file(root, "helpers/target.jl", "target(x) = x\n")
-        discovery_file(root, "dynamic.jl", "include(ARGS[1])\n")
-        discovery_file(root, "missing.jl", "include(\"absent.jl\")\n")
-        discovery_file(root, "malformed.jl", "function bad(\n")
-        discovery_file(root, "macros.jl", "@custom function user_macro(x)\n x\nend\n")
-        discovery_file(root, "conditional.jl", "if flag\n filename = \"a.jl\"\nelse\n filename = \"b.jl\"\nend\ninclude(filename)\n")
-        jobs = plan(discover(root))
-        byname = Dict(basename(job.entry) => job for job in jobs)
-        @test byname["target.jl"].context.containing_files == [joinpath(root, "entry.jl")]
-        @test byname["entry.jl"].project == ""
-        @test isempty(byname["macros.jl"].issues)
-        @test any(issue -> occursin("dynamic include", issue), byname["dynamic.jl"].issues)
-        @test isempty(byname["dynamic.jl"].blocking_issues)
-        @test any(issue -> occursin("source does not exist", issue), byname["missing.jl"].issues)
-        @test isempty(byname["missing.jl"].blocking_issues)
-        @test any(issue -> occursin("source parse failed", issue), byname["malformed.jl"].issues)
-        @test !isempty(byname["malformed.jl"].blocking_issues)
-        @test any(issue -> occursin("dynamic include", issue), byname["conditional.jl"].issues)
-        discovery_file(root, "another.jl", "include(\"helpers/target.jl\")\n")
-        target = only(filter(job -> basename(job.entry) == "target.jl", plan(discover(root))))
-        @test any(issue -> occursin("multiple containing files", issue), target.issues)
-        @test isempty(target.blocking_issues)
-        discovery_file(root, "setup.jl", "const context_value = 1\n")
-        discovery_file(root, ".JETSweep.toml", "[[jobs]]\nmatch = \"helpers/target.jl\"\nsetup = [\"setup.jl\"]\n")
-        target = only(filter(job -> basename(job.entry) == "target.jl", plan(discover(root))))
-        @test isempty(target.issues)
-    end
+planning_package(root::String, relative::String, name::String; extra...) =
+    planning_project(root, relative, Dict{String,Any}("name" => name, "uuid" => string(uuid4()),
+                                                      (String(k) => v for (k, v) in extra)...))
+
+planning_context(project, owner, test=false, triggers=Dict{String,String}()) =
+    JETSweep.Context(project, owner, test, triggers)
+
+function planning_plan(root::String, file::String="")
+    config = JETSweep.read_config(root, file)
+    inventory = discover(root; exclude=config.exclude)
+    return inventory, plan(inventory, config)
 end
 
-@testset "Static missing include targets remain advisory" begin
-    mktempdir() do root
-        package = discovery_project(root, "."; name="OptionalInclude",
-            uuid="0dc3a9ce-c6fe-4d1e-868f-147c5c2cb5d0")
-        entry = joinpath(package, "src/OptionalInclude.jl")
-        for conditional in ("false", "isfile(joinpath(@__DIR__, \"optional.jl\"))", "optional_feature_enabled()")
-            write(entry, "module OptionalInclude\nif $conditional\n include(\"optional.jl\")\nend\nend\n")
-            job = only(plan(discover(root)))
-            @test any(issue -> occursin("included source does not exist", issue), job.issues)
-            @test isempty(job.blocking_issues)
-        end
-        # An unconditional include is also execution-dependent at this stage;
-        # the real loader/JETLS must report its failure, rather than a heuristic.
-        write(entry, "module OptionalInclude\ninclude(\"optional.jl\")\nend\n")
-        @test isempty(only(plan(discover(root))).blocking_issues)
-        rm(entry)
-        @test any(issue -> occursin("expected source does not exist", issue), only(plan(discover(root))).blocking_issues)
-    end
+planning_unit(units, entry::String) = only(filter(unit -> unit.entry == entry, units))
+planning_entries(units) = Set(unit.entry for unit in units)
+planning_noted(unit, text) = any(note -> occursin(text, note), unit.notes)
+planning_overrides(overrides) = (overrides.setup, overrides.args, overrides.env, overrides.jetls_config)
+const PLANNING_NONE = (String[], String[], Dict{String,String}(), "")
+
+function planning_invariants(inventory, units)
+    paths = Set(source.path for source in inventory.sources)
+    @test all(source -> any(unit -> source.path in unit.expected, units), inventory.sources)
+    @test allunique(unit.id for unit in units)
+    @test all(unit -> occursin(Regex("^$(unit.kind)-[0-9a-f]{12}\$"), unit.id), units)
+    @test all(unit -> unit.entry in unit.expected && issorted(unit.expected), units)
+    @test all(unit -> all(in(paths), unit.expected), units)
+    @test all(unit -> issorted(unit.notes) && allunique(unit.notes), units)
+    @test issorted(units; by=unit -> (unit.entry, unit.extension))
 end
 
-@testset "Static pkgdir paths follow declared identities instead of sibling names" begin
+@testset "package units cover the owned files their entry reaches and their other sources" begin
     mktempdir() do directory
-        root = joinpath(directory, "workspace")
-        dependency_uuid = "9ca1778b-f46c-4c8c-8a17-9122cc7a78bf"
-        owner_uuid = "d934767a-63cc-4f1f-a271-8b7c0637859f"
-        owner = discovery_project(root, "Owner"; name="Owner", uuid=owner_uuid,
-            extra=Dict("deps" => Dict("Dep" => dependency_uuid)))
-        discovery_project(root, "Owner duplicate"; name="Owner", uuid=owner_uuid)
-        decoy = discovery_project(root, "Dep"; name="Dep", uuid=dependency_uuid)
-        actual = discovery_project(directory, "actual_dependency"; name="Dep", uuid=dependency_uuid)
-        replacement = discovery_project(directory, "explicit_dependency"; name="Dep", uuid=dependency_uuid)
-        discovery_file(actual, "bootstrap.jl", "const SOURCE_ORIGIN = :manifest\n")
-        discovery_file(replacement, "bootstrap.jl", "const SOURCE_ORIGIN = :explicit\n")
-        entry = discovery_file(owner, "src/Owner.jl", "module Owner\nusing Dep\ninclude(joinpath(pkgdir(Dep), \"bootstrap.jl\"))\nend\n")
-        inventory = discover(root)
-        source = only(filter(file -> file.path == entry, inventory.files))
-        unresolved = JETSweep._source_package_paths(source, inventory)
-        @test unresolved["Owner"] == owner
-        @test !haskey(unresolved, "Dep")
-        job = only(filter(job -> job.entry == entry, plan(inventory)))
-        @test any(issue -> occursin("dynamic include", issue), job.issues)
-        @test isempty(job.blocking_issues)
-
-        function write_manifest(name, path)
-            open(joinpath(owner, name), "w") do io
-                TOML.print(io, Dict("manifest_format" => "2.0", "julia_version" => string(VERSION),
-                    "deps" => Dict("Dep" => [Dict("uuid" => dependency_uuid, "version" => "0.1.0", "path" => path)])))
+        root = realpath(directory)
+        outer = planning_package(root, "Outer", "Outer")
+        entry = planning_file(outer, "src/Outer.jl", """
+            module Outer
+            include("a.jl")
+            include(joinpath(@__DIR__, "sub", "b.jl"))
+            function load()
+                include("lazy.jl")
             end
-        end
-        write_manifest("Manifest.toml", decoy)
-        write_manifest("Manifest-v$(VERSION.major).$(VERSION.minor).toml", actual)
-        selected = JETSweep._source_package_paths(source, inventory)
-        @test selected["Dep"] == actual
-        job = only(filter(job -> job.entry == entry, plan(inventory)))
-        @test !any(issue -> occursin(joinpath(decoy, "bootstrap.jl"), issue), job.issues)
-        @test isempty(job.blocking_issues)
+            include("../lib/Inner/src/Inner.jl")
+            end
+            """)
+        a = planning_file(outer, "src/a.jl", "include(\"sub/b.jl\")\n")
+        b = planning_file(outer, "src/sub/b.jl", "include(\"../a.jl\")\n")
+        lazy = planning_file(outer, "src/lazy.jl")
+        disconnected = planning_file(outer, "src/disconnected.jl", "disconnected(x) = x\n")
+        inner = planning_package(outer, "lib/Inner", "Inner")
+        inner_entry = planning_file(inner, "src/Inner.jl", "module Inner\ninclude(\"helper.jl\")\nend\n")
+        inner_helper = planning_file(inner, "src/helper.jl")
+        alternate = planning_package(root, "Alternate", "Alternate"; entryfile="lib/Main.jl")
+        alternate_entry = planning_file(alternate, "lib/Main.jl",
+                                        "module Alternate\ninclude(\"helper.jl\")\nend\n")
+        alternate_helper = planning_file(alternate, "lib/helper.jl")
+        broken = planning_package(root, "Broken", "Broken")
+        planning_file(broken, "src/part.jl")
+        inventory, units = planning_plan(root)
 
-        project_file = joinpath(owner, "Project.toml")
-        data = TOML.parsefile(project_file)
-        data["sources"] = Dict("Dep" => Dict("path" => relpath(replacement, owner)))
-        open(io -> TOML.print(io, data), project_file, "w")
-        @test JETSweep._source_package_paths(source, inventory)["Dep"] == replacement
-        # A URL declaration supersedes stale development paths, but cannot be
-        # resolved statically by choosing a conveniently named sibling.
-        data["sources"] = Dict("Dep" => Dict("url" => "https://example.invalid/Dep.jl"))
-        open(io -> TOML.print(io, data), project_file, "w")
-        @test !haskey(JETSweep._source_package_paths(source, inventory), "Dep")
-        data["sources"] = Dict("Dep" => Dict("path" => relpath(replacement, owner)))
-        open(io -> TOML.print(io, data), project_file, "w")
-        replacement_data = TOML.parsefile(joinpath(replacement, "Project.toml"))
-        replacement_data["uuid"] = "831b5e3b-276a-4cf6-80ad-d2d348d77e1f"
-        open(io -> TOML.print(io, replacement_data), joinpath(replacement, "Project.toml"), "w")
-        @test !haskey(JETSweep._source_package_paths(source, inventory), "Dep")
+        @test sort([unit.entry for unit in units if unit.kind === :package]) ==
+              sort([entry, inner_entry, alternate_entry])
+        package = planning_unit(units, entry)
+        @test package.kind === :package
+        # Sources the entry does not include statically are expected too: the sweep analyzes
+        # those that loading leaves out as orphan units.
+        @test package.expected == sort([entry, a, b, lazy, disconnected])
+        @test package.context == planning_context(outer, outer)
+        @test package.driver == package.extension == ""
+        @test isempty(package.notes)
+        @test planning_overrides(package.overrides) == PLANNING_NONE
+        nested = planning_unit(units, inner_entry)
+        @test nested.expected == sort([inner_entry, inner_helper])
+        @test nested.context == planning_context(inner, inner)
+        @test count(unit -> inner_helper in unit.expected, units) == 1
+        @test !(disconnected in planning_entries(units))
+
+        @test only(filter(source -> source.path == alternate_helper, inventory.sources)).kind === :script
+        @test planning_unit(units, alternate_entry).expected == sort([alternate_entry, alternate_helper])
+        @test !(alternate_helper in planning_entries(units))
+        @test count(unit -> alternate_helper in unit.expected, units) == 1
+        @test !any(unit -> unit.context.owner == broken && unit.kind in (:package, :orphan), units)
+        @test length(units) == 4
+        planning_invariants(inventory, units)
     end
 end
 
-@testset "Declarative per-job context overrides" begin
-    mktempdir() do root
-        discovery_file(root, "script.jl")
-        discovery_file(root, "setup.jl", "const supplied_value = 1\n")
-        discovery_project(root, "environment")
-        discovery_file(root, "jetls.toml", "\n")
-        discovery_file(root, ".JETSweep.toml", """
-            [[jobs]]
-            match = "script.jl"
-            project = "environment"
-            setup = ["setup.jl"]
-            args = ["hello world", "--flag"]
-            jetls_config = "jetls.toml"
-            [jobs.env]
-            EXAMPLE_SELECTOR = "tests"
+@testset "extension units for flat and directory layouts" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        host = planning_package(root, "Host", "Host";
+            weakdeps=Dict("Dates" => PLANNING_DATES, "Other" => PLANNING_OTHER),
+            extensions=Dict("FlatExt" => "Dates", "DirExt" => ["Dates", "Other"], "BothExt" => "Other",
+                            "AbsentExt" => "Dates"))
+        entry = planning_file(host, "src/Host.jl", "module Host\nend\n")
+        flat = planning_file(host, "ext/FlatExt.jl", "module FlatExt\nend\n")
+        nested = planning_file(host, "ext/DirExt/DirExt.jl", "module DirExt\ninclude(\"helper.jl\")\nend\n")
+        helper = planning_file(host, "ext/DirExt/helper.jl")
+        stray = planning_file(host, "ext/DirExt/stray.jl")
+        both_flat = planning_file(host, "ext/BothExt.jl", "module BothExt\nend\n")
+        both_nested = planning_file(host, "ext/BothExt/BothExt.jl", "module BothExt\nend\n")
+        undeclared = planning_file(host, "ext/Undeclared.jl")
+        inventory, units = planning_plan(root)
+
+        extensions = Dict(unit.extension => unit for unit in units if unit.kind === :extension)
+        @test sort!(collect(keys(extensions))) == ["BothExt", "DirExt", "FlatExt"]
+        @test extensions["FlatExt"].entry == flat
+        @test extensions["FlatExt"].expected == [flat]
+        @test extensions["FlatExt"].context == planning_context(host, host, false, Dict("Dates" => PLANNING_DATES))
+        @test extensions["DirExt"].entry == nested
+        @test extensions["DirExt"].expected == [nested, helper]
+        @test extensions["DirExt"].context.triggers == Dict("Dates" => PLANNING_DATES, "Other" => PLANNING_OTHER)
+        @test extensions["BothExt"].entry == both_flat
+        @test all(unit -> unit.driver == "" && !unit.context.test, values(extensions))
+        @test planning_unit(units, entry).kind === :package
+        @test planning_unit(units, entry).expected == [entry]
+        @test planning_unit(units, both_nested).kind === :orphan
+        @test planning_unit(units, undeclared).kind === :orphan
+        @test planning_unit(units, undeclared).context == planning_context(host, host)
+        # A source in an extension's directory that it does not include belongs to it.
+        @test planning_unit(units, stray).kind === :orphan
+        @test planning_unit(units, stray).extension == "DirExt"
+        @test planning_unit(units, stray).context == extensions["DirExt"].context
+        @test planning_unit(units, undeclared).extension == ""
+        @test !any(unit -> unit.extension == "AbsentExt", units)
+        @test length(units) == 7
+        planning_invariants(inventory, units)
+    end
+end
+
+@testset "test units: drivers, run-time includes and helpers" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        tested = planning_package(root, "Tested", "Tested")
+        planning_file(tested, "src/Tested.jl", "module Tested\nend\n")
+        environment = planning_project(tested, "test", Dict{String,Any}("deps" => Dict("Test" => PLANNING_TEST)))
+        driver = planning_file(tested, "test/runtests.jl", """
+            using Test, Tested
+            include("setup.jl")
+            include(joinpath(pkgdir(Tested), "test", "located.jl"))
+            @testset "grouped" include("grouped.jl")
+            const TESTS = ["unit_a.jl", "unit_b.jl"]
+            for file in TESTS
+                include(file)
+            end
+            function lazy()
+                include("lazy.jl")
+            end
             """)
-        job = only(filter(job -> basename(job.entry) == "script.jl", plan(discover(root))))
-        @test job.project == joinpath(root, "environment")
-        @test job.context.project == job.project
-        @test job.context.setup == [joinpath(root, "setup.jl")]
-        @test job.context.arguments == ["hello world", "--flag"]
-        @test job.context.variables == Dict("EXAMPLE_SELECTOR" => "tests")
-        @test job.context.configuration == joinpath(root, "jetls.toml")
-        discovery_file(root, ".JETSweep.toml", "[[jobs]]\nmatch = \"absent.jl\"\n")
-        @test_throws ArgumentError plan(discover(root))
-        discovery_file(root, ".JETSweep.toml", "[[jobs]]\nmatch = \"*.jl\"\nunknown = true\n")
-        @test_throws ArgumentError plan(discover(root))
+        statics = [planning_file(tested, "test/$name.jl") for name in ("setup", "located", "grouped")]
+        unit_a = planning_file(tested, "test/unit_a.jl", "include(\"helpers/common.jl\")\n")
+        unit_b = planning_file(tested, "test/unit_b.jl", "include(\"setup.jl\")\ninclude(\"helpers/common.jl\")\n")
+        common = planning_file(tested, "test/helpers/common.jl")
+        lazy = planning_file(tested, "test/lazy.jl")
+        cycle_x = planning_file(tested, "test/cycle_x.jl", "include(\"cycle_y.jl\")\n")
+        cycle_y = planning_file(tested, "test/cycle_y.jl", "include(\"cycle_x.jl\")\n")
+        recursive = planning_file(tested, "test/recursive.jl", "include(@__FILE__)\n")
+        sub_driver = planning_file(tested, "test/sub/runtests.jl", "for file in ARGS\n    include(file)\nend\n")
+        deep = planning_file(tested, "test/sub/deep.jl")
+        isolated_environment = planning_project(tested, "test/isolated")
+        isolated = planning_file(tested, "test/isolated/check.jl")
+
+        plain = planning_package(root, "Plain", "Plain")
+        planning_file(plain, "src/Plain.jl", "module Plain\nend\n")
+        plain_driver = planning_file(plain, "test/runtests.jl", "include(\"basic.jl\")\n")
+        basic = planning_file(plain, "test/basic.jl")
+
+        # A nested driver included statically is part of its outer driver's unit.
+        nested = planning_package(root, "Nested", "Nested")
+        planning_file(nested, "src/Nested.jl", "module Nested\nend\n")
+        nested_driver = planning_file(nested, "test/runtests.jl",
+                                      "@testset \"all\" begin\n    include(\"core/runtests.jl\")\nend\n")
+        core_driver = planning_file(nested, "test/core/runtests.jl", "for file in ARGS\n    include(file)\nend\n")
+        core_test = planning_file(nested, "test/core/test_x.jl")
+
+        driverless = planning_package(root, "Driverless", "Driverless")
+        planning_file(driverless, "src/Driverless.jl", "module Driverless\nend\n")
+        driverless_environment = planning_project(driverless, "test"; file="JuliaProject.toml")
+        only_test = planning_file(driverless, "test/only.jl")
+        inventory, units = planning_plan(root)
+
+        context = planning_context(environment, tested, true)
+        main = planning_unit(units, driver)
+        @test main.kind === :test
+        @test main.driver == ""
+        @test main.expected == sort([driver; statics])
+        @test main.context == context
+        @test main.notes == ["$driver:7: include target is only known at run time"]
+        for file in [unit_a, unit_b, lazy, cycle_x, recursive]
+            @test planning_unit(units, file).kind === :test
+            @test planning_unit(units, file).driver == driver
+            @test planning_unit(units, file).context == context
+        end
+        @test planning_unit(units, unit_a).expected == sort([unit_a, common])
+        @test planning_unit(units, unit_b).expected == [unit_b]
+        @test planning_unit(units, lazy).expected == [lazy]
+        @test planning_unit(units, cycle_x).expected == [cycle_x, cycle_y]
+        @test planning_unit(units, recursive).expected == [recursive]
+        @test isdisjoint(planning_entries(units), vcat(common, cycle_y, statics))
+        # A nested driver the outer one does not include statically runs under it.
+        @test planning_unit(units, sub_driver).kind === :test
+        @test planning_unit(units, sub_driver).driver == driver
+        @test planning_unit(units, sub_driver).expected == [sub_driver]
+        @test planning_unit(units, sub_driver).context == context
+        @test length(unique(unit.context for unit in units if unit.context.owner == tested)) == 2
+        @test planning_unit(units, deep).driver == sub_driver
+        @test planning_unit(units, deep).expected == [deep]
+        @test planning_unit(units, isolated).kind === :script
+        @test planning_unit(units, isolated).context == planning_context(isolated_environment, "")
+
+        @test planning_unit(units, plain_driver).expected == sort([plain_driver, basic])
+        @test planning_unit(units, plain_driver).context == planning_context(plain, plain, true)
+        @test !(basic in planning_entries(units))
+        @test planning_unit(units, nested_driver).expected == [core_driver, nested_driver]
+        @test !(core_driver in planning_entries(units))
+        @test planning_unit(units, core_test).driver == nested_driver
+        @test planning_unit(units, only_test).kind === :test
+        @test planning_unit(units, only_test).driver == ""
+        @test planning_unit(units, only_test).context == planning_context(driverless_environment, driverless, true)
+        planning_invariants(inventory, units)
+    end
+end
+
+@testset "script units group by include roots in their nearest environment" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        main = planning_file(root, "main.jl", "include(\"lib/util.jl\")\n")
+        util = planning_file(root, "lib/util.jl")
+        first_script = planning_file(root, "first.jl", "include(\"shared.jl\")\n")
+        second_script = planning_file(root, "second.jl", "include(\"shared.jl\")\n")
+        shared = planning_file(root, "shared.jl")
+        loop_a = planning_file(root, "loop/a.jl", "include(\"b.jl\")\n")
+        loop_b = planning_file(root, "loop/b.jl", "include(\"a.jl\")\n")
+        tool = planning_package(root, "Tool", "Tool")
+        planning_file(tool, "src/Tool.jl", "module Tool\nend\n")
+        run = planning_file(tool, "scripts/run.jl", "include(\"common.jl\")\n")
+        common = planning_file(tool, "scripts/common.jl")
+        docs = planning_project(tool, "docs")
+        make = planning_file(tool, "docs/make.jl")
+        inventory, units = planning_plan(root)
+
+        loose = planning_context("", "")
+        @test planning_unit(units, main).kind === :script
+        @test planning_unit(units, main).expected == sort([main, util])
+        @test planning_unit(units, main).context == loose
+        @test planning_unit(units, main).driver == ""
+        @test planning_unit(units, first_script).expected == sort([first_script, shared])
+        @test planning_unit(units, second_script).expected == [second_script]
+        @test planning_unit(units, loop_a).expected == [loop_a, loop_b]
+        @test isdisjoint(planning_entries(units), [util, shared, loop_b, common])
+        @test planning_unit(units, run).expected == sort([run, common])
+        # A package's own scripts use its test environment, a superset of the package's.
+        @test planning_unit(units, run).context == JETSweep.Context(tool, tool, true, Dict{String,String}())
+        @test planning_unit(units, make).context == planning_context(docs, "")
+        @test count(unit -> unit.kind === :script, units) == length(units) - 1
+        @test length(units) == 7
+        planning_invariants(inventory, units)
+    end
+end
+
+@testset "files an include cycle reaches are covered by the cycle's entry" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        leaf = planning_file(root, "a.jl")
+        inner = [planning_file(root, "b.jl", "include(\"c.jl\")\n"),
+                 planning_file(root, "c.jl", "include(\"b.jl\")\n")]
+        outer = [planning_file(root, "m.jl", "include(\"n.jl\")\n"),
+                 planning_file(root, "n.jl", "include(\"m.jl\")\ninclude(\"a.jl\")\ninclude(\"b.jl\")\n")]
+        inventory, units = planning_plan(root)
+        @test [unit.entry for unit in units] == [first(outer)]
+        @test [unit.expected for unit in units] == [[leaf; inner; outer]]
+        planning_invariants(inventory, units)
+    end
+end
+
+@testset "notes record dynamic includes and parse failures" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        dynamic = planning_file(root, "dynamic.jl", "include(ARGS[1])\n")
+        broken = planning_file(root, "broken.jl", "function bad(\n")
+        clean = planning_file(root, "clean.jl", "const x = 1\n")
+        conditional = planning_file(root, "conditional.jl",
+            "if flag\n    file = \"a.jl\"\nelse\n    file = \"b.jl\"\nend\ninclude(file)\n")
+        absent = planning_file(root, "absent.jl", "include(\"nowhere.jl\")\n")
+        side = planning_file(root, "side.jl", """
+            write(joinpath(@__DIR__, "executed"), "")
+            include(touch(joinpath(@__DIR__, "touched.jl")))
+            """)
+        other = planning_package(root, "Other", "Other")
+        planning_file(other, "src/Other.jl", "module Other\nend\n")
+        sibling = planning_file(other, "extra.jl")
+        noted = planning_package(root, "Noted", "Noted")
+        entry = planning_file(noted, "src/Noted.jl", """
+            module Noted
+            include("parts.jl")
+            include(name)
+            include(joinpath(pkgdir(Other), "extra.jl"))
+            end
+            """)
+        parts = planning_file(noted, "src/parts.jl", "function f(\n")
+        orphan = planning_file(noted, "src/orphan.jl", "include(readline())\n")
+        inventory, units = planning_plan(root)
+
+        @test planning_noted(planning_unit(units, dynamic), "$dynamic:1: include target is only known at run time")
+        @test planning_noted(planning_unit(units, broken), "$broken:1: cannot be parsed")
+        @test isempty(planning_unit(units, clean).notes)
+        @test planning_noted(planning_unit(units, conditional), "$conditional:6: include target is only known")
+        package = planning_unit(units, entry)
+        @test package.expected == sort([entry, parts, orphan])
+        @test planning_noted(package, "$entry:3: include target is only known at run time")
+        @test planning_noted(package, "$parts:1: cannot be parsed")
+        @test planning_noted(package, "$entry:4: include target is only known at run time")
+        @test planning_unit(units, sibling).context == JETSweep.Context(other, other, true, Dict{String,String}())
+        @test planning_unit(units, absent).expected == [absent]
+        @test planning_noted(planning_unit(units, side), "$side:2: include target is only known at run time")
+        @test !ispath(joinpath(root, "executed")) && !ispath(joinpath(root, "touched.jl"))
+        @test !(orphan in planning_entries(units))
+        @test planning_noted(package, "$orphan:1: include target is only known at run time")
+        planning_invariants(inventory, units)
+    end
+end
+
+@testset "unit ids are deterministic, unique and relative to the root" begin
+    function planning_workspace(root)
+        package = planning_package(root, "Pkg", "Pkg"; weakdeps=Dict("Dates" => PLANNING_DATES),
+                                   extensions=Dict("PkgDatesExt" => "Dates"))
+        planning_file(package, "src/Pkg.jl", "module Pkg\ninclude(\"part.jl\")\nend\n")
+        planning_file(package, "src/part.jl")
+        planning_file(package, "src/unused.jl")
+        planning_file(package, "ext/PkgDatesExt.jl")
+        planning_file(package, "test/runtests.jl", "for file in ARGS\n    include(file)\nend\n")
+        planning_file(package, "test/case.jl")
+        planning_file(root, "script.jl")
+        return root
+    end
+    mktempdir() do directory
+        first_root = planning_workspace(mkpath(joinpath(realpath(directory), "first")))
+        second_root = planning_workspace(mkpath(joinpath(realpath(directory), "second")))
+        inventory, units = planning_plan(first_root)
+        @test sort!([unit.kind for unit in units]) == [:extension, :package, :script, :test, :test]
+        @test [unit.id for unit in units] == [unit.id for unit in plan(inventory)]
+        @test [unit.id for unit in units] == [unit.id for unit in last(planning_plan(second_root))]
+        package = only(filter(unit -> unit.kind === :package, units))
+        extension = only(filter(unit -> unit.kind === :extension, units))
+        @test package.id != extension.id
+        planning_invariants(inventory, units)
+        planning_file(first_root, "later.jl")
+        @test [unit.id for unit in units] ⊆ [unit.id for unit in last(planning_plan(first_root))]
+    end
+end
+
+@testset "excluded files are not planned" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        host = planning_package(root, "Host", "Host"; weakdeps=Dict("Dates" => PLANNING_DATES),
+                                extensions=Dict("HostDatesExt" => "Dates"))
+        planning_file(host, "src/Host.jl", "module Host\nend\n")
+        planning_file(host, "ext/HostDatesExt.jl")
+        driver = planning_file(host, "test/runtests.jl")
+        partial = planning_package(root, "Partial", "Partial")
+        entry = planning_file(partial, "src/Partial.jl",
+                              "module Partial\ninclude(\"generated.jl\")\ninclude(\"kept.jl\")\nend\n")
+        planning_file(partial, "src/generated.jl")
+        kept = planning_file(partial, "src/kept.jl")
+        planning_file(root, ".JETSweep.toml", "exclude = [\"ext\", \"Host/src\", \"**/generated.jl\"]\n")
+        inventory, units = planning_plan(root)
+        @test [source.path for source in inventory.sources] == [driver, entry, kept]
+        @test [unit.entry for unit in units] == [driver, entry]
+        @test planning_unit(units, entry).expected == [entry, kept]
+        planning_invariants(inventory, units)
+    end
+end
+
+@testset "read_config" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        @test JETSweep.read_config(root).file == ""
+        @test isempty(JETSweep.read_config(root).exclude) && isempty(JETSweep.read_config(root).contexts)
+        absent = joinpath(root, "absent.toml")
+        @test_throws "ArgumentError: configuration file does not exist: $absent" begin
+            JETSweep.read_config(root, absent)
+        end
+        @test_throws ArgumentError JETSweep.read_config(root, joinpath(root, ".JETSweep.toml"))
+
+        planning_project(root, "tools/env")
+        setup = planning_file(root, "tools/setup.jl")
+        jetls = planning_file(root, "tools/jetls.toml")
+        default = planning_file(root, ".JETSweep.toml", """
+            exclude = ["vendor", "**/generated/*.jl"]
+
+            [[context]]
+            match = "tools/check.jl"
+            project = "tools/env"
+            setup = ["tools/setup.jl"]
+            args = ["--fast", "two words"]
+            env = { MODE = "analysis" }
+            jetls_config = "tools/jetls.toml"
+
+            [[context]]
+            match = "**/*.jl"
+            project = "tools/env/Project.toml"
+
+            [[context]]
+            match = "tools/*.jl"
+            project = "tools/env/"
+            """)
+        config = JETSweep.read_config(root)
+        @test config.file == default
+        @test config.exclude == ["vendor", "**/generated/*.jl"]
+        @test [rule.match for rule in config.contexts] == ["tools/check.jl", "**/*.jl", "tools/*.jl"]
+        rule = first(config.contexts)
+        @test rule.project == joinpath(root, "tools/env")
+        @test rule.setup == [setup]
+        @test rule.args == ["--fast", "two words"]
+        @test rule.env == Dict("MODE" => "analysis")
+        @test rule.jetls_config == jetls
+        @test rule.keys == Set(["match", "project", "setup", "args", "env", "jetls_config"])
+        @test config.contexts[2].project == joinpath(root, "tools/env")
+        @test planning_overrides(config.contexts[2]) == PLANNING_NONE
+        @test config.contexts[2].keys == Set(["match", "project"])
+        @test config.contexts[3].project == joinpath(root, "tools/env")
+
+        relocated = planning_file(root, "settings/sweep.toml",
+                                  "[[context]]\nmatch = \"tools/check.jl\"\nsetup = [\"local.jl\"]\n")
+        planning_file(root, "settings/local.jl")
+        config = JETSweep.read_config(root, relocated)
+        @test config.file == relocated
+        @test only(config.contexts).setup == [joinpath(root, "settings/local.jl")]
+        @test only(config.contexts).project == ""
+
+        rule = "[[context]]\nmatch = \"a.jl\"\n"
+        invalid = [
+            "unknown = 1" => "unknown keys unknown",
+            "exclude = \"vendor\"" => "`exclude` must be an array of strings",
+            "exclude = [1]" => "`exclude` must be an array of strings",
+            "[context]\nmatch = \"a.jl\"" => "`context` must be an array of tables",
+            "context = 1" => "`context` must be an array of tables",
+            "[[context]]\nproject = \"tools/env\"" => "each [[context]] needs a `match` glob",
+            "[[context]]\nmatch = 1" => "each [[context]] needs a `match` glob",
+            rule * "unknown = 1" => "unknown [[context]] keys unknown",
+            rule * "project = \"tools\"" => "no Julia project at $(joinpath(root, "tools"))",
+            rule * "project = \"absent\"" => "no Julia project at $(joinpath(root, "absent"))",
+            rule * "project = 1" => "`project` must be a path",
+            rule * "setup = [\"tools/absent.jl\"]" =>
+                "setup file does not exist: $(joinpath(root, "tools/absent.jl"))",
+            rule * "setup = \"tools/setup.jl\"" => "`setup` must be an array of strings",
+            rule * "args = [1]" => "`args` must be an array of strings",
+            rule * "env = { MODE = 1 }" => "`env` must be a table of strings",
+            rule * "env = \"MODE\"" => "`env` must be a table of strings",
+            rule * "jetls_config = \"tools/absent.toml\"" =>
+                "JETLS configuration does not exist: $(joinpath(root, "tools/absent.toml"))",
+            rule * "jetls_config = 1" => "`jetls_config` must be a path",
+        ]
+        for (content, message) in invalid
+            write(default, content * "\n")
+            @test_throws "ArgumentError: $default: $message" JETSweep.read_config(root)
+        end
+    end
+end
+
+@testset "context rules apply to the units they match" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        environment = planning_project(root, "tools/env")
+        check = planning_file(root, "tools/check.jl")
+        other = planning_file(root, "tools/other.jl")
+        loose = planning_file(root, "loose.jl")
+        setup = planning_file(root, "tools/setup.jl")
+        jetls = planning_file(root, "tools/jetls.toml")
+        package = planning_package(root, "Pkg", "Pkg"; weakdeps=Dict("Dates" => PLANNING_DATES),
+                                   extensions=Dict("PkgDatesExt" => "Dates"))
+        entry = planning_file(package, "src/Pkg.jl", "module Pkg\ninclude(\"part.jl\")\nend\n")
+        planning_file(package, "src/part.jl")
+        extension = planning_file(package, "ext/PkgDatesExt.jl")
+        test_file = planning_file(package, "test/runtests.jl")
+        planning_file(root, ".JETSweep.toml", """
+            exclude = ["vendor"]
+
+            [[context]]
+            match = "tools/check.jl"
+            project = "tools/env"
+            setup = ["tools/setup.jl"]
+            args = ["--fast"]
+            env = { MODE = "analysis" }
+            jetls_config = "tools/jetls.toml"
+
+            [[context]]
+            match = "Pkg/test/**"
+            project = "tools/env"
+            args = ["--test"]
+
+            [[context]]
+            match = "Pkg/ext/*.jl"
+            project = "tools/env"
+            """)
+        planning_file(root, "vendor/skipped.jl")
+        inventory, units = planning_plan(root)
+
+        @test !any(source -> occursin("vendor", source.path), inventory.sources)
+        configured = planning_unit(units, check)
+        @test configured.context == planning_context(environment, "")
+        @test planning_overrides(configured.overrides) == ([setup], ["--fast"], Dict("MODE" => "analysis"), jetls)
+        test_unit = planning_unit(units, test_file)
+        @test test_unit.context == planning_context(environment, package, true)
+        @test test_unit.overrides.args == ["--test"]
+        @test test_unit.id == planning_unit(plan(inventory), test_file).id
+        @test planning_unit(units, extension).context ==
+              planning_context(environment, package, false, Dict("Dates" => PLANNING_DATES))
+        for file in (setup, other, loose, entry)
+            @test planning_overrides(planning_unit(units, file).overrides) == PLANNING_NONE
+        end
+        @test planning_unit(units, other).context == planning_context("", "")
+        @test planning_unit(units, entry).context == planning_context(package, package)
+        planning_invariants(inventory, units)
+
+        for match in ("tools/absent.jl", "Pkg/src/part.jl")
+            file = planning_file(root, ".JETSweep.toml", "[[context]]\nmatch = \"$match\"\n")
+            message = "ArgumentError: $file: [[context]] match $(repr(match)) selects no unit"
+            @test_throws message planning_plan(root)
+        end
+        planning_file(root, ".JETSweep.toml", "[[context]]\nmatch = \"*.jl\"\nargs = [\"--all\"]\n")
+        _, units = planning_plan(root)
+        @test planning_unit(units, loose).overrides.args == ["--all"]
+        @test planning_unit(units, check).overrides.args == String[]
+        # Tables matching the same unit combine: each key a later table sets overrides it.
+        planning_file(root, ".JETSweep.toml", """
+            [[context]]
+            match = "*.jl"
+            args = ["--all"]
+            env = { A = "1", B = "1" }
+            [[context]]
+            match = "*.jl"
+            env = { B = "2" }
+            """)
+        unit = planning_unit(last(planning_plan(root)), loose)
+        @test unit.overrides.args == ["--all"]
+        @test unit.overrides.env == Dict("A" => "1", "B" => "2")
     end
 end

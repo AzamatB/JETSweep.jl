@@ -1,35 +1,33 @@
+"""
+Recursive JETLS analysis of every Julia package, extension, test and script below a
+directory, with each analysis in its own process. See [`sweep`](@ref).
+"""
 module JETSweep
 
-using Dates
+using Base: UUID
 using LibGit2
 using Pkg
 using SHA
 using TOML
-using UUIDs
-
-const _LOADED_TOOL_PROJECT = Ref{String}("")
-
-function __init__()
-    _, environment = lock(Base.require_lock) do
-        Base.locate_package_env(Base.PkgId(@__MODULE__))
-    end
-    _LOADED_TOOL_PROJECT[] = something(environment, joinpath(dirname(@__DIR__), "Project.toml"))
-    return
-end
-
-_tool_project() = _LOADED_TOOL_PROJECT[]
 
 include("model.jl")
-include("io.jl")
 include("discovery.jl")
+include("syntax.jl")
+include("config.jl")
 include("planning.jl")
 include("environments.jl")
-include("tool_environment.jl")
+include("processes.jl")
 include("execution.jl")
 include("reporting.jl")
 include("cli.jl")
 
+function __init__()
+    _, environment = @lock Base.require_lock Base.locate_package_env(Base.PkgId(@__MODULE__))
+    _LOADED_PROJECT[] = something(environment, joinpath(dirname(@__DIR__), "Project.toml"))
+    return nothing
+end
+
 export SweepOptions, discover, plan, sweep
-public main
+public main, read_config, prepare, prelude, parse_source
 
 end # module JETSweep
