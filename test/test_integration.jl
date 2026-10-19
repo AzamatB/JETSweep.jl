@@ -123,6 +123,19 @@ end
             end
             after() = 1 + "one"
             """)
+        # What outlined code does wrong is reported where it does it.
+        write(joinpath(root, "inside.jl"), """
+            const LOCK = rand(Bool) ? nothing : 1
+            LOCK === nothing || (sin("one"); atexit(() -> close(LOCK)))
+            for item in readdir(@__DIR__)
+                if isdir(item)
+                    foreach(x -> println(x), item)
+                end
+                cos("two")
+            end
+            using Test
+            @test isempty(ARGS) || (tan("three") > 0 && all(a -> a > 0, [1]))
+            """)
         # A script runs as the program, so a check for that holds as it would.
         write(joinpath(root, "main_check.jl"), """
             const MAIN = abspath(PROGRAM_FILE) == abspath(@__FILE__)
@@ -171,6 +184,8 @@ end
         @test status("bootstrap.jl") === :findings
         @test status("main_check.jl") === :findings
         @test status("loop.jl") === :findings
+        inside = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "inside.jl"))
+        @test issubset([2, 7, 10], [f.line for f in inside.findings if f.code == "inference/method-error"])
         @test status("uses_sibling.jl") === :findings
         sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
         @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)

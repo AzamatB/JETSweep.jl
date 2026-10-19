@@ -109,6 +109,9 @@ JETLS's interpreter; any other top-level expression that assigns nothing, as in
 local scopes already, unless they import packages, which only top-level code can. Code that
 includes or evaluates code stays at top level, where JETLS follows it, as do closures whose
 parameters declare types, since Julia evaluates those types where the closure stands.
+JETLS drops what it finds in code without line information, which the closures it outlines
+`@test` expressions into are; JETSweep reports it at the nearest line that has some, the
+test's.
 
 Files a finished analysis does not reach, such as package files loading leaves out or files
 after an analysis stop, get follow-up units of their own, in the same context: a package's

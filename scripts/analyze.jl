@@ -84,16 +84,46 @@ must stand at top level, keep it there.
 """
 outlinable_scope(ex) = ex isa Expr && ex.head in (:for, :while, :let) && branch_function(ex) && !imports(ex)
 
+"The first line node in `ex`, outside quoted code."
+function first_line(ex)
+    ex isa LineNumberNode && return ex
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return nothing
+    for arg in ex.args
+        line = first_line(arg)
+        line === nothing || return line
+    end
+    return nothing
+end
+
 # JET analyzes any top-level expression it can outline the same way, such as
 # `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`, and
 # loops and `let` blocks. Closures with typed parameters stay, since lowering would evaluate
-# their types anyway.
+# their types anyway. The closure starts at the expression's first line, so that what is
+# reported in it has its location.
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
         (should_wrap_test_expression_in_thunk(x) || $outlinable_scope(x)) && !$stays(x) && !$typed_closure(x) ||
             return x
-        return wrap_test_expression_in_thunk(x)
+        thunk, line = gensym(:outlined), $first_line(x)
+        body = line === nothing ? x : Expr(:block, line, x)
+        return Expr(:let, Expr(:(=), thunk, Expr(:->, Expr(:tuple), body)), Expr(:block, Expr(:call, thunk)))
+    end
+end)
+
+# JETLS drops a report whose innermost frame has no file, as frames of code without line
+# information have, such as the closures JET outlines `@test` expressions into. Report it at
+# the nearest frame that has one instead.
+Core.eval(LS.Analyzer, quote
+    function inference_error_report_stack(@nospecialize report::JET.InferenceErrorReport)
+        stack = inference_error_report_stack_impl(report)
+        stack isa UnitRange{Int} && (stack = convert(StepRange{Int,Int}, stack))
+        stack isa StepRange{Int,Int} || error("Invalid implementation of `inference_error_report_stack_impl`")
+        while length(stack) > 1 && report.vst[first(stack)].file === :none
+            stack = first(stack)+step(stack):step(stack):last(stack)
+        end
+        @static JETLS_DEV_MODE && assert_valid_report_stack(report, stack, "display")
+        return stack
     end
 end)
 
