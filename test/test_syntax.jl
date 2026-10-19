@@ -10,7 +10,7 @@ function syntax_write(root::String, relative::String, content::String)
 end
 
 "Parse `code` as `source.jl` in a fresh directory: its directory, path and `Syntax`."
-function syntax_parse(code::String; packages=Dict{String,String}())
+function syntax_parse(code::String; packages=Dict{String,JETSweep.Project}())
     mktempdir() do directory
         dir = realpath(directory)
         file = syntax_write(dir, "source.jl", code)
@@ -129,20 +129,28 @@ end
     @test defined.syntax.notes == [syntax_dynamic(defined.file, 2)]
 end
 
-@testset "parse_source resolves pkgdir through the packages map" begin
+@testset "parse_source resolves pkgdir and pathof through the packages map" begin
     root = "/depot/packages/Dep"
     code = """
         include(joinpath(pkgdir(Dep), "bootstrap.jl"))
         include(pkgdir(Dep, "src", "part.jl"))
+        include(joinpath(dirname(pathof(Dep)), "../test/object.jl"))
+        include(Base.pathof(Dep))
         include(pkgdir(Unknown, "unknown.jl"))
         include(pkgdir(Dep, name))
+        include(joinpath(dirname(pathof(Unknown)), "unknown.jl"))
+        include(pathof(Dep, "extra"))
         """
-    parsed = syntax_parse(code; packages=Dict("Dep" => root))
+    dep = JETSweep.Project(root, joinpath(root, "Project.toml"), "Dep", "", joinpath(root, "lib", "Main.jl"),
+                           Dict{String,Dict{String,String}}())
+    parsed = syntax_parse(code; packages=Dict("Dep" => dep))
     @test parsed.syntax.includes == [SyntaxInclude(joinpath(root, "bootstrap.jl"), 1, true),
                                      SyntaxInclude(joinpath(root, "src", "part.jl"), 2, true),
-                                     SyntaxInclude("", 3, true), SyntaxInclude("", 4, true)]
-    @test parsed.syntax.notes == [syntax_dynamic(parsed.file, line) for line in 3:4]
-    @test syntax_parse(code).syntax.includes == [SyntaxInclude("", line, true) for line in 1:4]
+                                     SyntaxInclude(joinpath(root, "test", "object.jl"), 3, true),
+                                     SyntaxInclude(dep.entry, 4, true),
+                                     (SyntaxInclude("", line, true) for line in 5:8)...]
+    @test parsed.syntax.notes == [syntax_dynamic(parsed.file, line) for line in 5:8]
+    @test syntax_parse(code).syntax.includes == [SyntaxInclude("", line, true) for line in 1:8]
 end
 
 @testset "parse_source follows bindings to literal paths" begin

@@ -158,6 +158,7 @@ end
             using Test, Tested
             include("setup.jl")
             include(joinpath(pkgdir(Tested), "test", "located.jl"))
+            include(joinpath(dirname(pathof(Tested)), "../test/found.jl"))
             @testset "grouped" include("grouped.jl")
             const TESTS = ["unit_a.jl", "unit_b.jl"]
             for file in TESTS
@@ -167,7 +168,7 @@ end
                 include("lazy.jl")
             end
             """)
-        statics = [planning_file(tested, "test/$name.jl") for name in ("setup", "located", "grouped")]
+        statics = [planning_file(tested, "test/$name.jl") for name in ("setup", "located", "found", "grouped")]
         unit_a = planning_file(tested, "test/unit_a.jl", "include(\"helpers/common.jl\")\n")
         unit_b = planning_file(tested, "test/unit_b.jl", "include(\"setup.jl\")\ninclude(\"helpers/common.jl\")\n")
         common = planning_file(tested, "test/helpers/common.jl")
@@ -205,7 +206,7 @@ end
         @test main.driver == ""
         @test main.expected == sort([driver; statics])
         @test main.context == context
-        @test main.notes == ["$driver:7: include target is only known at run time"]
+        @test main.notes == ["$driver:8: include target is only known at run time"]
         for file in [unit_a, unit_b, lazy, cycle_x, recursive]
             @test planning_unit(units, file).kind === :test
             @test planning_unit(units, file).driver == driver

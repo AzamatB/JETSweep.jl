@@ -57,8 +57,11 @@ _symbols!(names::Set{Symbol}, ex::QuoteNode) = _symbols!(names, ex.value)
 _symbols!(names::Set{Symbol}, ::Any) = names
 _symbols(ex) = _symbols!(Set{Symbol}(), ex)
 
-"Evaluate a path expression built from literals, `@__DIR__`, `@__FILE__` and path calls."
-function _path(ex, file::String, bindings::Dict{Symbol,String}, packages::Dict{String,String})
+"""
+Evaluate a path expression built from literals, `@__DIR__`, `@__FILE__` and path calls,
+`pkgdir(Name)` and `pathof(Name)` among them for the packages `packages` names.
+"""
+function _path(ex, file::String, bindings::Dict{Symbol,String}, packages::Dict{String,Project})
     ex isa String && return ex
     ex isa Symbol && return get(bindings, ex, nothing)
     ex isa Expr || return nothing
@@ -74,11 +77,12 @@ function _path(ex, file::String, bindings::Dict{Symbol,String}, packages::Dict{S
         return nothing
     end
     name = _name(first(ex.args))
-    if name == "pkgdir"
-        length(ex.args) >= 2 || return nothing
-        root = get(packages, _name(ex.args[2]), nothing)
+    if name in ("pkgdir", "pathof")
+        package = length(ex.args) >= 2 ? get(packages, _name(ex.args[2]), nothing) : nothing
+        package === nothing && return nothing
+        name == "pathof" && return length(ex.args) == 2 && !isempty(package.entry) ? package.entry : nothing
         parts = [_path(arg, file, bindings, packages) for arg in ex.args[3:end]]
-        return root !== nothing && all(part -> part isa String, parts) ? joinpath(root, parts...) : nothing
+        return all(part -> part isa String, parts) ? joinpath(package.dir, parts...) : nothing
     end
     parts = [_path(arg, file, bindings, packages) for arg in ex.args[2:end]]
     all(part -> part isa String, parts) && !isempty(parts) || return nothing
@@ -94,7 +98,7 @@ end
 const _UPDATES = (:+=, :-=, :*=, :/=, :\=, :^=, :÷=, :%=, :|=, :&=, :⊻=, :<<=, :>>=, :>>>=, :.=, :$=)
 
 "Record or forget a path binding for an assignment-like expression."
-function _rebind!(bindings::Dict{Symbol,String}, ex::Expr, file::String, packages::Dict{String,String})
+function _rebind!(bindings::Dict{Symbol,String}, ex::Expr, file::String, packages::Dict{String,Project})
     lhs = first(ex.args)
     if ex.head === :(=) && lhs isa Symbol
         value = _path(last(ex.args), file, bindings, packages)
@@ -120,11 +124,11 @@ _loop_names(spec) = spec isa Expr && spec.head in (:(=), :block, :filter) ?
 """
     parse_source(file, packages=Dict(); exports=Dict()) -> Syntax
 
-Find the `include` calls of `file`. `packages` maps package names to their directories,
-which resolves `pkgdir(Name)` paths; `exports` maps files to the path constants they
-define, which code after including them can use.
+Find the `include` calls of `file`. `packages` maps package names to their projects,
+which resolves `pkgdir(Name)` and `pathof(Name)` paths; `exports` maps files to the path
+constants they define, which code after including them can use.
 """
-function parse_source(file::String, packages::Dict{String,String}=Dict{String,String}();
+function parse_source(file::String, packages::Dict{String,Project}=Dict{String,Project}();
                       exports::Dict{String,Dict{Symbol,String}}=Dict{String,Dict{Symbol,String}}())
     includes, notes, imports, modules = Include[], String[], String[], String[]
     tree = try
@@ -1014,7 +1018,7 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
         # wherever the call is, but other includes are test files, except nested drivers
         # included inside a `@testset`, say.
         for include in _nested_includes!(Expr[], ex)
-            path = _path(last(include.args), file, bindings, Dict{String,String}())
+            path = _path(last(include.args), file, bindings, Dict{String,Project}())
             path === nothing && return true
             path = normpath(dirname(file), path)
             path == next && return true
@@ -1025,7 +1029,7 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
         assignment = _assignment(ex)
         if assignment !== nothing
             names, value = assignment
-            known = length(names) == 1 ? _path(value, file, bindings, Dict{String,String}()) : nothing
+            known = length(names) == 1 ? _path(value, file, bindings, Dict{String,Project}()) : nothing
             known === nothing ? foreach(name -> delete!(bindings, name), names) : (bindings[only(names)] = known)
         end
         if ex isa Expr && (ex.head in (:using, :import) || _definition(ex) || assignment !== nothing)
