@@ -44,8 +44,15 @@ _method(ex) = ex isa Expr &&
 _is_include(ex) = ex isa Expr && ex.head === :call && _name(first(ex.args)) == "include" &&
     2 <= length(ex.args) <= 4
 
+"What a command literal, in backticks, interpolates; `nothing` for other expressions."
+function _command(ex)
+    _macro_name(ex) == "@cmd" && last(ex.args) isa String || return nothing
+    return try Base.shell_parse(last(ex.args); special=Base.shell_special)[1] catch; nothing end
+end
+
 _symbols!(names::Set{Symbol}, ex::Symbol) = push!(names, ex)
-_symbols!(names::Set{Symbol}, ex::Expr) = (foreach(arg -> _symbols!(names, arg), ex.args); names)
+_symbols!(names::Set{Symbol}, ex::Expr) =
+    (foreach(arg -> _symbols!(names, arg), something(_command(ex), ex).args); names)
 _symbols!(names::Set{Symbol}, ex::QuoteNode) = _symbols!(names, ex.value)
 _symbols!(names::Set{Symbol}, ::Any) = names
 _symbols(ex) = _symbols!(Set{Symbol}(), ex)
@@ -648,7 +655,7 @@ function _evaluated_symbols!(names::Set{Symbol}, ex, quoted::Bool=false)
         quoted || push!(names, ex)
     elseif ex isa Expr
         quoted = ex.head === :quote ? true : ex.head === :$ ? false : quoted
-        foreach(arg -> _evaluated_symbols!(names, arg, quoted), ex.args)
+        foreach(arg -> _evaluated_symbols!(names, arg, quoted), (quoted ? ex : something(_command(ex), ex)).args)
     end
     return names
 end
@@ -695,7 +702,7 @@ function _code_reads!(names::Set{Symbol}, ex)
             _interpolated!(names, ex)
             ex.head === :-> || (_method(ex) ? _signature_types!(names, first(ex.args)) : _type_symbols!(names, ex))
         else
-            foreach(arg -> _code_reads!(names, arg), ex.args)
+            foreach(arg -> _code_reads!(names, arg), something(_command(ex), ex).args)
         end
     end
     return names

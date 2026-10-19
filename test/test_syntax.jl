@@ -798,6 +798,15 @@ end
         using .Helper
         """
     @test syntax_patterns(code) == ["const SNAPSHOT = snapshot(joinpath(@__DIR__, \"helper.jl\"))"]
+    # Wherever the call stands, and through what command literals interpolate.
+    code = """
+        const SOURCE = joinpath(get(ENV, "SOURCE_ROOT", @__DIR__), "Source.jl")
+        let code = read(`git -C \$SOURCE show HEAD:helper.jl`, String)
+            include_string(@__MODULE__, code, "helper.jl")
+        end
+        """
+    @test syntax_patterns(code) == ["const SOURCE = joinpath(get(ENV, \"SOURCE_ROOT\", @__DIR__), \"Source.jl\")"]
+    @test JETSweep._symbols(Meta.parse("`a \$b \$(c.d):e`")) == Set([:b, :c, :d])
     # `import A.f` may bind a function, so only whole modules count.
     @test JETSweep._modules(:(using A.B, C)) == Set([:B, :C])
     @test JETSweep._modules(:(import D, E.f, F as G, H.i as j)) == Set([:D, :G])
