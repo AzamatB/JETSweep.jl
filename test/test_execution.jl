@@ -698,6 +698,38 @@ end
     end
 end
 
+execution_script(name) = JETSweep.Unit("script-$name", :script, "/root/$name.jl", execution_context(name),
+                                       ["/root/$name.jl"], "", "", JETSweep.Overrides(), String[])
+execution_incomplete(name, status, reasons, notes=String[]; log="") =
+    JETSweep.UnitResult("script-$name", status, JETSweep.Finding[], String[], reasons, notes, 1.0, log)
+
+"Report a sweep of `/root` with these units and results; return the terminal summary and summary.txt."
+function execution_report(output, units, results)
+    inventory = JETSweep.Inventory("/root", JETSweep.Project[], JETSweep.Source[], String[], String[])
+    io = IOBuffer()
+    JETSweep.write_report(JETSweep.SweepResult("/root", output, inventory, units, results, String[], 1.0, 2); io)
+    return String(take!(io)), read(joinpath(output, "summary.txt"), String)
+end
+
+@testset "Incomplete units are grouped by cause, whichever environment's log it points to" begin
+    mktempdir() do output
+        timed_out(key) = "environment unavailable: environment preparation timed out; see $output/environments/$key/log.txt"
+        exited(key) = "environment unavailable: environment preparation exited with code 1; see /out dir/$key/log.txt"
+        units = execution_script.(["a", "b", "c", "d"])
+        results = [execution_incomplete("a", :unavailable, [timed_out("1")]),
+                   execution_incomplete("b", :unavailable, [timed_out("2")]),
+                   execution_incomplete("c", :unavailable, [exited("3")]),
+                   execution_incomplete("d", :unavailable, [exited("4")])]
+        @test JETSweep._cause(results[1]) == "environment unavailable: environment preparation timed out"
+        @test JETSweep._cause(results[3]) == "environment unavailable: environment preparation exited with code 1"
+        terminal, _ = execution_report(output, units, results)
+        @test occursin("\n    2  unavailable environment unavailable: environment preparation timed out\n" *
+                       "         a.jl, b.jl\n", terminal)
+        @test occursin("\n    2  unavailable environment unavailable: environment preparation exited with code 1\n" *
+                       "         c.jl, d.jl\n", terminal)
+    end
+end
+
 @testset "Files a unit did not reach get follow-up units" begin
     mktempdir() do directory
         root = realpath(directory)

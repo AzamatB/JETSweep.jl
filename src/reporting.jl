@@ -101,13 +101,15 @@ function write_report(result::SweepResult; io::IO=stderr)
 end
 
 """
-Why a unit did not complete, without what differs from unit to unit: the location of a stop
-and the names in backquotes, as in "`X` must have a concrete value".
+Why a unit did not complete, without what differs from unit to unit: the location of a stop,
+the names in backquotes, as in "`X` must have a concrete value", and the log of an
+environment that failed to prepare, as in "timed out; see …/log.txt".
 """
 function _cause(result::UnitResult)
     result.status === :timeout && return "time limit exceeded"
     reason = isempty(result.reasons) ? "" : first(split(first(result.reasons), '\n'))
-    reason = replace(reason, r"^analysis stopped at .*?:\d+ \[" => "[", r"`[^`]*`" => "`…`")
+    reason = replace(reason, r"^analysis stopped at .*?:\d+ \[" => "[", r"`[^`]*`" => "`…`",
+                     r"; see .*?log\.txt" => "")
     return length(reason) > 160 ? first(reason, 159) * "…" : reason
 end
 
