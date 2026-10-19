@@ -372,6 +372,26 @@ function findings(uri2diagnostics, generated::String, encoding)
     return rows
 end
 
+"The line before each statement a prelude copies, naming where the statement is from."
+const MARKER = r"^#= (.+):(\d+) =#$"
+
+"""
+The original file and line of line `line` of the generated entry `file`, if a statement its
+prelude copies is there: after its marker, inside `@eval begin … end` if it is evaluated.
+"""
+function original(file::String, line::Int)
+    lines = readlines(file)
+    marker = findlast(i -> occursin(MARKER, lines[i]), 1:min(line, length(lines)))
+    marker === nothing && return nothing
+    source, start = match(MARKER, lines[marker])
+    # The statement ends where it parses to, before any include that follows the prelude.
+    text = join(lines[marker+1:end], '\n')
+    span = count('\n', text[1:prevind(text, last(Meta.parse(text, 1; raise=false)))])
+    line - marker <= span || return nothing
+    evaluated = lines[marker+1] == "@eval begin"
+    return source, parse(Int, start) + clamp(line - marker - 1 - evaluated, 0, span - 1 - 2evaluated)
+end
+
 function analyze(request, log::ErrorLog)
     timings = Dict{String,Float64}()
     started = time()
@@ -438,8 +458,11 @@ function analyze(request, log::ErrorLog)
         for (uri, list) in diagnostics, diagnostic in list
             code = string(something(diagnostic.code, ""))
             code in STOPS || continue
-            location = "$(something(LS.uri2filepath(uri), string(uri))):$(diagnostic.range.start.line + 1)"
-            push!(reasons, "analysis stopped at $location [$code]: " *
+            file, line = something(LS.uri2filepath(uri), string(uri)), Int(diagnostic.range.start.line) + 1
+            # A stop in a prelude is at the driver's statement it copies, as the driver's unit
+            # reports it.
+            canonical(file) == generated && ((file, line) = something(original(generated, line), (file, line)))
+            push!(reasons, "analysis stopped at $file:$line [$code]: " *
                 first(split(LS.get_raw_message(diagnostic), '\n')))
         end
         for (uri, list) in diagnostics

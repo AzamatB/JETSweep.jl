@@ -181,6 +181,34 @@ end
             use() = Bootstrapped.value() + "one"
             """)
         write(joinpath(root, "bootstrapped.txt"), "module Bootstrapped\nvalue() = 1\nend\n")
+        # A stop in the prelude of a test file a driver includes at run time is reported where
+        # the driver stops.
+        mkpath(joinpath(root, "Preluded", "src"))
+        mkpath(joinpath(root, "Preluded", "test"))
+        write(joinpath(root, "Preluded", "Project.toml"), """
+            name = "Preluded"
+            uuid = "0c5a3f2e-7d41-4b8a-9e6f-3a2b1c0d9e8f"
+            version = "0.1.0"
+            [extras]
+            Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+            [targets]
+            test = ["Test"]
+            """)
+        write(joinpath(root, "Preluded", "src", "Preluded.jl"), "module Preluded\nend\n")
+        write(joinpath(root, "Preluded", "test", "runtests.jl"), """
+            using Test
+
+            const TESTS = ["wrapped.jl"]
+
+            struct Wrapper{T<:NotDefinedAnywhere}
+                x::T
+            end
+
+            for file in (isempty(ARGS) ? TESTS : ARGS)
+                include(file)
+            end
+            """)
+        write(joinpath(root, "Preluded", "test", "wrapped.jl"), "@test Wrapper(1).x == 1\n")
         # A generator in a branch of a `@test` expression does not make JETLS run the test.
         write(joinpath(root, "outlined.jl"), """
             using Test
@@ -217,6 +245,10 @@ end
         @test issubset([2, 7, 10, 15], [f.line for f in inside.findings if f.code == "inference/method-error"])
         # A test that always fails is reported in outlined code as at top level.
         @test any(f -> f.code == "inference/failing-test" && f.line == 12, inside.findings)
+        @test status("Preluded/test/wrapped.jl") === :incomplete
+        @test reasons("Preluded/test/wrapped.jl") == reasons("Preluded/test/runtests.jl")
+        @test any(reason -> occursin("Preluded/test/runtests.jl:5 [toplevel/error]", reason),
+                  reasons("Preluded/test/wrapped.jl"))
         @test status("uses_sibling.jl") === :findings
         sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
         @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)

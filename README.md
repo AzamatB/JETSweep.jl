@@ -77,10 +77,12 @@ Test drivers commonly choose their test files at run time, as in
 follow. Each such test file therefore gets its own unit, analyzed after a prelude of what the
 drivers set up before including it: imports, definitions, and the constants, modules and
 conditional definitions, as in `@static if`, that the test file refers to, copied with their
-original source text; selection logic the test file does not depend on is left out. The
-drivers' own analyses evaluate the selection and skip including the files analyzed
-separately. A test file analyzed by itself is fail-fast top-level code, as below, even when
-its driver includes it in a `failfast=false` or custom test set.
+original source text; selection logic the test file does not depend on is left out. An
+analysis stop in the prelude is reported at the driver's line it copies, whose diagnostic the
+driver's own analysis reports. The drivers' own analyses evaluate the selection and skip
+including the files analyzed separately. A test file analyzed by itself is fail-fast
+top-level code, as below, even when its driver includes it in a `failfast=false` or custom
+test set.
 
 Script analysis evaluates definitions, imports and includes but not assignments, so a
 definition or `include` that needs an assigned value stops JETLS
