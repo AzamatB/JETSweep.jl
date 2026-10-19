@@ -18,8 +18,9 @@ code and so on — and says plainly which analyses could not complete, and why.
 JETSweep requires Julia 1.13. It uses JETLS 2026.10.18, pinned to that release's commit
 because the analysis entry points it drives are internal to JETLS, and JETLS's Revise-based
 package analysis, which only its development mode enables. JETLS releases leave out the
-Revise that mode loads, so JETSweep pins Revise too, at the revision JETLS's development
-branch uses.
+Revise that mode loads, so JETSweep adds it: an analyzed project keeps the Revise it locks if
+it is of the series JETLS's development branch uses, and otherwise gets the release that
+branch pins, which JETSweep pins too.
 
 ```julia
 using Pkg
@@ -113,8 +114,10 @@ JETLS's interpreter; any other top-level expression that assigns nothing, as in
 local scopes already, unless they import packages, which only top-level code can. Code that
 includes or evaluates code stays at top level, where JETLS follows it, as do closures whose
 parameters declare types, since Julia evaluates those types where the closure stands.
-JETLS analyzes test sets as fail-fast, so code after a `@test` that always fails is not
-analyzed, and reports such a test only in top-level code; JETSweep reports it in the code it
+JETLS analyzes top-level code and test sets as fail-fast, except test sets that specify
+`failfast=false` or have a custom type and those nested in them, which it analyzes as
+declared. So code after a `@test` that always fails is not analyzed, except in those test
+sets, and JETLS reports such a test only in top-level code; JETSweep reports it in the code it
 outlines too. JETLS drops what it finds in code without line information, which the closures
 it outlines `@test` expressions into are; JETSweep reports it at the nearest line that has
 some, the test's.
@@ -226,8 +229,10 @@ julia --project -e 'using Pkg; Pkg.test()'
 julia --project -e 'using Pkg; Pkg.test(test_args=["test_planning.jl"])'
 ```
 
-To move to another JETLS release, set its commit and version in `Project.toml`, and Revise's
-revision to the one `JETLSCore/Project.toml` pins on JETLS's development branch at that
-release. Then delete `Manifest.toml` and instantiate: updating JETLS alone keeps the old
-versions of the packages it vendors. Compare a sweep of a large workspace with one from
-before the change.
+To move to another JETLS release, set its commit and version in `Project.toml`. Then pin
+Revise, with an exact `[compat]` bound, to the release of the revision `[sources]` in
+`JETLSCore/Project.toml` names on JETLS's `master` at that release: the second parent of the
+release branch's merge of `master`, since the release itself names no revision. If that
+revision is no release, pin it in `[sources]` instead. Then delete `Manifest.toml` and
+instantiate: updating JETLS alone keeps the old versions of the packages it vendors. Compare
+a sweep of a large workspace with one from before the change.

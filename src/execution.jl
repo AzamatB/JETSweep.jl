@@ -220,13 +220,18 @@ function _package(unit::Unit, inventory::Inventory)
     return (inventory.projects[index].name, inventory.projects[index].uuid)
 end
 
-"The error a worker printed before it exited without a result, as `\": message\"`, if any."
-function _worker_error(log::String)
-    isfile(log) || return nothing
+"""
+The uncaught error a worker printed before it exited with `code` without a result, as
+`": message"`, if any. Julia prints that error last; a signal prints none of its own, so any
+error before it was caught.
+"""
+function _worker_error(log::String, code::Integer)
+    0 < code < 128 && isfile(log) || return nothing
+    message = nothing
     for line in eachline(log)
-        startswith(line, "ERROR: ") && return ": " * chopprefix(line, "ERROR: ")
+        startswith(line, "ERROR: ") && (message = ": " * chopprefix(line, "ERROR: "))
     end
-    return nothing
+    return message
 end
 
 function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Union{Nothing,String})
@@ -256,7 +261,7 @@ function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Unio
     process = run_worker(Cmd(command; dir=dirname(unit.entry)), log, sweep.options.timeout)
     process.timed_out && return failure(:timeout, "time limit of $(sweep.options.timeout) s exceeded")
     isfile(result) || return failure(:failed, "worker exited with code $(process.code) without a result" *
-                                     something(_worker_error(log), ""))
+                                     something(_worker_error(log, process.code), ""))
     data = TOML.parsefile(result)
     haskey(data, "error") && return failure(:failed, first(split(data["error"], '\n')))
     reasons = String[data["reasons"]..., ("logged error: " * error for error in data["errors"])...]

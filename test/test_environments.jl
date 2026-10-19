@@ -105,9 +105,12 @@ _environments_test_uuid() = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
         @test _environments_path(environment, parent_uuid) == parent
         @test _environments_path(environment, helper_uuid) == helper
         @test _environments_manifest(environment)[jetls.uuid].tree_hash == jetls.tree_hash
-        # JETLS releases leave Revise out of JETLSCore's dependencies; preparation supplies it.
+        # JETLS releases leave Revise out of JETLSCore's dependencies; preparation supplies it,
+        # of the analyzer's series.
         @test _environments_manifest(environment)[core.uuid].deps["Revise"] == revise.uuid
         @test _environments_manifest(environment)[revise.uuid].tree_hash == revise.tree_hash
+        @test project["compat"]["Revise"] == "$(revise.version.major).$(revise.version.minor)"
+        @test !haskey(project["sources"], "Revise")
         @test _environments_preferences(environment) ==
               Dict("JETLSCore" => Dict("JETLS_DEV_MODE" => true), "PlainParent" => Dict("backend" => "cpu"))
         @test _environments_run(environment, """
@@ -259,6 +262,17 @@ end
         failure = _environments_prepare(_environments_context(bare, ""), joinpath(envs, "bare"))
         @test failure.status === :failed
         @test occursin("no Julia project at $bare", failure.message)
+    end
+end
+
+@testset "a target's Revise must be of the analyzer's series" begin
+    _environments_sandbox() do root, envs
+        revise = string(_environments_tool("Revise").uuid)
+        scripts = joinpath(root, "scripts")
+        _environments_write(joinpath(scripts, "Project.toml"),
+                            Dict("deps" => Dict("Revise" => revise), "compat" => Dict("Revise" => "2")))
+        refused = _environments_prepare(_environments_context(scripts, ""), joinpath(envs, "refused"))
+        @test refused.status === :failed && occursin("incompatible compat bounds for Revise", refused.message)
     end
 end
 
@@ -539,7 +553,7 @@ end
             @test environment == _environments_ready(joinpath(envs, name))
             JETSweep.ready(environment) || continue
             compat = Pkg.Types.read_project(joinpath(environment.dir, "Project.toml")).compat
-            @test keys(compat) == Set(["CompatHelper", "julia"])
+            @test keys(compat) == Set(["CompatHelper", "julia", "Revise"])
             @test filter(in(compat["CompatHelper"].val), [inside; outside]) == inside
         end
 
@@ -561,7 +575,7 @@ end
         deferred = _environments_prepare(_environments_context(deferring), joinpath(envs, "deferred");
                                          instantiate=true)
         @test deferred == _environments_ready(joinpath(envs, "deferred"))
-        @test keys(_environments_project(deferred)["compat"]) == Set(["julia"])
+        @test keys(_environments_project(deferred)["compat"]) == Set(["julia", "Revise"])
         @test _environments_manifest(deferred)[UUID(preferences_uuid)].version == locked
 
         violator = target("ViolatingParent", Dict("Preferences" => "2"))

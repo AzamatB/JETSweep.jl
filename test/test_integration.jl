@@ -139,6 +139,10 @@ end
                 @test n
                 n > 1 && foreach(x -> println(x), 1:n)
             end
+            for item in readdir(sin("four"))
+                # The header is reported where it stands.
+                isdir(item) && foreach(x -> println(x), item)
+            end
             """)
         # A script runs as the program, so a check for that holds as it would.
         write(joinpath(root, "main_check.jl"), """
@@ -189,7 +193,7 @@ end
         @test status("main_check.jl") === :findings
         @test status("loop.jl") === :findings
         inside = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "inside.jl"))
-        @test issubset([2, 7, 10], [f.line for f in inside.findings if f.code == "inference/method-error"])
+        @test issubset([2, 7, 10, 15], [f.line for f in inside.findings if f.code == "inference/method-error"])
         # A test that always fails is reported in outlined code as at top level.
         @test any(f -> f.code == "inference/failing-test" && f.line == 12, inside.findings)
         @test status("uses_sibling.jl") === :findings

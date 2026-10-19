@@ -695,10 +695,12 @@ end
 @testset "a worker that exits without a result is reported with its error" begin
     mktempdir() do directory
         log = joinpath(directory, "log.txt")
-        @test JETSweep._worker_error(log) === nothing
-        write(log, "Precompiling...\nERROR: LoadError: ArgumentError: Cannot load Revise\nStacktrace:\nERROR: later\n")
-        @test JETSweep._worker_error(log) == ": LoadError: ArgumentError: Cannot load Revise"
+        @test JETSweep._worker_error(log, 1) === nothing
+        write(log, "ERROR: caught\nStacktrace:\nERROR: LoadError: ArgumentError: Cannot load Revise\nStacktrace:\n")
+        @test JETSweep._worker_error(log, 1) == ": LoadError: ArgumentError: Cannot load Revise"
+        # A signal ends a worker without an error of its own.
+        @test JETSweep._worker_error(log, 137) === nothing
         write(log, "killed\n")
-        @test JETSweep._worker_error(log) === nothing
+        @test JETSweep._worker_error(log, 1) === nothing
     end
 end

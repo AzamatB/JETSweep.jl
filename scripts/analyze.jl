@@ -84,40 +84,49 @@ must stand at top level, keep it there.
 """
 outlinable_scope(ex) = ex isa Expr && ex.head in (:for, :while, :let) && branch_function(ex) && !imports(ex)
 
-"The first line node in `ex`, outside quoted code."
-function first_line(ex)
-    ex isa LineNumberNode && return ex
-    ex isa Expr && !(ex.head in (:quote, :inert)) || return nothing
-    for arg in ex.args
-        line = first_line(arg)
-        line === nothing || return line
-    end
-    return nothing
-end
-
 "The name tag of the functions the worker outlines top-level code into."
 const OUTLINED = :jetsweep_outlined
 
 # JET analyzes any top-level expression it can outline the same way, such as
 # `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`, and
 # loops and `let` blocks. Closures with typed parameters stay, since lowering would evaluate
-# their types anyway. The function starts at the expression's first line, so that what is
-# reported in it has its location.
+# their types anyway.
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
         (should_wrap_test_expression_in_thunk(x) || $outlinable_scope(x)) && !$stays(x) && !$typed_closure(x) ||
             return x
-        thunk, line = gensym($(QuoteNode(OUTLINED))), $first_line(x)
-        body = line === nothing ? Expr(:block, x) : Expr(:block, line, x)
-        return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), body), Expr(:call, thunk)))
+        thunk = gensym($(QuoteNode(OUTLINED)))
+        return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), Expr(:block, x)), Expr(:call, thunk)))
+    end
+end)
+
+"The body of the function the worker outlined top-level code `x` into, if `x` is such code."
+function outlined_body(x)
+    Meta.isexpr(x, :let, 2) && Meta.isexpr(x.args[2], :block, 2) || return nothing
+    f = first(x.args[2].args)
+    Meta.isexpr(f, :function, 2) && Meta.isexpr(f.args[1], :call, 1) && f.args[1].args[1] isa Symbol &&
+        startswith(String(f.args[1].args[1]), "##$OUTLINED#") || return nothing
+    return f.args[2]
+end
+
+# JET lowers each top-level statement after the line node of its first line. An outlined
+# function starts there too, so that what is reported in it has its location: its loop
+# header or `let` bindings where they stand, and its body where that is.
+Core.eval(LS.Interpreter, quote
+    function JET.lower_with_err_handling(interp::LSInterpreter, node::JS.SyntaxNode, xblk::Expr)
+        body = $outlined_body(last(xblk.args))
+        body === nothing || !(first(xblk.args) isa LineNumberNode) || pushfirst!(body.args, first(xblk.args))
+        interp.current_node[] = node
+        @invoke JET.lower_with_err_handling(interp::JET.ConcreteInterpreter, node::JS.SyntaxNode, xblk::Expr)
     end
 end)
 
 # JETLS reports a `@test` that always fails only in top-level code, since a function body is
 # inferred for each specialization, for some of which a test may fail while it passes for
 # others. A function the worker outlines top-level code into has one, so its tests count too:
-# test sets are fail-fast, so the code after such a test is not analyzed, as at top level.
+# unless a test set is declared `failfast=false` or has a custom type, test sets are
+# fail-fast, so the code after such a test is not analyzed, as at top level.
 Core.eval(LS.Analyzer, quote
     function report_failing_test!(analyzer::LSAnalyzer, sv::CC.InferenceState, argtypes::Vector{Any})
         def = sv.linfo.def

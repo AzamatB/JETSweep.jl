@@ -354,7 +354,8 @@ end
 Add the analyzer to a scratch environment: JETLS with its Revise-based package analysis
 enabled, TestRunner, which JETLS requires as a direct dependency, and Revise, which that
 analysis needs (see `_supply_revise!`). Resolving tool and target together gives packages
-they share, such as Revise, one version for both.
+they share one version for both: the target keeps a Revise it locks if it is of the series
+the analyzer uses, whose release JETSweep pins.
 """
 function _add_tool!(project::Dict, preferences::Dict, manifest)
     tool = Pkg.Types.EnvCache(tool_project())
@@ -369,6 +370,8 @@ function _add_tool!(project::Dict, preferences::Dict, manifest)
         source = _entry_source(entry, tool.manifest_file)
         source === nothing || haskey(sources, entry.name) || (sources[entry.name] = source)
     end
+    revise = tool.manifest[_REVISE].version
+    _merge_compat!(get!(project, "compat", Dict{String,String}()), "Revise", "$(revise.major).$(revise.minor)")
     get!(project, "extras", Dict{String,String}())["JETLSCore"] = string(_JETLSCORE)
     preferences["JETLSCore"] = merge(get(preferences, "JETLSCore", Dict{String,Any}()), Dict("JETLS_DEV_MODE" => true))
     # Pkg applies root compat bounds by name, which would also constrain JETLS's privately

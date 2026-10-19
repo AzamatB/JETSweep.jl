@@ -13,7 +13,6 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
 [sources]
 JETLS = {rev = "88881856f97eb4750264aec5543b22b76c15dc48", url = "https://github.com/aviatesk/JETLS.jl"}
-Revise = {rev = "32638add4258d9a41ddedae377df19aa3dc1e295", url = "https://github.com/timholy/Revise.jl"}
 
 [compat]
 JETLS = "=2026.10.18"
