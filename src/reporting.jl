@@ -42,6 +42,9 @@ function report_progress(io::IO, unit::Unit, result::UnitResult, done::Int, tota
     flush(io)
 end
 
+report_issues(io::IO, inventory::Inventory) =
+    foreach(issue -> println(io, "Discovery issue: ", _relative(issue, inventory.root)), inventory.issues)
+
 "Findings deduplicated across units, which can analyze the same file."
 function unique_findings(results::Vector{UnitResult})
     findings = unique!(reduce(vcat, (result.findings for result in results); init=Finding[]))
@@ -118,9 +121,7 @@ function _summarize(io::IO, result::SweepResult, findings, statuses, severities,
     for (code, n) in first(sort!(collect(codes); by=last, rev=true), 10)
         println(io, "  ", lpad(n, 6), "  ", code)
     end
-    for issue in result.inventory.issues
-        println(io, "Discovery issue: ", _relative(issue, root))
-    end
+    report_issues(io, result.inventory)
     for file in result.changed
         println(io, "Changed during the run: ", _display(file, root))
     end

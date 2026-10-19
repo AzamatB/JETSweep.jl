@@ -422,6 +422,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     println(io, "JETSweep: $(length(inventory.sources)) files, $packages packages, $(length(units)) units, ",
             "$(length(contexts)) environments")
     if options.plan_only
+        report_issues(io, inventory)
         println(io, "Plan written to $output")
         return SweepResult(root, output, inventory, units, UnitResult[], String[], time() - started,
                            isempty(inventory.issues) ? 0 : 2)

@@ -670,6 +670,19 @@ end
     end
 end
 
+@testset "A plan prints the discovery issues that fail it" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        execution_touch(joinpath(root, "Broken", "Project.toml"), "name = \"Broken\"\nuuid = \"not-a-uuid\"\n")
+        execution_touch(joinpath(root, "Broken", "src", "Broken.jl"), "module Broken\nend\n")
+        io = IOBuffer()
+        result = sweep(root; options=SweepOptions(plan_only=true, output=joinpath(root, "plan")), io)
+        @test result.exit_code == 2
+        @test occursin("\nDiscovery issue: Broken/Project.toml: invalid project UUID \"not-a-uuid\"\nPlan written to ",
+                       String(take!(io)))
+    end
+end
+
 @testset "Files a unit did not reach get follow-up units" begin
     mktempdir() do directory
         root = realpath(directory)
