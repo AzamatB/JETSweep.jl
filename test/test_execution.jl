@@ -683,6 +683,21 @@ end
     end
 end
 
+@testset "The units of an unavailable environment point to its log, if it has one" begin
+    mktempdir() do output
+        unit = execution_unit(execution_touch(joinpath(output, "root", "script.jl")); kind=:script)
+        sweep = execution_sweep(unit, joinpath(output, "root"), output)
+        failed = JETSweep.Environment(:failed, joinpath(output, "environments", "env"), "invalid project")
+        result = JETSweep._analyze(unit, failed, sweep, nothing)
+        @test (result.status, result.reasons, result.log) == (:unavailable, ["environment unavailable: invalid project"], "")
+        @test !ispath(joinpath(output, "units"))
+        log = execution_touch(joinpath(output, "environments", JETSweep._context_key(unit.context), "log.txt"), "")
+        @test JETSweep._analyze(unit, failed, sweep, nothing).log == ""
+        write(log, "ERROR: preparation failed\n")
+        @test JETSweep._analyze(unit, failed, sweep, nothing).log == log
+    end
+end
+
 @testset "Files a unit did not reach get follow-up units" begin
     mktempdir() do directory
         root = realpath(directory)

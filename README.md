@@ -197,11 +197,12 @@ jetls_config = "tools/.JETLSConfig.toml"
 
 ## Reports
 
-The report directory contains `report.toml` (every unit's status, reasons, notes and
-timing, and the deduplicated diagnostics), `summary.txt` (the diagnostics as
-`file:line:column` with messages, every incomplete unit with its reasons and log, and the
-files no complete analysis covered), the inventory and plan, each unit's and environment's
-request, result and log, and the `CACHEDIR.TAG` that keeps sweeps and backups out of it. The
+The report directory contains `report.toml` (every unit's status, reasons, notes, timing and
+log, and the deduplicated diagnostics), `summary.txt` (the diagnostics as `file:line:column`
+with messages, every incomplete unit with its reasons and log, and the files no complete
+analysis covered), the inventory and plan, each unit's and environment's request, result and
+log, and the `CACHEDIR.TAG` that keeps sweeps and backups out of it. A unit whose environment
+is unavailable never runs; its log is the environment's, if preparation logged anything. The
 terminal summary groups incomplete units by cause.
 Lines and columns count from 1, columns in UTF-16 code units as LSP positions do; a
 diagnostic ends before its `end_column`, at the end of its line for a whole-line diagnostic.

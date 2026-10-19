@@ -68,6 +68,8 @@ _context_key(context::Context) = bytes2hex(sha256(string(context.project, '\0', 
     '\0', join(sort!(["$k=$v" for (k, v) in context.triggers]), '\0'),
     '\0', join(sort!(["$k=$v" for (k, v) in context.imports]), '\0'))))[1:12]
 
+_environment_directory(output::String, context::Context) = joinpath(output, "environments", _context_key(context))
+
 function _prepare(context::Context, directory::String, options::SweepOptions)
     request = _write_toml(joinpath(directory, "request.toml"), Dict(
         "project" => context.project, "owner" => context.owner, "test" => context.test,
@@ -238,13 +240,17 @@ function _worker_error(log::String, code::Integer)
 end
 
 function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Union{Nothing,String})
+    if !ready(environment)
+        # The unit never runs; what preparation logged, if anything, tells why.
+        log = joinpath(_environment_directory(sweep.output, unit.context), "log.txt")
+        return UnitResult(unit.id, :unavailable, Finding[], String[], ["environment unavailable: " * environment.message],
+                          String[], 0.0, filesize(log) > 0 ? log : "")
+    end
     directory = joinpath(sweep.output, "units", unit.id)
     mkpath(directory)
     log = joinpath(directory, "log.txt")
     started = time()
-    failure(status, reason, seconds=time() - started) =
-        UnitResult(unit.id, status, Finding[], String[], [reason], String[], seconds, log)
-    ready(environment) || return failure(:unavailable, "environment unavailable: " * environment.message, 0.0)
+    failure(status, reason) = UnitResult(unit.id, status, Finding[], String[], [reason], String[], time() - started, log)
     generated = joinpath(directory, "entry.jl")
     drivers = _drivers(unit, sweep)
     unit.kind in (:test, :script) && write(generated, _generated_entry(unit, drivers))
@@ -450,7 +456,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     function step(task::_Task)
         work = task.work
         if work isa Context
-            directory = joinpath(output, "environments", _context_key(work))
+            directory = _environment_directory(output, work)
             environments[work] = contained(() -> _prepare(work, directory, options),
                                            message -> Environment(:failed, directory, message))
             return [_task(unit, previous) for unit in members[work]]
