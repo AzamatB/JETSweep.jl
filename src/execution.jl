@@ -220,6 +220,15 @@ function _package(unit::Unit, inventory::Inventory)
     return (inventory.projects[index].name, inventory.projects[index].uuid)
 end
 
+"The error a worker printed before it exited without a result, as `\": message\"`, if any."
+function _worker_error(log::String)
+    isfile(log) || return nothing
+    for line in eachline(log)
+        startswith(line, "ERROR: ") && return ": " * chopprefix(line, "ERROR: ")
+    end
+    return nothing
+end
+
 function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Union{Nothing,String})
     directory = joinpath(sweep.output, "units", unit.id)
     mkpath(directory)
@@ -246,7 +255,8 @@ function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Unio
         threads, compile=false, env=gpu === nothing ? Dict{String,String}() : Dict("CUDA_VISIBLE_DEVICES" => gpu))
     process = run_worker(Cmd(command; dir=dirname(unit.entry)), log, sweep.options.timeout)
     process.timed_out && return failure(:timeout, "time limit of $(sweep.options.timeout) s exceeded")
-    isfile(result) || return failure(:failed, "worker exited with code $(process.code) without a result")
+    isfile(result) || return failure(:failed, "worker exited with code $(process.code) without a result" *
+                                     something(_worker_error(log), ""))
     data = TOML.parsefile(result)
     haskey(data, "error") && return failure(:failed, first(split(data["error"], '\n')))
     reasons = String[data["reasons"]..., ("logged error: " * error for error in data["errors"])...]

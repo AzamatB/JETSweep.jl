@@ -135,6 +135,10 @@ end
             end
             using Test
             @test isempty(ARGS) || (tan("three") > 0 && all(a -> a > 0, [1]))
+            for n in 1:2
+                @test n
+                n > 1 && foreach(x -> println(x), 1:n)
+            end
             """)
         # A script runs as the program, so a check for that holds as it would.
         write(joinpath(root, "main_check.jl"), """
@@ -186,6 +190,8 @@ end
         @test status("loop.jl") === :findings
         inside = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "inside.jl"))
         @test issubset([2, 7, 10], [f.line for f in inside.findings if f.code == "inference/method-error"])
+        # A test that always fails is reported in outlined code as at top level.
+        @test any(f -> f.code == "inference/failing-test" && f.line == 12, inside.findings)
         @test status("uses_sibling.jl") === :findings
         sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
         @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)

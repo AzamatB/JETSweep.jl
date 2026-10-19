@@ -320,6 +320,7 @@ function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool)
     download && ops.download_source(ctx)
     ops.fixups_from_projectfile!(ctx)
     download && ops.download_artifacts(ctx; julia_version=ctx.julia_version)
+    _supply_revise!(ctx.env.manifest)
     Pkg.Types.write_env(ctx.env; update_undo=false)
     return nothing
 end
@@ -327,6 +328,18 @@ end
 const _JETLS = UUID("a3b70258-0602-4ee2-b5a6-54c2470400db")
 const _JETLSCORE = UUID("8d6afe4c-923b-5912-b63d-b990009c9e74")
 const _TESTRUNNER = UUID("65a77010-ae58-5cc9-8243-71cff1cf0f92")
+const _REVISE = UUID("295af30f-e4ad-537b-8983-00126c2a3abe")
+
+"""
+Make Revise a dependency of JETLSCore, which loads it for its Revise-based package analysis
+(`JETLS_DEV_MODE`). JETLS releases leave Revise out of JETLSCore's dependencies, since they
+never enable that mode themselves, so JETSweep supplies it.
+"""
+function _supply_revise!(manifest)
+    core = get(manifest, _JETLSCORE, nothing)
+    core === nothing || !haskey(manifest, _REVISE) || (core.deps["Revise"] = _REVISE)
+    return manifest
+end
 
 function _entry_source(entry::Pkg.Types.PackageEntry, manifest_file::String)
     entry.path === nothing || return Dict("path" => abspath(dirname(manifest_file), entry.path))
@@ -339,8 +352,9 @@ end
 
 """
 Add the analyzer to a scratch environment: JETLS with its Revise-based package analysis
-enabled, and TestRunner, which JETLS requires as a direct dependency. Resolving tool and
-target together gives packages they share, such as Revise, one version for both.
+enabled, TestRunner, which JETLS requires as a direct dependency, and Revise, which that
+analysis needs (see `_supply_revise!`). Resolving tool and target together gives packages
+they share, such as Revise, one version for both.
 """
 function _add_tool!(project::Dict, preferences::Dict, manifest)
     tool = Pkg.Types.EnvCache(tool_project())
@@ -349,7 +363,7 @@ function _add_tool!(project::Dict, preferences::Dict, manifest)
     end
     mergewith!((a, _) -> a, manifest.registries, deepcopy(tool.manifest.registries))
     sources = get!(project, "sources", Dict{String,Dict{String,String}}())
-    for uuid in (_JETLS, _TESTRUNNER)
+    for uuid in (_JETLS, _TESTRUNNER, _REVISE)
         entry = tool.manifest[uuid]
         _merge_dep!(project["deps"], entry.name, uuid)
         source = _entry_source(entry, tool.manifest_file)

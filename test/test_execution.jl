@@ -691,3 +691,14 @@ end
         @test isempty(JETSweep._previous_seconds(root))
     end
 end
+
+@testset "a worker that exits without a result is reported with its error" begin
+    mktempdir() do directory
+        log = joinpath(directory, "log.txt")
+        @test JETSweep._worker_error(log) === nothing
+        write(log, "Precompiling...\nERROR: LoadError: ArgumentError: Cannot load Revise\nStacktrace:\nERROR: later\n")
+        @test JETSweep._worker_error(log) == ": LoadError: ArgumentError: Cannot load Revise"
+        write(log, "killed\n")
+        @test JETSweep._worker_error(log) === nothing
+    end
+end

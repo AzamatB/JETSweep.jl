@@ -92,9 +92,10 @@ _environments_test_uuid() = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
         @test (Base.active_project(), LOAD_PATH, DEPOT_PATH) == state
 
         project = _environments_project(environment)
-        jetls, runner, core = _environments_tool.(("JETLS", "TestRunner", "JETLSCore"))
+        jetls, runner, core, revise = _environments_tool.(("JETLS", "TestRunner", "JETLSCore", "Revise"))
         @test project["deps"] == Dict("PlainParent" => parent_uuid, "PlainHelper" => helper_uuid,
-                                      "JETLS" => string(jetls.uuid), "TestRunner" => string(runner.uuid))
+                                      "JETLS" => string(jetls.uuid), "TestRunner" => string(runner.uuid),
+                                      "Revise" => string(revise.uuid))
         @test project["extras"] == Dict("JETLSCore" => string(core.uuid))
         @test project["sources"]["PlainParent"] == Dict("path" => parent)
         @test project["sources"]["PlainHelper"] == Dict("path" => helper)
@@ -104,6 +105,9 @@ _environments_test_uuid() = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
         @test _environments_path(environment, parent_uuid) == parent
         @test _environments_path(environment, helper_uuid) == helper
         @test _environments_manifest(environment)[jetls.uuid].tree_hash == jetls.tree_hash
+        # JETLS releases leave Revise out of JETLSCore's dependencies; preparation supplies it.
+        @test _environments_manifest(environment)[core.uuid].deps["Revise"] == revise.uuid
+        @test _environments_manifest(environment)[revise.uuid].tree_hash == revise.tree_hash
         @test _environments_preferences(environment) ==
               Dict("JETLSCore" => Dict("JETLS_DEV_MODE" => true), "PlainParent" => Dict("backend" => "cpu"))
         @test _environments_run(environment, """
@@ -240,7 +244,7 @@ end
             "sources" => Dict("ScriptHelper" => Dict("path" => "../../ScriptHelper"))))
         environment = _environments_prepare(_environments_context(scripts, ""), joinpath(envs, "script"))
         @test environment == _environments_ready(joinpath(envs, "script"))
-        @test keys(_environments_project(environment)["deps"]) == Set(["ScriptHelper", "JETLS", "TestRunner"])
+        @test keys(_environments_project(environment)["deps"]) == Set(["ScriptHelper", "JETLS", "TestRunner", "Revise"])
         @test _environments_run(environment, """
             using ScriptHelper
             print(ScriptHelper.value(), ' ', Base.identify_package("ScriptOwner") === nothing)
@@ -249,7 +253,7 @@ end
         # A script outside every project still gets the analyzer.
         standalone = _environments_prepare(_environments_context("", ""), joinpath(envs, "standalone"))
         @test standalone == _environments_ready(joinpath(envs, "standalone"))
-        @test keys(_environments_project(standalone)["deps"]) == Set(["JETLS", "TestRunner"])
+        @test keys(_environments_project(standalone)["deps"]) == Set(["JETLS", "TestRunner", "Revise"])
 
         bare = mkpath(joinpath(root, "bare"))
         failure = _environments_prepare(_environments_context(bare, ""), joinpath(envs, "bare"))

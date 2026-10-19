@@ -15,8 +15,11 @@ code and so on — and says plainly which analyses could not complete, and why.
 
 ## Install
 
-JETSweep requires Julia 1.13. It uses JETLS 2026.10.14, pinned to that release's commit
-because the analysis entry points it drives are internal to JETLS.
+JETSweep requires Julia 1.13. It uses JETLS 2026.10.18, pinned to that release's commit
+because the analysis entry points it drives are internal to JETLS, and JETLS's Revise-based
+package analysis, which only its development mode enables. JETLS releases leave out the
+Revise that mode loads, so JETSweep pins Revise too, at the revision JETLS's development
+branch uses.
 
 ```julia
 using Pkg
@@ -61,7 +64,7 @@ grouped into analysis units, each covering its entry file and the files it inclu
 
 | Unit | Entry | Analysis |
 | --- | --- | --- |
-| Package | `src/Name.jl`, or the project's `entryfile` | The package is loaded and every method signature is analyzed (JETLS's Revise-based package analysis); its structs are checked for abstract fields. |
+| Package | `src/Name.jl`, or the project's `entryfile` | The package is loaded and every method signature is analyzed, closures where the types of their arguments are known (JETLS's Revise-based package analysis); its structs are checked for abstract fields. |
 | Extension | `ext/Name.jl` or `ext/Name/Name.jl` | Loaded with its parent package and trigger packages, then analyzed like a package. |
 | Test driver | `test/runtests.jl` | Script analysis in the package's test environment. A nested `runtests.jl` its driver includes statically is part of its unit; one included at run time is a driver run by the one above it. |
 | Test file | any other test file | Script analysis after a prelude from the drivers that run it, for test files a driver includes at run time. |
@@ -74,7 +77,8 @@ follow. Each such test file therefore gets its own unit, analyzed after a prelud
 drivers set up before including it: imports, definitions, and the constants and modules the
 test file refers to, copied with their original source text; selection logic the test file
 does not depend on is left out. The drivers' own analyses evaluate the selection and skip
-including the files analyzed separately.
+including the files analyzed separately. A test file analyzed by itself is fail-fast top-level
+code, as below, even when its driver includes it in a `failfast=false` or custom test set.
 
 Script analysis evaluates definitions, imports and includes but not assignments, so a
 definition or `include` that needs an assigned value stops JETLS
@@ -109,9 +113,11 @@ JETLS's interpreter; any other top-level expression that assigns nothing, as in
 local scopes already, unless they import packages, which only top-level code can. Code that
 includes or evaluates code stays at top level, where JETLS follows it, as do closures whose
 parameters declare types, since Julia evaluates those types where the closure stands.
-JETLS drops what it finds in code without line information, which the closures it outlines
-`@test` expressions into are; JETSweep reports it at the nearest line that has some, the
-test's.
+JETLS analyzes test sets as fail-fast, so code after a `@test` that always fails is not
+analyzed, and reports such a test only in top-level code; JETSweep reports it in the code it
+outlines too. JETLS drops what it finds in code without line information, which the closures
+it outlines `@test` expressions into are; JETSweep reports it at the nearest line that has
+some, the test's.
 
 Files a finished analysis does not reach, such as package files loading leaves out or files
 after an analysis stop, get follow-up units of their own, in the same context: a package's
@@ -219,3 +225,9 @@ Loading JETSweep does not load JETLS; only analysis workers do.
 julia --project -e 'using Pkg; Pkg.test()'
 julia --project -e 'using Pkg; Pkg.test(test_args=["test_planning.jl"])'
 ```
+
+To move to another JETLS release, set its commit and version in `Project.toml`, and Revise's
+revision to the one `JETLSCore/Project.toml` pins on JETLS's development branch at that
+release. Then delete `Manifest.toml` and instantiate: updating JETLS alone keeps the old
+versions of the packages it vendors. Compare a sweep of a large workspace with one from
+before the change.

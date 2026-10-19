@@ -95,19 +95,44 @@ function first_line(ex)
     return nothing
 end
 
+"The name tag of the functions the worker outlines top-level code into."
+const OUTLINED = :jetsweep_outlined
+
 # JET analyzes any top-level expression it can outline the same way, such as
 # `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`, and
 # loops and `let` blocks. Closures with typed parameters stay, since lowering would evaluate
-# their types anyway. The closure starts at the expression's first line, so that what is
+# their types anyway. The function starts at the expression's first line, so that what is
 # reported in it has its location.
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
         (should_wrap_test_expression_in_thunk(x) || $outlinable_scope(x)) && !$stays(x) && !$typed_closure(x) ||
             return x
-        thunk, line = gensym(:outlined), $first_line(x)
-        body = line === nothing ? x : Expr(:block, line, x)
-        return Expr(:let, Expr(:(=), thunk, Expr(:->, Expr(:tuple), body)), Expr(:block, Expr(:call, thunk)))
+        thunk, line = gensym($(QuoteNode(OUTLINED))), $first_line(x)
+        body = line === nothing ? Expr(:block, x) : Expr(:block, line, x)
+        return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), body), Expr(:call, thunk)))
+    end
+end)
+
+# JETLS reports a `@test` that always fails only in top-level code, since a function body is
+# inferred for each specialization, for some of which a test may fail while it passes for
+# others. A function the worker outlines top-level code into has one, so its tests count too:
+# test sets are fail-fast, so the code after such a test is not analyzed, as at top level.
+Core.eval(LS.Analyzer, quote
+    function report_failing_test!(analyzer::LSAnalyzer, sv::CC.InferenceState, argtypes::Vector{Any})
+        def = sv.linfo.def
+        def isa Module || (def isa Method && startswith(String(def.name), $("#$OUTLINED#"))) || return false
+        length(argtypes) == 2 || return false
+        value = CC.widenconditional(argtypes[2])
+        if value isa Const && value.val === false
+            add_new_report!(analyzer, sv.result, FailingTestReport(sv, Bool))
+            return true
+        end
+        t = CC.widenconst(value)
+        t === Union{} && return false
+        CC.hasintersect(t, Bool) && return false
+        add_new_report!(analyzer, sv.result, FailingTestReport(sv, t))
+        return true
     end
 end)
 
