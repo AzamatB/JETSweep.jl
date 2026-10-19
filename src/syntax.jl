@@ -263,17 +263,19 @@ end
 # definition or `include` that needs an assigned value stops it
 # (`toplevel/missing-concretization`), and other code sees assigned values only as types.
 # JETSweep lets JETLS evaluate the top-level statements that cannot have side effects:
-# assignments of values built from literals, paths, files read and pure functions of names
-# already bound, and blocks and conditionals made only of these, definitions and imports.
-# Values that depend on how the program is run (`ARGS`, `ENV`) are evaluated only where
-# analysis needs them: in `include` and `eval` arguments, definition signatures, and the
-# conditions JETLS evaluates to define the closures in their branches or to import. Since
-# JETLS always evaluates `include` and `eval` calls, whatever their arguments need is
+# assignments of values built from literals, paths and pure functions of names already
+# bound, and blocks and conditionals made only of these, definitions and imports. Values
+# that depend on how and where the program runs (`ARGS`, `ENV`, files read) are evaluated
+# only where analysis needs them: in `include` and `eval` arguments, definition signatures,
+# and the conditions JETLS evaluates to define the closures in their branches or to import.
+# Since JETLS always evaluates `include` and `eval` calls, whatever their arguments need is
 # evaluated too, pure or not, as a test driver's selection of the files it includes.
 
 const _PURE_NAMES = Set([:nothing, :missing, :true, :false, :Inf, :NaN, :pi, :π, :ℯ])
 "Names whose values depend on how the analyzed program is run."
 const _PROCESS_NAMES = Set([:ARGS, :ENV])
+"Pure functions whose values depend on the files present where the program runs."
+const _FILE_READS = Set([:readdir, :read, :readlines, :readchomp, :parsefile])
 const _PURE_CALLS = Set(Symbol.(split("""
     joinpath normpath dirname basename splitext splitdir splitpath relpath isabspath isfile isdir
     ispath readdir read readlines readchomp parseall parsefile pkgdir pathof string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
@@ -306,11 +308,15 @@ end
 _within_scope(scope::_Scope, names) =
     _Scope(union(scope.known, names), setdiff(scope.opaque, names), scope.shadowed)
 
-"Base's constant types, functions, modules and immutable values."
-function _pure_global(name::Symbol)
-    isdefined(Base, name) && isconst(Base, name) && !Base.isdeprecated(Base, name) || return false
-    value = getglobal(Base, name)
-    return value isa Union{Type,Function,Module,String,Symbol,VersionNumber} || isbits(value)
+"""
+A constant of `mod` that evaluation can read: a type, module or immutable value, or a
+function among `_PURE_CALLS`, since a pure function such as `map` may call it.
+"""
+function _pure_global(name::Symbol, mod::Module=Base)
+    isdefined(mod, name) && isconst(mod, name) && !Base.isdeprecated(mod, name) || return false
+    value = getglobal(mod, name)
+    value isa Function && return name in _PURE_CALLS
+    return value isa Union{Type,Module,String,Symbol,VersionNumber} || isbits(value)
 end
 
 function _pure_callee(f, scope::_Scope)
@@ -351,7 +357,11 @@ function _pure(ex, scope::_Scope)
         base, field = ex.args
         # Reading a global of a known module is pure too, as in `Sys.KERNEL` or `Package.VERSION`;
         # globals of modules the analyzed code defines may be left unevaluated.
-        field isa QuoteNode && return _pure(base, scope)
+        if field isa QuoteNode
+            base in (:Base, :Core, :Sys, :Meta) && !(base in scope.shadowed) &&
+                return _pure_global(field.value, getglobal(Base, base))
+            return _pure(base, scope)
+        end
         # `f.(x)` broadcasts `f`
         return field isa Expr && field.head === :tuple && _pure_callee(base, scope) && pure(field.args)
     end
@@ -410,7 +420,7 @@ function _binds!(names::Set{Symbol}, ex)
         foreach(arg -> _binds!(names, arg), ex.args)
     elseif ex.head === :macrocall
         union!(names, _bound_names(ex))
-        foreach(arg -> _binds!(names, arg), ex.args)
+        _macro_name(ex) == "@static" && foreach(arg -> _binds!(names, arg), ex.args)
     else
         union!(names, _bound_names(ex))
     end
@@ -479,6 +489,14 @@ function _evaluable(ex, scope::_Scope, bound::Set{Symbol})
     return nothing
 end
 
+"Names assigned as `global` anywhere in `ex`, in functions too."
+function _globals!(names::Set{Symbol}, ex)
+    ex isa Expr || return names
+    ex.head === :global && foreach(arg -> arg isa Symbol ? push!(names, arg) : _assigned!(names, arg), ex.args)
+    foreach(arg -> _globals!(names, arg), ex.args)
+    return names
+end
+
 "Like `_evaluable`, for a statement inside a block or branch, where definitions and imports may also appear."
 function _member(ex, scope::_Scope, bound::Set{Symbol})
     ex isa LineNumberNode && return Symbol[]
@@ -529,17 +547,68 @@ const _TEST_MACROS = Set(["@test", "@test_broken", "@test_skip", "@test_throws",
 _closure(ex::Expr) = ex.head === :-> ||
     (ex.head === :function && first(ex.args) isa Expr && first(ex.args).head === :tuple)
 
+"Symbols `ex` evaluates: those outside quoted code, and those interpolated into it."
+function _evaluated_symbols!(names::Set{Symbol}, ex, quoted::Bool=false)
+    if ex isa Symbol
+        quoted || push!(names, ex)
+    elseif ex isa Expr
+        quoted = ex.head === :quote ? true : ex.head === :$ ? false : quoted
+        foreach(arg -> _evaluated_symbols!(names, arg, quoted), ex.args)
+    end
+    return names
+end
+
+"""
+Symbols a method signature evaluates when the method is defined: argument types, `where`
+bounds and the return type, not argument names or default values.
+"""
+function _signature_types!(names::Set{Symbol}, ex)
+    ex isa Expr || return names
+    if ex.head === :where
+        _signature_types!(names, first(ex.args))
+        for bound in ex.args[2:end]
+            bound isa Expr && bound.head in (:<:, :>:) ? _symbols!(names, last(bound.args)) :
+                bound isa Expr && bound.head === :comparison ? foreach(b -> _symbols!(names, b), bound.args[[1, end]]) : nothing
+        end
+    elseif ex.head === :(::)
+        _symbols!(names, last(ex.args))
+        length(ex.args) == 2 && _signature_types!(names, first(ex.args))
+    elseif ex.head in (:call, :tuple, :parameters)
+        for argument in ex.args
+            argument isa Expr && argument.head === :kw && (argument = first(argument.args))
+            argument isa Expr && argument.head === :... && (argument = first(argument.args))
+            argument isa Expr && argument.head in (:(::), :parameters, :curly) && _signature_types!(names, argument)
+        end
+    elseif ex.head === :curly
+        foreach(argument -> _symbols!(names, argument), ex.args)
+    end
+    return names
+end
+
+"Symbols a type definition evaluates: its header, field types and constructor signatures."
+function _type_symbols!(names::Set{Symbol}, ex::Expr)
+    ex.head === :struct || return _symbols!(names, ex)
+    _symbols!(names, ex.args[2])
+    for field in ex.args[3].args
+        field isa Expr && field.head === :(=) && !_signature(first(field.args)) && (field = first(field.args))
+        field isa Expr && field.head === :(::) ? _symbols!(names, last(field.args)) :
+            _method(field) && !_closure(field) ? _signature_types!(names, first(field.args)) : nothing
+    end
+    return names
+end
+
 """
 Add the names whose values JETLS evaluates when it analyzes the top-level statement `ex`:
 arguments of `include` and `eval` calls, signatures of definitions, the control flow around
 these and around imports, and the conditions of branches that define closures, which JETLS
-evaluates to define them; with `forced`, only those of `include` and `eval` calls, which JETLS evaluates
-whatever they need. Assignments in `ex` that these names depend on count too.
+evaluates to define them; with `forced`, only those of `include` and `eval` calls, which
+JETLS evaluates whatever they need. Assignments in `ex` that these names depend on count too.
 """
 function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
     direct = Set{Symbol}()
     locals = Pair{Set{Symbol},Set{Symbol}}[]
-    needs!(parts, controls) = (foreach(part -> _symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
+    needs!(parts, controls) =
+        (foreach(part -> _evaluated_symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
     function visit(ex, controls::Vector{Any}, branches::Vector{Any})
         ex isa Expr || return
         head = ex.head
@@ -548,7 +617,13 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
         elseif head === :macrocall
             name = _macro_name(ex)
             name in _TEST_MACROS && return     # JETLS outlines their closures into thunks
-            name == "@eval" && return needs!(ex.args, controls)
+            if name == "@eval"
+                # `@eval [module] code` evaluates the module, and of the code what it interpolates.
+                arguments = filter(arg -> !(arg isa LineNumberNode), ex.args[2:end])
+                isempty(arguments) && return
+                needs!(arguments[1:end-1], controls)
+                return _evaluated_symbols!(direct, last(arguments), true)
+            end
             # `@static` evaluates its condition when it expands.
             !forced && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
                 needs!(Any[first(last(ex.args).args)], controls)
@@ -556,9 +631,10 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
         elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "eval")
             needs!(ex.args[2:end], controls)
         elseif _method(ex)
-            forced || (_closure(ex) ? needs!(branches, Any[]) : needs!(Any[first(ex.args)], controls))
+            forced || (_closure(ex) ? needs!(branches, Any[]) :
+                       (_signature_types!(direct, first(ex.args)); needs!(Any[], controls)))
         elseif head in (:struct, :abstract, :primitive)
-            forced || needs!(Any[ex], controls)
+            forced || (_type_symbols!(direct, ex); needs!(Any[], controls))
         elseif head in (:using, :import)
             forced || needs!(Any[], controls)
         elseif head in (:if, :elseif, :&&, :||)
@@ -592,18 +668,22 @@ end
 """
 Indices of the statements that analysis may evaluate. Run-dependent statements are evaluated
 only where needed, or where JETLS evaluates part of them anyway; impure assignments only
-where `include` and `eval` calls need them. `excluded` statements are not.
+where `include` and `eval` calls need them. A need selects the binding of a name that
+reaches the statement needing it. `excluded` statements are not evaluated.
 """
 function _concretized(expressions::Vector{Any}, excluded::Set{Int})
     shadowed = Set{Symbol}()
-    foreach(ex -> (_assigned!(shadowed, ex); union!(shadowed, _definitions(ex))), expressions)
+    foreach(ex -> (_binds!(shadowed, ex); _globals!(shadowed, ex)), expressions)
     scope = _Scope(Set{Symbol}(), Set{Symbol}(), shadowed)
-    variable = setdiff(_PROCESS_NAMES, shadowed)
+    variable = setdiff(union(_PROCESS_NAMES, _FILE_READS), shadowed)
     bound = Set{Symbol}()
     selected = Set{Int}()
-    # Statements to evaluate where needed: their names, what they read, and whether pure.
-    deferred = Tuple{Int,Vector{Symbol},Set{Symbol},Bool}[]
-    needed, forced = Set{Symbol}(), Set{Symbol}()
+    # Statements to evaluate where needed, with what they read and whether they are pure.
+    deferred = Dict{Int,Tuple{Set{Symbol},Bool}}()
+    # Needs: a name, the statement needing it, and whether JETLS evaluates it whatever it is.
+    needs = Tuple{Symbol,Int,Bool}[]
+    need!(names, i, forced) = foreach(name -> push!(needs, (name, i, forced)), names)
+    bindings = Dict{Symbol,Vector{Int}}()
     for (i, ex) in pairs(expressions)
         binds = _binds!(Set{Symbol}(), ex)
         assignment = _assignment(ex)
@@ -611,9 +691,9 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int})
         known = i in excluded ? nothing : _evaluable(ex, scope, bound)
         setdiff!(scope.known, binds)
         if known === nothing
-            !(i in excluded) && assignment !== nothing && push!(deferred, (i, first(assignment), reads, false))
-            _reads!(forced, ex; forced=true)
-            _reads!(needed, ex)
+            !(i in excluded) && assignment !== nothing && (deferred[i] = (reads, false))
+            need!(_reads!(Set{Symbol}(), ex; forced=true), i, true)
+            need!(_reads!(Set{Symbol}(), ex), i, false)
             setdiff!(variable, binds)
         elseif isdisjoint(reads, variable)
             push!(selected, i)
@@ -623,24 +703,29 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int})
             # JETLS evaluates part of a statement anyway when it defines a closure in a
             # branch, and then not the closure in the other branch: evaluating it whole is better.
             evaluated = _reads!(Set{Symbol}(), ex)
-            isempty(evaluated) ? push!(deferred, (i, collect(binds), reads, true)) : push!(selected, i)
-            union!(needed, evaluated)
+            isempty(evaluated) ? (deferred[i] = (reads, true)) : (push!(selected, i); need!(reads, i, false))
+            need!(evaluated, i, false)
             union!(scope.known, known)
             union!(variable, binds)
         end
+        # JETLS evaluates type aliases such as `const V = Vector{T}` itself.
+        assignment !== nothing && Meta.isexpr(last(assignment), :curly) && need!(reads, i, true)
         _define!(scope, ex)
         setdiff!(scope.known, _mutated!(Set{Symbol}(), ex))
         union!(bound, binds)
+        foreach(name -> push!(get!(bindings, name, Int[]), i), binds)
     end
-    changed = true
-    while changed
-        changed = false
-        for (i, names, reads, pure) in deferred
-            !(i in selected) && any(name -> name in forced || pure && name in needed, names) || continue
-            push!(selected, i)
-            union!(pure ? needed : forced, reads)
-            changed = true
-        end
+    while !isempty(needs)
+        name, i, forced = pop!(needs)
+        positions = get(bindings, name, Int[])
+        k = findlast(<(i), positions)
+        k === nothing && continue
+        k = positions[k]
+        haskey(deferred, k) && !(k in selected) || continue
+        reads, pure = deferred[k]
+        pure || forced || continue
+        push!(selected, k)
+        need!(reads, k, forced)
     end
     return selected
 end
@@ -865,7 +950,8 @@ function prelude(drivers::Vector{String}, target::String)
     io = IOBuffer()
     for (i, statement) in pairs(statements)
         println(io, "#= ", statement.file, ":", statement.line, " =#")
-        println(io, i in evaluated && !isempty(statement.names) ? "@eval " : "", statement.text)
+        evaluate = i in evaluated && !isempty(statement.names) && statement.ex.head !== :module
+        println(io, evaluate ? "@eval begin\n$(statement.text)\nend" : statement.text)
     end
     return String(take!(io))
 end

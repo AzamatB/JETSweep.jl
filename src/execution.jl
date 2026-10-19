@@ -272,6 +272,10 @@ function _followups(unit::Unit, result::UnitResult, sweep::_Sweep, planned::Set{
     for file in unit.expected, include in get(sweep.syntax, file, Syntax(Include[], String[])).includes
         include.depth > (package && file == unit.entry) && setdiff!(missed, [include.target])
     end
+    # A JLL package's wrappers for other platforms need its module's identity; they are not
+    # analyzed by themselves either.
+    name, _ = _package(unit, sweep.inventory)
+    endswith(name, "_jll") && filter!(file -> !_within(file, joinpath(unit.context.owner, "src", "wrappers")), missed)
     isempty(missed) && return Unit[]
     root = sweep.inventory.root
     groups = _entries(missed, sweep.syntax)

@@ -129,7 +129,7 @@ function _summarize(io::IO, result::SweepResult, findings, statuses, severities,
     else
         groups = Dict{Tuple{Symbol,String},Vector{UnitResult}}()
         foreach(r -> push!(get!(groups, (r.status, _relative(_cause(r), root)), UnitResult[]), r), incomplete)
-        for ((status, cause), members) in sort!(collect(groups); by=group -> -length(last(group)))
+        for ((status, cause), members) in sort!(collect(groups); by=group -> (-length(last(group)), first(group)))
             println(io, lpad(length(members), 5), "  ", rpad(String(status), 11), " ", cause)
             examples = join((name(byid[r.unit]) for r in first(members, 3)), ", ")
             println(io, "         ", examples, length(members) > 3 ? ", and $(length(members) - 3) more" : "")

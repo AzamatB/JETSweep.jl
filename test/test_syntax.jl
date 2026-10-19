@@ -540,7 +540,7 @@ end
         @test !occursin("@__DIR__", text) && !occursin("@__FILE__", text)
         # Analysis always evaluates `@eval`, which the generated file needs for its pure
         # assignments, since concretization patterns cannot apply to it.
-        @test occursin("@eval const DATA_DIR = joinpath(DRIVER_DIR, \"data\")", text)
+        @test occursin("@eval begin\nconst DATA_DIR = joinpath(DRIVER_DIR, \"data\")\nend", text)
         @test !occursin("@eval data_path", text)
         sandbox = syntax_load(text)
         @test sandbox isa Module
@@ -751,6 +751,32 @@ end
         "const MEASURE = get(ARGS, 1, \"\") == \"--measure\"", "if MEASURE\n    using Statistics\nend"]
 end
 
+@testset "concretization_patterns needs only what JETLS evaluates, where it does" begin
+    # Default values and argument names are not evaluated when a method is defined, nor is
+    # the quoted code `@eval` defines, except what it interpolates.
+    @test syntax_patterns("outdir = ARGS[1]\nwrite_to(x; dir=outdir) = x\n") == String[]
+    @test syntax_patterns("const NAME = ARGS[1]\n@eval named() = NAME\n") == String[]
+    @test syntax_patterns("const LEVEL = length(ARGS)\n@eval level() = \$LEVEL\n") == ["const LEVEL = length(ARGS)"]
+    # The binding that reaches the need is evaluated, not an earlier one.
+    code = """
+        file = ARGS[1]
+        file = isempty(ARGS) ? "default.jl" : ARGS[1]
+        include(file)
+        """
+    @test syntax_patterns(code) == ["file = isempty(ARGS) ? \"default.jl\" : ARGS[1]"]
+    # JETLS evaluates type aliases itself, and so what they read.
+    @test syntax_patterns("const N = length(ARGS)\nconst Row = NTuple{N,Int}\n") == ["const N = length(ARGS)"]
+    # Local variables do not hide Base's functions; functions with side effects are not pure
+    # arguments of pure ones.
+    code = """
+        smallest(x) = (min = minimum(x); min)
+        const M = min(1, 2)
+        const REMOVED = map(rm, ["a", "b"])
+        const RM = Base.rm
+        """
+    @test syntax_patterns(code) == ["const M = min(1, 2)"]
+end
+
 @testset "concretization_patterns forgets values that other code may change" begin
     code = """
         errs = Float64[]
@@ -779,13 +805,16 @@ end
         """
     @test syntax_patterns(code) == ["errs = Float64[]", "const SEEN = Int[]", "const TABLE = Dict{String,Int}()",
                                     "const S = Base.range(1, 3)", "const W = map(x -> x + 1, 1:3)"]
-    # Reading files has no side effects.
+    # Reading files has no side effects, but the files may not exist where analysis runs, so
+    # their contents are evaluated only where needed.
     read_only = """
         const MANIFEST = read(joinpath(@__DIR__, "manifest.json"), String)
         const AST = Meta.parseall(MANIFEST)
         const SEALED = !occursin("sha256:" * "0"^64, MANIFEST)
+        Core.eval(@__MODULE__, AST)
         """
-    @test syntax_patterns(read_only) == split(chomp(read_only), '\n')
+    @test syntax_patterns(read_only) == ["const MANIFEST = read(joinpath(@__DIR__, \"manifest.json\"), String)",
+                                         "const AST = Meta.parseall(MANIFEST)"]
 end
 
 @testset "concretization_patterns takes blocks and conditionals whole, as JETLS matches them" begin

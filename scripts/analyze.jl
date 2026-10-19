@@ -212,7 +212,9 @@ function analyze(request, log::ErrorLog)
         target = load(request, log)
         timings["load"] = time() - started
         if kind == "orphan"
-            write(request["generated"], orphan_entry(target, request["entry"], request["package"], request["extension"]))
+            # The package's bindings exist only in the world after loading it.
+            write(request["generated"], Base.invokelatest(orphan_entry, target, request["entry"], request["package"],
+                                                          request["extension"]))
             target = nothing
         end
     end
