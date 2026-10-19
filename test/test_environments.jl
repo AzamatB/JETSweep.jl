@@ -109,7 +109,7 @@ _environments_test_uuid() = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
         # of the analyzer's series.
         @test _environments_manifest(environment)[core.uuid].deps["Revise"] == revise.uuid
         @test _environments_manifest(environment)[revise.uuid].tree_hash == revise.tree_hash
-        @test project["compat"]["Revise"] == "$(revise.version.major).$(revise.version.minor)"
+        @test project["compat"]["Revise"] == "=$(revise.version)"
         @test !haskey(project["sources"], "Revise")
         @test _environments_preferences(environment) ==
               Dict("JETLSCore" => Dict("JETLS_DEV_MODE" => true), "PlainParent" => Dict("backend" => "cpu"))
@@ -656,6 +656,9 @@ end
             manifest_file = joinpath(fallback.dir, "Manifest.toml")
             entry = Pkg.Types.read_manifest(manifest_file)[UUID(dependency_uuid)]
             @test entry.version == v"2.0.0"
+            # Re-resolving keeps the analyzer's Revise for a target that locks none.
+            revise = _environments_tool("Revise")
+            @test Pkg.Types.read_manifest(manifest_file)[revise.uuid].version == revise.version
             # Positive control: the installed build script really would have written the marker.
             installed = Pkg.Operations.source_path(manifest_file, entry)
             Base.include(Module(:BuildGuardControl), joinpath(installed, "deps", "build.jl"))

@@ -19,8 +19,8 @@ JETSweep requires Julia 1.13. It uses JETLS 2026.10.18, pinned to that release's
 because the analysis entry points it drives are internal to JETLS, and JETLS's Revise-based
 package analysis, which only its development mode enables. JETLS releases leave out the
 Revise that mode loads, so JETSweep adds it: an analyzed project keeps the Revise it locks if
-it is of the series JETLS's development branch uses, and otherwise gets the release that
-branch pins, which JETSweep pins too.
+it is of the series JETLS's development branch uses, and otherwise gets the latest release of
+that series, which JETSweep pins.
 
 ```julia
 using Pkg
@@ -244,9 +244,8 @@ julia --project -e 'using Pkg; Pkg.test(test_args=["test_planning.jl"])'
 ```
 
 To move to another JETLS release, set its commit and version in `Project.toml`. Then pin
-Revise, with an exact `[compat]` bound, to the release of the revision `[sources]` in
-`JETLSCore/Project.toml` names on JETLS's `master` at that release: the second parent of the
-release branch's merge of `master`, since the release itself names no revision. If that
-revision is no release, pin it in `[sources]` instead. Then delete `Manifest.toml` and
-instantiate: updating JETLS alone keeps the old versions of the packages it vendors. Compare
-a sweep of a large workspace with one from before the change.
+Revise, with an exact `[compat]` bound, to the latest release of the series `[compat]` in
+`JETLSCore/Project.toml` allows on JETLS's `master` at that release: the second parent of the
+release branch's merge of `master`, since the release itself declares no Revise. Then delete
+`Manifest.toml` and instantiate: updating JETLS alone keeps the old versions of the packages
+it vendors. Compare a sweep of a large workspace with one from before the change.

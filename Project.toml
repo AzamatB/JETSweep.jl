@@ -18,7 +18,7 @@ JETLS = {rev = "88881856f97eb4750264aec5543b22b76c15dc48", url = "https://github
 JETLS = "=2026.10.18"
 LibGit2 = "1"
 Pkg = "1.13"
-Revise = "=3.17.2"
+Revise = "=3.17.3"
 SHA = "1"
 TOML = "1"
 julia = "1.13"
