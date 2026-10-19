@@ -1,0 +1,9 @@
+name = "BackendBroken"
+uuid = "bccf44ca-89c7-4396-ace9-39b586db3eee"
+version = "0.1.0"
+
+[weakdeps]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[extensions]
+BackendBrokenTestExt = "Test"
