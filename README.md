@@ -43,7 +43,7 @@ jetsweep --exclude vendor --exclude '**/generated/*.jl' DIRECTORY
 | `--gpus auto\|none\|LIST` | GPUs assigned round-robin through `CUDA_VISIBLE_DEVICES` (default `auto`: the visible devices). |
 | `--output DIRECTORY` | Report directory, new or empty (default `DIRECTORY/.jetsweep/TIMESTAMP`). |
 | `--config FILE` | Configuration file (default `DIRECTORY/.JETSweep.toml`, if present). |
-| `--exclude GLOB` | Skip matching paths; repeatable. Without `/`, a pattern matches any path segment. |
+| `--exclude GLOB` | Skip matching paths; repeatable. A pattern with `/`, or starting with `/` or `./`, matches the path relative to `DIRECTORY`; any other pattern matches a path segment. |
 | `--include-ignored`, `--tracked-only` | Include files Git ignores; include only files Git tracks. |
 | `--offline` | Use only packages that are already installed. |
 | `--fail-on LEVEL` | Lowest severity that fails the run: `error`, `warning`, `info`, `hint` (default) or `none`. |
@@ -53,25 +53,36 @@ jetsweep --exclude vendor --exclude '**/generated/*.jl' DIRECTORY
 Discovery walks the directory with each Git repository's own ignore rules (nested
 repositories included); outside Git everything is included. Hidden directories are skipped
 unless Git tracks files inside them, so editor and tool state stays out while, for example,
-a JLL package's `.pkg` scripts stay in. The files are then grouped into analysis units, each
-covering its entry file and the files it includes:
+a JLL package's tracked `.pkg` scripts stay in. Symlinks are not followed: inside the root
+they only alias what discovery reaches anyway, or what it excludes. The files are then
+grouped into analysis units, each covering its entry file and the files it includes:
 
 | Unit | Entry | Analysis |
 | --- | --- | --- |
-| Package | `src/Name.jl`, or the project's `entryfile` | The package is loaded and every method signature is analyzed (JETLS's Revise-based package analysis). |
+| Package | `src/Name.jl`, or the project's `entryfile` | The package is loaded and every method signature is analyzed (JETLS's Revise-based package analysis); its structs are checked for abstract fields. |
 | Extension | `ext/Name.jl` or `ext/Name/Name.jl` | Loaded with its parent package and trigger packages, then analyzed like a package. |
 | Test driver | `test/runtests.jl` | Script analysis in the package's test environment. |
 | Test file | any other test file | Script analysis after a prelude from its driver, for test files the driver includes at run time. |
-| Script | any other file | Script analysis in its nearest environment. |
-| Orphan source | package source no entry includes | Script analysis with the package's bindings imported, as if the package included it. |
+| Script | any other file | Script analysis in its nearest environment; a package's own scripts use its test environment. |
+| Orphan source | package or extension source that loading leaves out | Script analysis with the package's bindings and imports in scope, as if the package included it. |
 
 Test drivers commonly choose their test files at run time, as in
 `for file in (isempty(ARGS) ? ALL_TESTS : ARGS) include(file) end`, which static analysis cannot
 follow. Each such test file therefore gets its own unit, analyzed after a prelude of the
-driver's imports and definitions and the constants the test file refers to, while selection
-logic it does not depend on is left out. The driver's own analysis evaluates its constants
-to get past the selection and skips the files analyzed separately. Package files that
-loading leaves out, such as conditionally included code, become orphan units automatically.
+driver's imports and definitions and the constants the test file refers to, copied with their
+original source text; selection logic the test file does not depend on is left out. The
+driver's own analysis evaluates exactly the assignments that select its files, to get past
+the selection, and skips including the files analyzed separately.
+
+Script analysis evaluates definitions but not assignments, so a definition or `include` that
+needs an assigned value stops JETLS (`toplevel/missing-concretization`). JETSweep lets it
+evaluate the top-level statements that cannot have side effects: assignments of literals,
+paths and pure functions of names already bound, such as
+`const ROOT = normpath(joinpath(@__DIR__, ".."))`, and definition guards such as
+`if !@isdefined(Alias) const Alias = Package end`.
+
+Files an analysis does not reach, such as package files loading leaves out or files after an
+analysis stop, get follow-up units of their own, so every file is analyzed somewhere.
 
 Every unit runs in a fresh worker process. Units with the same dependency context share one
 prepared environment: a scratch project in the report directory that combines the
@@ -83,10 +94,13 @@ when they are not, the environment is re-resolved and the report notes what chan
 environment is precompiled once for all its units. Original projects, manifests, preferences
 and sources are never written, and package build scripts never run.
 
-The scheduler starts environment preparation first, then the longest analyses, giving
-package analyses `--threads` CPU slots each, and assigns GPUs round-robin. Analysis is
-static, but it loads packages and runs their initialization, macros and generated functions,
-and the code JETLS evaluates to analyze scripts: use JETSweep only on code you trust.
+The scheduler prepares environments first, then starts the longest analyses, as measured by
+the previous report in `DIRECTORY/.jetsweep` or estimated from source size, giving package
+and extension analyses `--threads` CPU slots each, and assigns GPUs round-robin. Workers run
+with Julia's default code generation flags, so they share the package images of ordinary
+sessions. Analysis is static, but it loads packages and runs their initialization, macros and
+generated functions, and the code JETLS evaluates to analyze scripts: use JETSweep only on
+code you trust.
 
 ## Configuration
 
@@ -96,8 +110,10 @@ concretization patterns apply. JETSweep prepares environments itself, so it sets
 `full_analysis.auto_instantiate = "never"`, and it keeps diagnostics enabled for all files.
 
 An optional `.JETSweep.toml` at the root adds exclusions and context for units that need it,
-such as scripts that expect arguments or a different environment. Paths are relative to the
-file; `match` globs are relative to the root and must select at least one unit.
+such as scripts that expect arguments or a different environment. `exclude` and `match` are
+globs relative to the root, and each `match` must select at least one unit by its entry file;
+`project`, `setup` and `jetls_config` are paths relative to the configuration file. When
+several tables match a unit, each key a later table sets overrides earlier ones.
 
 ```toml
 exclude = ["vendor", "**/generated/*.jl"]

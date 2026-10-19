@@ -12,7 +12,8 @@ const HELP = """
                           (default: auto)
       --output DIRECTORY  New or empty report directory (default: DIRECTORY/.jetsweep/TIMESTAMP)
       --config FILE       Configuration file (default: DIRECTORY/.JETSweep.toml, if present)
-      --exclude GLOB      Skip matching paths, relative to DIRECTORY; repeatable
+      --exclude GLOB      Skip matching paths; repeatable. A pattern with `/`, or starting with
+                          `/` or `./`, matches paths relative to DIRECTORY, others any segment
       --include-ignored   Include files Git ignores
       --tracked-only      Include only files Git tracks
       --offline           Use only packages already installed
@@ -23,8 +24,9 @@ const HELP = """
       --help              Show this help
 
     Exit status: 0 when every analysis completed without diagnostics at or above the
-    --fail-on level, 1 when some did, 2 when an analysis is incomplete or failed or an input
-    changed during the run, and 130 when interrupted.
+    --fail-on level, 1 when some did, 2 when an analysis is incomplete or failed, a project's
+    metadata is broken, an input changed during the run or the arguments are invalid, and 130
+    when interrupted.
 
     Analysis loads packages and runs their top-level code, macros and generated functions;
     use JETSweep only on code you trust.

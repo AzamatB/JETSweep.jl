@@ -654,3 +654,80 @@ end
         end
     end
 end
+
+"Concretization patterns of `code` written as `file.jl`."
+function syntax_patterns(code::String; selection=false)
+    mktempdir() do directory
+        return JETSweep.concretization_patterns(syntax_write(realpath(directory), "file.jl", code); selection)
+    end
+end
+
+@testset "concretization_patterns selects statements free of side effects" begin
+    code = """
+        using LinearAlgebra
+        import Statistics as Stats
+        const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+        const POLY = [(0.0, 0.0), (1.0, 0.5)]
+        const PORT = length(POLY) + 1
+        const NAMES = (imin = "inlet", imax = "outlet")
+        const ALIAS = LinearAlgebra
+        const STATS = Stats.mean
+        const LOW, HIGH = 1, 2
+        const SEED = rand()
+        const AFTER = SEED + 1
+        const CALL = user_function(1)
+        value = 3
+        value += 1
+        DIR = @__DIR__
+        if !@isdefined(GUARDED)
+            const GUARDED = LinearAlgebra
+        end
+        if !@isdefined(SIDE)
+            const SIDE = rand()
+        end
+        if flag
+            const FLAGGED = 1
+        end
+        module Inner
+        const INNER = 1 + 2
+        end
+        const DATA_ = 4
+        f(x) = x + 1
+        """
+    @test syntax_patterns(code) == [
+        "const ROOT = normpath(joinpath(@__DIR__, \"..\", \"..\"))", "const POLY = [(0.0, 0.0), (1.0, 0.5)]",
+        "const PORT = length(POLY) + 1", "const NAMES = (imin = \"inlet\", imax = \"outlet\")",
+        "const ALIAS = LinearAlgebra", "const STATS = Stats.mean", "const LOW, HIGH = 1, 2", "value = 3",
+        "DIR = @__DIR__", "if !@isdefined(GUARDED)\n    const GUARDED = LinearAlgebra\nend", "const INNER = 1 + 2"]
+    # A pattern matches its statement exactly, so JETLS evaluates nothing else.
+    for pattern in syntax_patterns(code)
+        @test Meta.parse(pattern) isa Expr
+    end
+end
+
+@testset "concretization_patterns of a test driver evaluates its file selection" begin
+    driver = """
+        const FILES = ["test_a.jl", "test_b.jl"]
+        const ASKED = isempty(ARGS) ? split(get(ENV, "TESTS", ""), ","; keepempty = false) : ARGS
+        const RUN = isempty(ASKED) ? FILES : filter(in(ASKED), FILES)
+        const UNRELATED = rand()
+        helper() = 1
+        @testset "suite" begin
+            for file in RUN
+                include(file)
+            end
+        end
+        """
+    @test syntax_patterns(driver) == ["const FILES = [\"test_a.jl\", \"test_b.jl\"]"]
+    @test syntax_patterns(driver; selection=true) == [
+        "const FILES = [\"test_a.jl\", \"test_b.jl\"]",
+        "const ASKED = isempty(ARGS) ? split(get(ENV, \"TESTS\", \"\"), \",\"; keepempty = false) : ARGS",
+        "const RUN = isempty(ASKED) ? FILES : filter(in(ASKED), FILES)"]
+    mktempdir() do directory
+        file = syntax_write(realpath(directory), "runtests.jl", driver)
+        @test JETSweep.include_selectors(file) == Set([:FILES, :ASKED, :RUN])
+    end
+    # Includes inside functions run only when called, so nothing selects them statically.
+    @test syntax_patterns("const FILES = readdir()\nrun(f) = include(f)\nforeach(run, FILES)\n"; selection=true) ==
+          String[]
+end

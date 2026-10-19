@@ -545,3 +545,66 @@ end
         @test execution_concretized(data, "const MODE = \"fast\"", files, base) == [setup]
     end
 end
+
+@testset "Files a unit did not reach get follow-up units" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        package = joinpath(root, "Pkg")
+        entry = execution_touch(joinpath(package, "src", "Pkg.jl"), "module Pkg\nend\n")
+        inactive = execution_touch(joinpath(package, "src", "inactive.jl"))
+        test = execution_touch(joinpath(package, "test", "runtests.jl"), "include(\"helper.jl\")\n")
+        helper = execution_touch(joinpath(package, "test", "helper.jl"), "include(\"leaf.jl\")\n")
+        leaf = execution_touch(joinpath(package, "test", "leaf.jl"))
+        inventory = discover(root)
+        sources = Dict(source.path => source for source in inventory.sources)
+        analyzed(files...) = JETSweep.UnitResult("unit", :incomplete, JETSweep.Finding[], [realpath.(files)...],
+                                                 String[], String[], 0.0, "")
+        context = JETSweep.Context(package, package, false, Dict{String,String}())
+        unit = JETSweep.Unit("package-unit", :package, entry, context, [entry, inactive], "", "",
+                             JETSweep.Overrides(), String[])
+        orphan = only(JETSweep._followups(unit, analyzed(entry), inventory, Set([entry]), sources))
+        @test (orphan.kind, orphan.entry, orphan.expected, orphan.context) == (:orphan, inactive, [inactive], context)
+        @test isempty(JETSweep._followups(unit, analyzed(entry), inventory, Set([entry, inactive]), sources))
+        failed = JETSweep.UnitResult("unit", :failed, JETSweep.Finding[], String[], ["load error"], String[], 0.0, "")
+        @test isempty(JETSweep._followups(unit, failed, inventory, Set([entry]), sources))
+
+        tests = JETSweep.Context(package, package, true, Dict{String,String}())
+        overrides = JETSweep.Overrides(; args=["--quick"])
+        unit = JETSweep.Unit("test-unit", :test, test, tests, [test, helper, leaf], "", "", overrides, String[])
+        followup = only(JETSweep._followups(unit, analyzed(test), inventory, Set([test]), sources))
+        # The unreached helper covers the leaf it includes, in the same context, after the driver.
+        @test (followup.kind, followup.entry, followup.expected) == (:test, helper, [helper, leaf])
+        @test (followup.context, followup.driver, followup.overrides.args) == (tests, test, ["--quick"])
+    end
+end
+
+@testset "A repeated sweep schedules the longest analyses first" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        @test isempty(JETSweep._previous_seconds(root))
+        for (run, seconds) in (("1", 5.0), ("2", 200.0))
+            report = joinpath(root, ".jetsweep", run, "report.toml")
+            mkpath(dirname(report))
+            open(io -> TOML.print(io, Dict("results" => [Dict("unit" => "test-slow", "seconds" => seconds)])), report, "w")
+            touch(report)
+            sleep(0.01)
+        end
+        previous = JETSweep._previous_seconds(root)
+        @test previous == Dict("test-slow" => 200.0)
+        small = execution_touch(joinpath(root, "small.jl"))
+        slow = JETSweep.Unit("test-slow", :test, small, execution_context("a"), [small], "", "",
+                             JETSweep.Overrides(), String[])
+        fresh = JETSweep.Unit("test-fresh", :test, small, execution_context("a"), [small], "", "",
+                              JETSweep.Overrides(), String[])
+        @test JETSweep._cost(slow, previous) == 200.0
+        @test JETSweep._cost(fresh, previous) < 20
+        options = SweepOptions(threads=3)
+        @test JETSweep._task(slow, options, previous).priority < JETSweep._task(fresh, options, previous).priority
+        package = JETSweep.Unit("package-x", :package, small, execution_context("a"), [small], "", "",
+                                JETSweep.Overrides(), String[])
+        @test JETSweep._task(package, options, previous).weight == 3
+        @test JETSweep._task(slow, options, previous).weight == 1
+        write(joinpath(root, ".jetsweep", "2", "report.toml"), "not toml [")
+        @test isempty(JETSweep._previous_seconds(root))
+    end
+end

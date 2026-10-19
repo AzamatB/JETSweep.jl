@@ -233,13 +233,33 @@ function _followups(unit::Unit, result::UnitResult, inventory::Inventory, planne
                  ["not reached when analyzing $(unit.entry)"]) for (entry, expected) in _entries(missed, syntax)]
 end
 
-"Source bytes a unit analyzes, the scheduler's estimate of its cost."
-_cost(unit::Unit) = sum(file -> isfile(file) ? filesize(file) : 0, unit.expected; init=0)
+"""
+Seconds each unit took in the latest report below `root/.jetsweep`, by unit id. Unit ids
+are stable across runs, so a repeated sweep can start its longest analyses first.
+"""
+function _previous_seconds(root::String)
+    directory = joinpath(root, ".jetsweep")
+    reports = isdir(directory) ? filter(isfile, joinpath.(readdir(directory; join=true), "report.toml")) : String[]
+    isempty(reports) && return Dict{String,Float64}()
+    try
+        return Dict{String,Float64}(r["unit"] => r["seconds"] for r in TOML.parsefile(argmax(mtime, reports))["results"])
+    catch
+        return Dict{String,Float64}()
+    end
+end
 
-# Environments first, since units wait for them; then the longest analyses, packages first.
-_task(context::Context, units) = _Task(2, (0, -sum(_cost, units; init=0)), context)
-_task(unit::Unit, options::SweepOptions) = unit.kind in (:package, :extension) ?
-    _Task(options.threads, (1, -_cost(unit)), unit) : _Task(1, (2, -_cost(unit)), unit)
+"Estimated seconds a unit takes: its previous duration, or a guess from its source size."
+_cost(unit::Unit, previous::Dict{String,Float64}) =
+    get(previous, unit.id) do
+        10.0 + sum(file -> isfile(file) ? filesize(file) : 0, unit.expected; init=0) / 1000
+    end
+
+# Environments first, since units wait for them, those with the most work first; then the
+# longest analyses. Package and extension analyses use `threads` slots.
+_task(context::Context, units, previous) =
+    _Task(2, (0, -round(Int, sum(unit -> _cost(unit, previous), units; init=0.0))), context)
+_task(unit::Unit, options::SweepOptions, previous) =
+    _Task(unit.kind in (:package, :extension) ? options.threads : 1, (1, -round(Int, _cost(unit, previous))), unit)
 
 "Values for each worker's `CUDA_VISIBLE_DEVICES`; `\"\"` hides all devices, none leaves it unset."
 function _gpus(requested::Vector{String})::Vector{String}
@@ -306,6 +326,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     end
     before = _snapshot(inventory, config)
     gpus = _gpus(options.gpus)
+    previous = _previous_seconds(root)
     members = Dict(context => filter(unit -> unit.context == context, units) for context in contexts)
     separate = Dict{String,Vector{String}}()
     foreach(unit -> isempty(unit.driver) || push!(get!(separate, unit.driver, String[]), unit.entry), units)
@@ -328,7 +349,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
             directory = joinpath(output, "environments", _context_key(work))
             environments[work] = contained(() -> _prepare(work, directory, options),
                                            message -> Environment(:failed, directory, message))
-            return [_task(unit, options) for unit in members[work]]
+            return [_task(unit, options, previous) for unit in members[work]]
         end
         gpu = isempty(gpus) ? nothing : gpus[mod1(started_units[] += 1, length(gpus))]
         result = contained(() -> _analyze(work, environments[work.context], inventory, output, options, gpu,
@@ -341,9 +362,9 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
             union!(planned, unit.expected)
             push!(units, unit)
         end
-        return [_task(unit, options) for unit in followups]
+        return [_task(unit, options, previous) for unit in followups]
     end
-    _dispatch(step, [_task(context, members[context]) for context in contexts], options.jobs)
+    _dispatch(step, [_task(context, members[context], previous) for context in contexts], options.jobs)
     after = _snapshot(discover(root; exclude=[config.exclude; options.exclude], output,
                                include_ignored=options.include_ignored, tracked_only=options.tracked_only), config)
     changed = sort!([file for file in union(keys(before), keys(after)) if get(before, file, "") != get(after, file, "")])
