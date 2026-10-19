@@ -66,13 +66,33 @@ function typed_closure(ex)
     return any(typed_closure, ex.args)
 end
 
+"Whether `ex` defines a function, anonymous or local, in a branch, whose condition JET would evaluate."
+function branch_function(ex, conditional::Bool=false)
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return false
+    (ex.head in (:->, :function, :generator) || (ex.head === :(=) && signature(first(ex.args)))) && return conditional
+    ex.head in (:if, :elseif, :&&, :||) &&
+        return branch_function(first(ex.args), conditional) || any(arg -> branch_function(arg, true), ex.args[2:end])
+    return any(arg -> branch_function(arg, conditional), ex.args)
+end
+signature(ex) = ex isa Expr && (ex.head === :call || (ex.head in (:where, :(::)) && signature(first(ex.args))))
+imports(ex) = ex isa Expr && !(ex.head in (:quote, :inert)) && (ex.head in (:using, :import) || any(imports, ex.args))
+
+"""
+Whether `ex` is a loop or `let` block that defines a function in a branch. Its body is a
+local scope already, as a closure's is, so JET can analyze it in one; only imports, which
+must stand at top level, keep it there.
+"""
+outlinable_scope(ex) = ex isa Expr && ex.head in (:for, :while, :let) && branch_function(ex) && !imports(ex)
+
 # JET analyzes any top-level expression it can outline the same way, such as
-# `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`.
-# Closures with typed parameters stay, since lowering would evaluate their types anyway.
+# `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`, and
+# loops and `let` blocks. Closures with typed parameters stay, since lowering would evaluate
+# their types anyway.
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
-        should_wrap_test_expression_in_thunk(x) && !$stays(x) && !$typed_closure(x) || return x
+        (should_wrap_test_expression_in_thunk(x) || $outlinable_scope(x)) && !$stays(x) && !$typed_closure(x) ||
+            return x
         return wrap_test_expression_in_thunk(x)
     end
 end)

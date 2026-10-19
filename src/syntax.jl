@@ -583,9 +583,9 @@ _stays(ex) = ex isa Expr && (ex.head === :$ ||
 
 """
 Whether the analysis worker outlines the top-level expression `ex` into a closure, as JET
-does a `@test` expression: an expression of calls and control flow, binding no names, so
-that the closures it defines in its branches need no evaluated conditions. A generator's
-ranges stand outside its closure.
+does a `@test` expression, so that the closures it defines in its branches need no evaluated
+conditions: an expression of calls and control flow, binding no names, or a loop or `let`
+block, whose body is a local scope already. A generator's ranges stand outside its closure.
 """
 function _outlined(ex)
     outlinable(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) || _closure(ex) || generator(ex) ||
@@ -598,7 +598,20 @@ function _outlined(ex)
             specs = spec isa Expr && spec.head === :filter ? spec.args[2:end] : Any[spec]
             all(s -> s isa Expr && s.head === :(=) && outlinable(last(s.args)), specs)
         end)
-    return ex isa Expr && outlinable(ex) && !_stays(ex) && !_typed_closure(ex)
+    return ex isa Expr && (outlinable(ex) || _outlinable_scope(ex)) && !_stays(ex) && !_typed_closure(ex)
+end
+
+"Whether `ex` is a loop or `let` block that defines a function in a branch, without imports, which must stand at top level."
+_outlinable_scope(ex::Expr) = ex.head in (:for, :while, :let) && _branch_function(ex) && !_imports(ex)
+_imports(ex) = ex isa Expr && !(ex.head in (:quote, :inert)) && (ex.head in (:using, :import) || any(_imports, ex.args))
+
+"Whether `ex` defines a function, anonymous or local, in a branch."
+function _branch_function(ex, conditional::Bool=false)
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return false
+    (_method(ex) || ex.head === :generator) && return conditional
+    ex.head in (:if, :elseif, :&&, :||) &&
+        return _branch_function(first(ex.args), conditional) || any(arg -> _branch_function(arg, true), ex.args[2:end])
+    return any(arg -> _branch_function(arg, conditional), ex.args)
 end
 
 "Whether parameters declare types, which lowering evaluates where a closure stands."
@@ -717,7 +730,8 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
     locals = Pair{Set{Symbol},Set{Symbol}}[]
     needs!(parts, controls) =
         (foreach(part -> _evaluated_symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
-    function visit(ex, controls::Vector{Any}, branches::Vector{Any})
+    # Functions defined in loops and `let` blocks are local: closures.
+    function visit(ex, controls::Vector{Any}, branches::Vector{Any}, scoped::Bool=false)
         ex isa Expr || return
         head = ex.head
         if head in (:quote, :inert, :module)
@@ -730,14 +744,14 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
             # `@static` evaluates its condition when it expands.
             !forced && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
                 needs!(Any[first(last(ex.args).args)], controls)
-            foreach(arg -> visit(arg, controls, branches), ex.args[2:end])
+            foreach(arg -> visit(arg, controls, branches, scoped), ex.args[2:end])
         elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "include_string")
             needs!(ex.args[2:end], controls)
         elseif head === :call && _name(first(ex.args)) == "eval"
             foreach(arg -> _code_reads!(direct, arg), ex.args[2:end])
             needs!(Any[], controls)
         elseif _method(ex)
-            forced || (_closure(ex) ? needs!(branches, Any[]) :
+            forced || (_closure(ex) || scoped ? needs!(branches, Any[]) :
                        (_signature_types!(direct, first(ex.args)); needs!(Any[], controls)))
         elseif head in (:struct, :abstract, :primitive)
             forced || (_type_symbols!(direct, ex); needs!(Any[], controls))
@@ -745,17 +759,20 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
             forced || needs!(Any[], controls)
         elseif head in (:if, :elseif, :&&, :||)
             condition = first(ex.args)
-            visit(condition, controls, branches)
-            foreach(arg -> visit(arg, [controls; condition], [branches; condition]), ex.args[2:end])
+            visit(condition, controls, branches, scoped)
+            foreach(arg -> visit(arg, [controls; condition], [branches; condition], scoped), ex.args[2:end])
         elseif head in (:for, :while)
-            visit(first(ex.args), controls, branches)
-            visit(last(ex.args), [controls; first(ex.args)], branches)
+            visit(first(ex.args), controls, branches, scoped)
+            visit(last(ex.args), [controls; first(ex.args)], branches, true)
+        elseif head === :let
+            visit(first(ex.args), controls, branches, scoped)
+            visit(last(ex.args), controls, branches, true)
         else
             !forced && head in (:generator, :comprehension, :typed_comprehension, :do) && needs!(branches, Any[])
             if head === :(=) && !_signature(first(ex.args))
                 push!(locals, _symbols(first(ex.args)) => union(_symbols(last(ex.args)), (_symbols(c) for c in controls)...))
             end
-            foreach(arg -> visit(arg, controls, branches), ex.args)
+            foreach(arg -> visit(arg, controls, branches, scoped), ex.args)
         end
     end
     visit(ex, Any[], Any[])

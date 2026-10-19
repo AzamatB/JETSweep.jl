@@ -104,10 +104,11 @@ test itself. So JETLS analyzes a `@test` expression that defines an anonymous fu
 branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, inside a closure of its own.
 JETSweep treats generators and comprehensions alike, as in
 `@test r.ok && [a.b for a in r.items] == [1]`, which would otherwise run the whole test set in
-JETLS's interpreter, and any other top-level expression that assigns nothing, as in
-`lock === nothing || atexit(() -> close(lock))`. Expressions that include or evaluate code
-stay at top level, where JETLS follows it, as do closures whose parameters declare types,
-since Julia evaluates those types where the closure stands.
+JETLS's interpreter; any other top-level expression that assigns nothing, as in
+`lock === nothing || atexit(() -> close(lock))`; and loops and `let` blocks, whose bodies are
+local scopes already, unless they import packages, which only top-level code can. Code that
+includes or evaluates code stays at top level, where JETLS follows it, as do closures whose
+parameters declare types, since Julia evaluates those types where the closure stands.
 
 Files a finished analysis does not reach, such as package files loading leaves out or files
 after an analysis stop, get follow-up units of their own, in the same context: a package's

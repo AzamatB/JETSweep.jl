@@ -770,6 +770,17 @@ end
     @test !JETSweep._outlined(:(ready || foreach(xs) do x::Row; x; end))
     @test !JETSweep._outlined(:(ready || foreach(function (x::T) where {T}; x; end, xs)))
     @test JETSweep._outlined(:(ready || foreach((x=Row()) -> x, xs)))
+    # Loop and `let` bodies are local scopes already, unless they import.
+    @test JETSweep._outlined(:(for (name, entries) in deps; if haskey(m, name); all(e -> e, entries); end; end))
+    @test JETSweep._outlined(:(let r = slow(); if r > 0; g(x) = x + 1; end; end))
+    @test !JETSweep._outlined(:(for x in xs; foreach(y -> y, x); end))
+    @test !JETSweep._outlined(:(for m in ms; using Test; ready && map(x -> x, m); end))
+    @test !JETSweep._outlined(:(for f in fs; ready && include(f); map(x -> x, f); end))
+    @test syntax_patterns("const ITEMS = readdir(ARGS[1])\nfor item in ITEMS\n    isdir(item) && foreach(println, filter(x -> x, item))\nend\n") ==
+          String[]
+    # A function a loop defines is a closure, so its loop needs no values.
+    @test syntax_patterns("const ITEMS = readdir(ARGS[1])\nfor item in ITEMS\n    show_item() = println(item)\nend\n") ==
+          String[]
     @test !JETSweep._outlined(:(x = cond ? 1 : map(y -> y, z)))
     @test !JETSweep._outlined(:(ready && include(f)))
     # A generator's ranges stand outside its closure, as do interpolations into quotes.

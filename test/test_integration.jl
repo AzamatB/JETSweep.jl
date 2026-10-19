@@ -113,6 +113,16 @@ end
             LOCK === nothing || atexit(() -> close(LOCK))
             after() = 1 + "one"
             """)
+        # Nor does one in a branch of a top-level loop.
+        write(joinpath(root, "loop.jl"), """
+            const LISTED = readdir(ARGS[1])
+            for item in LISTED
+                if isdir(item)
+                    foreach(x -> println(x), item)
+                end
+            end
+            after() = 1 + "one"
+            """)
         # A script runs as the program, so a check for that holds as it would.
         write(joinpath(root, "main_check.jl"), """
             const MAIN = abspath(PROGRAM_FILE) == abspath(@__FILE__)
@@ -160,6 +170,7 @@ end
         @test status("locked.jl") === :findings && !isfile(joinpath(root, "acquired.marker"))
         @test status("bootstrap.jl") === :findings
         @test status("main_check.jl") === :findings
+        @test status("loop.jl") === :findings
         @test status("uses_sibling.jl") === :findings
         sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
         @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)
