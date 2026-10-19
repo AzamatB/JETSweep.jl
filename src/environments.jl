@@ -395,7 +395,7 @@ function _add_tool!(project::Dict, preferences::Dict, manifest)
         source === nothing || haskey(sources, entry.name) || (sources[entry.name] = source)
     end
     # A target that locks a Revise keeps it within the analyzer's series; others get the
-    # release JETSweep pins, also when the environment is re-resolved.
+    # release JETSweep's own environment has, also when the environment is re-resolved.
     revise = tool.manifest[_REVISE].version
     _merge_compat!(get!(project, "compat", Dict{String,String}()), "Revise",
                    locked ? "$(revise.major).$(revise.minor)" : "=$revise")
