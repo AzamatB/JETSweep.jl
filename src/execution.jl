@@ -373,6 +373,21 @@ function _snapshot(inventory::Inventory, config::Config)
 end
 
 """
+Create the directory `name` in `parent`, or `name-2`, `name-3` and so on if it exists. Only
+one `mkdir` of a path succeeds, so sweeps started in the same second get their own.
+"""
+function _new_directory(parent::String, name::String)
+    mkpath(parent)
+    for n in Iterators.countfrom(1)
+        try
+            return mkdir(joinpath(parent, n == 1 ? name : "$name-$n"))
+        catch err
+            err isa Base.IOError && err.code == Base.UV_EEXIST || rethrow()
+        end
+    end
+end
+
+"""
     sweep(root; options=SweepOptions(), io=stderr) -> SweepResult
 
 Discover, plan and analyze everything below `root`, writing a report directory. Every
@@ -390,15 +405,15 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     started = time()
     root = realpath(root)
     config = read_config(root, options.config)
-    output = isempty(options.output) ?
-        joinpath(root, ".jetsweep", Libc.strftime("%Y%m%d-%H%M%S", time())) : abspath(options.output)
-    ispath(output) && !(isdir(output) && isempty(readdir(output))) &&
+    output = isempty(options.output) ? "" : abspath(options.output)
+    isempty(output) || !ispath(output) || isdir(output) && isempty(readdir(output)) ||
         throw(ArgumentError("report directory must be new or empty: $output"))
     inventory = discover(root; exclude=[config.exclude; options.exclude], output,
                          include_ignored=options.include_ignored, tracked_only=options.tracked_only)
     syntax = source_syntax(inventory)
     units = plan(inventory, config; syntax)
-    mkpath(output)
+    output = isempty(output) ? _new_directory(joinpath(root, ".jetsweep"), Libc.strftime("%Y%m%d-%H%M%S", time())) :
+             mkpath(output)
     write_inventory(joinpath(output, "inventory.toml"), inventory)
     write_plan(joinpath(output, "plan.toml"), units, inventory.root)
     contexts = unique(unit.context for unit in units)

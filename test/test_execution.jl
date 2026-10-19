@@ -394,6 +394,29 @@ end
     end
 end
 
+@testset "Sweeps started in the same second get their own report directories" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        write(joinpath(root, "script.jl"), "f() = 1\n")
+        reports = joinpath(root, "reports")
+        @test JETSweep._new_directory(reports, "run") == joinpath(reports, "run")
+        @test JETSweep._new_directory(reports, "run") == joinpath(reports, "run-2")
+        touch(joinpath(reports, "run-3"))
+        @test JETSweep._new_directory(reports, "run") == joinpath(reports, "run-4")
+        @test isdir(joinpath(reports, "run-2")) && isdir(joinpath(reports, "run-4"))
+        # The default report directories of other sweeps started this minute, empty or not.
+        started = time()
+        taken = [joinpath(root, ".jetsweep", Libc.strftime("%Y%m%d-%H%M%S", started + s)) for s in 0:60]
+        foreach(path -> write(joinpath(mkpath(path), "plan.toml"), ""), taken[1:2:end])
+        foreach(mkpath, taken[2:2:end])
+        result = sweep(root; options=SweepOptions(plan_only=true), io=devnull)
+        @test result.output in taken .* "-2"
+        @test isfile(joinpath(result.output, "plan.toml"))
+        @test all(path -> read(joinpath(path, "plan.toml"), String) == "", taken[1:2:end])
+        @test all(path -> isempty(readdir(path)), taken[2:2:end])
+    end
+end
+
 @testset "GPU assignment" begin
     @test JETSweep._gpus(["none"]) == [""]
     @test JETSweep._gpus(["0", "GPU-1234"]) == ["0", "GPU-1234"]

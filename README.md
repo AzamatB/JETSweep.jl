@@ -46,7 +46,7 @@ jetsweep --exclude vendor --exclude '**/generated/*.jl' DIRECTORY
 | `--threads N` | Threads for package and extension analyses, whose signature analysis is parallel (default 4). Other analyses run single-threaded. |
 | `--timeout SECONDS` | Time limit per analysis or environment, 0 for none (default 1800). JETLS's own limit on evaluating each top-level statement, which counts compilation and so grows with load, is 300 s instead of its editor default of 10 s, unless `.JETLSConfig.toml` sets `full_analysis.concretization_timeout`. |
 | `--gpus auto\|none\|LIST` | GPUs assigned round-robin through `CUDA_VISIBLE_DEVICES` (default `auto`: the visible devices). |
-| `--output DIRECTORY` | Report directory, new or empty (default `DIRECTORY/.jetsweep/TIMESTAMP`). |
+| `--output DIRECTORY` | Report directory, new or empty (default `DIRECTORY/.jetsweep/TIMESTAMP`, or `TIMESTAMP-2` and so on if another sweep has it). |
 | `--config FILE` | Configuration file (default `DIRECTORY/.JETSweep.toml`, if present). |
 | `--exclude GLOB` | Skip matching paths; repeatable. A pattern with `/` inside, or starting with `/` or `./`, matches the path relative to `DIRECTORY`; any other pattern matches a path segment. |
 | `--include-ignored`, `--tracked-only` | Include files Git ignores; include only files Git tracks. |
