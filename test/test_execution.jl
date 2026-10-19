@@ -398,7 +398,7 @@ function execution_sweep(unit, root, output)
     includes = [dynamic; [JETSweep.Include(file, 1, true) for file in unit.expected if file != unit.entry]]
     syntax = Dict(unit.entry => JETSweep.Syntax(includes, String[]))
     return JETSweep._Sweep(inventory, output, SweepOptions(), syntax, Dict{String,JETSweep.Unit}(),
-                           Dict{String,Vector{String}}(), Dict{Tuple{String,Bool},Vector{String}}())
+                           Dict{String,Vector{String}}(), Dict{String,Vector{String}}())
 end
 
 "Write `unit`'s JETLS configuration; returns the root its paths are relative to and the configuration."
@@ -530,14 +530,13 @@ const EXECUTION_USER_JETLS = """
               Set([("const DIR = @__DIR__", "Pkg/test/runtests.jl"), (EXECUTION_SELECTION, "Pkg/test/runtests.jl")])
         @test execution_skips(data) == [execution_skip("Pkg/test/second.jl")]
 
-        # A selection that is not pure is evaluated only to get past the run-time includes
-        # of a driver whose included files are analyzed separately.
+        # What run-time includes need is evaluated, pure or not; the driver's unit skips the
+        # files analyzed separately.
         listing = execution_touch(joinpath(root, "Listing", "test", "runtests.jl"),
                                   "const PICKED = list_tests()\nfor file in PICKED\n    include(file)\nend\n")
-        _, data = execution_jetls(execution_unit(listing), root)
-        @test isempty(execution_patterns(data))
         _, data = execution_jetls(execution_unit(listing), root, separate[2:2])
         @test execution_patterns(data) == [("const PICKED = list_tests()", "Listing/test/runtests.jl")]
+        @test execution_skips(data) == [execution_skip("Pkg/test/second.jl")]
     end
 end
 
@@ -603,7 +602,7 @@ end
         inventory = discover(root)
         sweep = JETSweep._Sweep(inventory, root, SweepOptions(), JETSweep.source_syntax(inventory),
                                 Dict{String,JETSweep.Unit}(), Dict{String,Vector{String}}(),
-                                Dict{Tuple{String,Bool},Vector{String}}())
+                                Dict{String,Vector{String}}())
         analyzed(files...) = JETSweep.UnitResult("unit", :incomplete, JETSweep.Finding[], [realpath.(files)...],
                                                  String[], String[], 0.0, "")
         # An extension's orphans load in its context and module, with its run-time settings.

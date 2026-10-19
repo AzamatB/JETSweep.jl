@@ -73,19 +73,22 @@ Test drivers commonly choose their test files at run time, as in
 follow. Each such test file therefore gets its own unit, analyzed after a prelude of the
 drivers' imports and definitions and the constants the test file refers to, copied with their
 original source text; selection logic the test file does not depend on is left out. The
-drivers' own analyses evaluate what selects their files, to get past the selection, and skip
-including the files analyzed separately.
+drivers' own analyses evaluate the selection and skip including the files analyzed
+separately.
 
 Script analysis evaluates definitions, imports and includes but not assignments, so a
 definition or `include` that needs an assigned value stops JETLS
 (`toplevel/missing-concretization`), and other code sees assigned values only as types.
 JETSweep lets JETLS evaluate the top-level statements of the files a unit loads that cannot
-have side effects: assignments of literals, paths and pure functions of names already bound,
-such as `const ROOT = normpath(joinpath(@__DIR__, ".."))`, and blocks and conditionals made
-only of these, definitions and imports, such as `if !@isdefined(Alias) const Alias = Package end`.
-Values that depend on how the program is run (`ARGS`, `ENV`) are evaluated only where analysis
-needs them: in `include` arguments, definition signatures, and conditions of branches that
-define closures, which JETLS evaluates itself. A value that code left unevaluated may change,
+have side effects: assignments of literals, paths, files read and pure functions of names
+already bound, such as `const ROOT = normpath(joinpath(@__DIR__, ".."))`, and blocks and
+conditionals made only of these, definitions and imports, such as
+`if !@isdefined(Alias) const Alias = Package end`. Values that depend on how the program is
+run (`ARGS`, `ENV`) are evaluated only where analysis needs them: in `include` and `eval`
+arguments, definition signatures, and conditions of branches that define closures or choose
+imports, which JETLS evaluates itself. Since JETLS always evaluates `include` and `eval` calls,
+whatever their arguments need is evaluated too, side effects or not, as a test driver's
+selection of its files is. A value that code left unevaluated may change,
 as `push!` or an indexed assignment does, is no longer evaluated from there on, and neither is
 a name the file rebinds, even one Base defines. Since JETLS matches these statements as
 patterns, in which names such as `x_` and `@__DIR__` are wildcards, a statement whose

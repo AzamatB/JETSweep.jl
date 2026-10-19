@@ -103,8 +103,8 @@ struct _Sweep
     tests::Dict{String,Unit}
     "Files each test driver includes at run time that are analyzed as their own units."
     separate::Dict{String,Vector{String}}
-    "Concretization patterns by file and selection, since many units load the same files."
-    patterns::Dict{Tuple{String,Bool},Vector{String}}
+    "Concretization patterns by file, since many units load the same files."
+    patterns::Dict{String,Vector{String}}
 end
 
 "The `.JETLSConfig.toml` that applies to a unit: configured, or the nearest above its entry."
@@ -142,9 +142,9 @@ applies with its paths rebased from its own directory to the sweep root, plus th
 a sweep requires.
 
 Script analysis also evaluates the statements of the files it loads that are free of side
-effects (`concretization_patterns`), so that definitions and includes depending on their
-values load. A unit that loads a test driver whose run-time includes are analyzed as their
-own units also evaluates what selects those files, and skips including them.
+effects, and those `include` and `eval` calls need (`concretization_patterns`), so that
+definitions and includes depending on their values load. A test driver's unit skips
+including the files it includes at run time that are analyzed as their own units.
 """
 function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separate::Vector{String})
     root = sweep.inventory.root
@@ -166,10 +166,7 @@ function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separ
         for file in sort!(collect(loaded))
             isfile(file) && _within(file, root) || continue
             path = _glob_literal(relpath(file, root))
-            # A driver whose run-time includes are analyzed separately gets past its selection.
-            selection = !isempty(separate) && haskey(sweep.syntax, file) &&
-                any(include -> isempty(include.target) && include.followed, sweep.syntax[file].includes)
-            for pattern in get!(() -> concretization_patterns(file; selection), sweep.patterns, (file, selection))
+            for pattern in get!(() -> concretization_patterns(file), sweep.patterns, file)
                 push!(patterns, Dict("pattern" => pattern, "path" => path))
             end
         end
@@ -369,7 +366,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     separate = Dict{String,Vector{String}}()
     foreach(unit -> isempty(unit.driver) || push!(get!(separate, unit.driver, String[]), unit.entry), units)
     state = _Sweep(inventory, output, options, syntax, Dict(unit.entry => unit for unit in units if unit.kind === :test),
-                   separate, Dict{Tuple{String,Bool},Vector{String}}())
+                   separate, Dict{String,Vector{String}}())
     environments = Dict{Context,Environment}()
     results = Dict{String,UnitResult}()
     # Files some unit's entry already covers need no follow-up units of their own.

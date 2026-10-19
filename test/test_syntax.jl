@@ -671,9 +671,9 @@ end
 end
 
 "Concretization patterns of `code` written as `file.jl`."
-function syntax_patterns(code::String; selection=false)
+function syntax_patterns(code::String)
     mktempdir() do directory
-        return JETSweep.concretization_patterns(syntax_write(realpath(directory), "file.jl", code); selection)
+        return JETSweep.concretization_patterns(syntax_write(realpath(directory), "file.jl", code))
     end
 end
 
@@ -775,6 +775,13 @@ end
         """
     @test syntax_patterns(code) == ["errs = Float64[]", "const SEEN = Int[]", "const TABLE = Dict{String,Int}()",
                                     "const S = Base.range(1, 3)", "const W = map(x -> x + 1, 1:3)"]
+    # Reading files has no side effects.
+    read_only = """
+        const MANIFEST = read(joinpath(@__DIR__, "manifest.json"), String)
+        const AST = Meta.parseall(MANIFEST)
+        const SEALED = !occursin("sha256:" * "0"^64, MANIFEST)
+        """
+    @test syntax_patterns(read_only) == split(chomp(read_only), '\n')
 end
 
 @testset "concretization_patterns takes blocks and conditionals whole, as JETLS matches them" begin
@@ -846,12 +853,13 @@ end
         "const ASKED = isempty(ARGS) ? split(get(ENV, \"TESTS\", \"\"), \",\"; keepempty = false) : ARGS",
         "const RUN = isempty(ASKED) ? FILES : filter(in(ASKED), FILES)"]
     @test syntax_patterns(driver) == selected
-    @test syntax_patterns(driver; selection=true) == selected
-    # With `selection`, what an include needs is evaluated even when not pure.
+    # What `include` and `eval` calls need is evaluated even when not pure, since JETLS
+    # evaluates those calls; not what other evaluated code needs.
     listing = "const FILES = list_tests()\nfor file in FILES\n    include(file)\nend\n"
-    @test syntax_patterns(listing) == String[]
-    @test syntax_patterns(listing; selection=true) == ["const FILES = list_tests()"]
+    @test syntax_patterns(listing) == ["const FILES = list_tests()"]
+    generated = "const BODY = make_body()\nCore.eval(@__MODULE__, Expr(:function, :(f()), BODY))\n"
+    @test syntax_patterns(generated) == ["const BODY = make_body()"]
+    @test syntax_patterns("const N = compute()\ng(::Val{N}) = 1\n") == String[]
     # Includes inside functions run only when called, so nothing selects them statically.
-    @test syntax_patterns("const FILES = list_tests()\nrun(f) = include(f)\nforeach(run, FILES)\n"; selection=true) ==
-          String[]
+    @test syntax_patterns("const FILES = list_tests()\nrun(f) = include(f)\nforeach(run, FILES)\n") == String[]
 end

@@ -260,19 +260,20 @@ end
 # definition or `include` that needs an assigned value stops it
 # (`toplevel/missing-concretization`), and other code sees assigned values only as types.
 # JETSweep lets JETLS evaluate the top-level statements that cannot have side effects:
-# assignments of values built from literals, paths and pure functions of names already
-# bound, and blocks and conditionals made only of these, definitions and imports. Values
-# that depend on how the program is run (`ARGS`, `ENV`) are evaluated only where analysis
-# needs them: in `include` arguments, definition signatures, and the conditions JETLS
-# evaluates to define the closures in their branches. A test driver whose run-time includes
-# are analyzed as their own units also evaluates whatever selects those files.
+# assignments of values built from literals, paths, files read and pure functions of names
+# already bound, and blocks and conditionals made only of these, definitions and imports.
+# Values that depend on how the program is run (`ARGS`, `ENV`) are evaluated only where
+# analysis needs them: in `include` and `eval` arguments, definition signatures, and the
+# conditions JETLS evaluates to define the closures in their branches or to import. Since
+# JETLS always evaluates `include` and `eval` calls, whatever their arguments need is
+# evaluated too, pure or not, as a test driver's selection of the files it includes.
 
 const _PURE_NAMES = Set([:nothing, :missing, :true, :false, :Inf, :NaN, :pi, :π, :ℯ])
 "Names whose values depend on how the analyzed program is run."
 const _PROCESS_NAMES = Set([:ARGS, :ENV])
 const _PURE_CALLS = Set(Symbol.(split("""
     joinpath normpath dirname basename splitext splitdir splitpath relpath isabspath isfile isdir
-    ispath readdir pkgdir pathof string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
+    ispath readdir read readlines readchomp parseall parsefile pkgdir pathof string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
     exp2 exp10 log log2 log10 sin cos tan hypot round floor ceil trunc length Dict Set Pair => :
     range collect Tuple NamedTuple tuple Symbol Int Int8 Int16 Int32 Int64 UInt UInt8 UInt16 UInt32
     UInt64 Float16 Float32 Float64 Bool String Char BigInt BigFloat Rational Complex VersionNumber Vector Matrix
@@ -313,7 +314,7 @@ function _pure_callee(f, scope::_Scope)
     f isa Symbol && return (f in _PURE_CALLS || f === :isdefined) && !(f in scope.shadowed)
     f isa Expr || return false
     f.head === :curly && return _pure_callee(first(f.args), scope) && all(arg -> _pure_type(arg, scope), f.args[2:end])
-    return f.head === :. && first(f.args) in (:Base, :Sys) && Symbol(_name(f)) in _PURE_CALLS
+    return f.head === :. && first(f.args) in (:Base, :Sys, :Meta, :TOML) && Symbol(_name(f)) in _PURE_CALLS
 end
 
 "A type parameter: the file's own types count, since naming a type runs no code."
@@ -529,10 +530,10 @@ _closure(ex::Expr) = ex.head === :-> ||
 Add the names whose values JETLS evaluates when it analyzes the top-level statement `ex`:
 arguments of `include` and `eval` calls, signatures of definitions, the control flow around
 these and around imports, and the conditions of branches that define closures, which JETLS
-evaluates to define them; with `includes`, only those of `include` calls. Assignments in
-`ex` that these names depend on count too.
+evaluates to define them; with `forced`, only those of `include` and `eval` calls, which JETLS evaluates
+whatever they need. Assignments in `ex` that these names depend on count too.
 """
-function _reads!(needed::Set{Symbol}, ex; includes::Bool=false)
+function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
     direct = Set{Symbol}()
     locals = Pair{Set{Symbol},Set{Symbol}}[]
     needs!(parts, controls) = (foreach(part -> _symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
@@ -544,21 +545,19 @@ function _reads!(needed::Set{Symbol}, ex; includes::Bool=false)
         elseif head === :macrocall
             name = _macro_name(ex)
             name in _TEST_MACROS && return     # JETLS outlines their closures into thunks
-            name == "@eval" && return includes || needs!(ex.args, controls)
+            name == "@eval" && return needs!(ex.args, controls)
             # `@static` evaluates its condition when it expands.
-            !includes && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
+            !forced && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
                 needs!(Any[first(last(ex.args).args)], controls)
             foreach(arg -> visit(arg, controls, branches), ex.args[2:end])
-        elseif _is_include(ex)
+        elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "eval")
             needs!(ex.args[2:end], controls)
-        elseif head === :call && _name(first(ex.args)) == "eval"
-            includes || needs!(ex.args[2:end], controls)
         elseif _method(ex)
-            includes || (_closure(ex) ? needs!(branches, Any[]) : needs!(Any[first(ex.args)], controls))
+            forced || (_closure(ex) ? needs!(branches, Any[]) : needs!(Any[first(ex.args)], controls))
         elseif head in (:struct, :abstract, :primitive)
-            includes || needs!(Any[ex], controls)
+            forced || needs!(Any[ex], controls)
         elseif head in (:using, :import)
-            includes || needs!(Any[], controls)
+            forced || needs!(Any[], controls)
         elseif head in (:if, :elseif, :&&, :||)
             condition = first(ex.args)
             visit(condition, controls, branches)
@@ -567,7 +566,7 @@ function _reads!(needed::Set{Symbol}, ex; includes::Bool=false)
             visit(first(ex.args), controls, branches)
             visit(last(ex.args), [controls; first(ex.args)], branches)
         else
-            !includes && head in (:generator, :comprehension, :typed_comprehension, :do) && needs!(branches, Any[])
+            !forced && head in (:generator, :comprehension, :typed_comprehension, :do) && needs!(branches, Any[])
             if head === :(=) && !_signature(first(ex.args))
                 push!(locals, _symbols(first(ex.args)) => union(_symbols(last(ex.args)), (_symbols(c) for c in controls)...))
             end
@@ -589,10 +588,10 @@ end
 
 """
 Indices of the statements that analysis may evaluate. Run-dependent statements are evaluated
-only where needed, or where JETLS evaluates part of them anyway; with `selection`, so are
-impure assignments that `include` calls need. `excluded` statements are not.
+only where needed, or where JETLS evaluates part of them anyway; impure assignments only
+where `include` and `eval` calls need them. `excluded` statements are not.
 """
-function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::Bool)
+function _concretized(expressions::Vector{Any}, excluded::Set{Int})
     shadowed = Set{Symbol}()
     foreach(ex -> (_assigned!(shadowed, ex); union!(shadowed, _definitions(ex))), expressions)
     scope = _Scope(Set{Symbol}(), Set{Symbol}(), shadowed)
@@ -601,7 +600,7 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::B
     selected = Set{Int}()
     # Statements to evaluate where needed: their names, what they read, and whether pure.
     deferred = Tuple{Int,Vector{Symbol},Set{Symbol},Bool}[]
-    needed, selectors = Set{Symbol}(), Set{Symbol}()
+    needed, forced = Set{Symbol}(), Set{Symbol}()
     for (i, ex) in pairs(expressions)
         binds = _binds!(Set{Symbol}(), ex)
         assignment = _assignment(ex)
@@ -609,10 +608,8 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::B
         known = i in excluded ? nothing : _evaluable(ex, scope, bound)
         setdiff!(scope.known, binds)
         if known === nothing
-            if selection
-                !(i in excluded) && assignment !== nothing && push!(deferred, (i, first(assignment), reads, false))
-                _reads!(selectors, ex; includes=true)
-            end
+            !(i in excluded) && assignment !== nothing && push!(deferred, (i, first(assignment), reads, false))
+            _reads!(forced, ex; forced=true)
             _reads!(needed, ex)
             setdiff!(variable, binds)
         elseif isdisjoint(reads, variable)
@@ -636,9 +633,9 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::B
     while changed
         changed = false
         for (i, names, reads, pure) in deferred
-            !(i in selected) && any(name -> name in selectors || pure && name in needed, names) || continue
+            !(i in selected) && any(name -> name in forced || pure && name in needed, names) || continue
             push!(selected, i)
-            union!(pure ? needed : selectors, reads)
+            union!(pure ? needed : forced, reads)
             changed = true
         end
     end
@@ -679,19 +676,17 @@ function _may_match(pattern, ex)
 end
 
 """
-    concretization_patterns(file; selection=false) -> Vector{String}
+    concretization_patterns(file) -> Vector{String}
 
 The source text of the top-level statements of `file` that analysis may evaluate, each a
-JETLS concretization pattern. With `selection`, also the assignments its `include` calls
-depend on, which a test driver whose run-time includes are analyzed separately evaluates
-to get past them.
+JETLS concretization pattern.
 """
-function concretization_patterns(file::String; selection::Bool=false)
+function concretization_patterns(file::String)
     text, statements = _statements(file; modules=true, blocks=false)
     expressions = Any[last(statement) for statement in statements]
     excluded = Set{Int}()
     while true
-        selected = _concretized(expressions, excluded, selection)
+        selected = _concretized(expressions, excluded)
         # A pattern selects every statement of its file that it matches.
         conflicts = filter(i -> any(j -> !(j in selected) && _may_match(expressions[i], expressions[j]),
                                     eachindex(expressions)), selected)
@@ -846,7 +841,7 @@ function prelude(drivers::Vector{String}, target::String)
         end
     end
     statements = statements[selected]
-    evaluated = _concretized(Any[statement.ex for statement in statements], Set{Int}(), false)
+    evaluated = _concretized(Any[statement.ex for statement in statements], Set{Int}())
     io = IOBuffer()
     for (i, statement) in pairs(statements)
         println(io, "#= ", statement.file, ":", statement.line, " =#")

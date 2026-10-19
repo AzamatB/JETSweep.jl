@@ -83,9 +83,9 @@ end
               "name = rand() > 2 ? \"a\" : \"b\"\ninclude(joinpath(@__DIR__, name * \".jl\"))\nh() = 2\n")
         write(joinpath(root, "silenced", ".JETLSConfig.toml"), """
             [[diagnostic.patterns]]
-            pattern = "toplevel/missing-concretization"
+            pattern = "toplevel/.*"
             match_by = "code"
-            match_type = "literal"
+            match_type = "regex"
             severity = "off"
             """)
         # Arguments are not evaluated where analysis does not need them; a selection that
@@ -110,7 +110,7 @@ end
         @test status("unparsable.jl") === :incomplete
         @test any(reason -> occursin("syntax/parse-error", reason), reasons("unparsable.jl"))
         @test status("silenced/stop.jl") === :incomplete
-        @test any(reason -> occursin("toplevel/missing-concretization", reason), reasons("silenced/stop.jl"))
+        @test any(reason -> occursin("silenced/stop.jl:2 [toplevel/", reason), reasons("silenced/stop.jl"))
         @test status("arguments.jl") in (:clean, :findings)
         @test status("selection.jl") === :clean
         @test result.exit_code == 2
