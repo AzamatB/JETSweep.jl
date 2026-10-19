@@ -177,10 +177,10 @@ end
 function _configure(units::Vector{Unit}, config::Config, root::String)
     for rule in config.contexts
         matched = false
+        set(key, value, current) = key in rule.keys ? value : current
         for (i, unit) in pairs(units)
             occursin(rule.pattern, _slash(relpath(unit.entry, root))) || continue
             matched = true
-            set(key, value, current) = key in rule.keys ? value : current
             context = unit.context
             "project" in rule.keys && (context = Context(rule.project, context.owner, context.test, context.triggers))
             current = unit.overrides

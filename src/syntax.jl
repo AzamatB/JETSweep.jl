@@ -272,7 +272,7 @@ const _PURE_NAMES = Set([:nothing, :missing, :true, :false, :Inf, :NaN, :pi, :π
 const _PROCESS_NAMES = Set([:ARGS, :ENV])
 const _PURE_CALLS = Set(Symbol.(split("""
     joinpath normpath dirname basename splitext splitdir splitpath relpath isabspath isfile isdir
-    ispath readdir string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
+    ispath readdir pkgdir pathof string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
     exp2 exp10 log log2 log10 sin cos tan hypot round floor ceil trunc length Dict Set Pair => :
     range collect Tuple NamedTuple tuple Symbol Int Int8 Int16 Int32 Int64 UInt UInt8 UInt16 UInt32
     UInt64 Float16 Float32 Float64 Bool String Char BigInt BigFloat Rational Complex VersionNumber Vector Matrix
@@ -345,8 +345,9 @@ function _pure(ex, scope::_Scope)
     if head === :.
         length(ex.args) == 2 || return false
         base, field = ex.args
-        # Reading a global of a module is pure too, as in `Sys.KERNEL` or `Package.VERSION`.
-        field isa QuoteNode && return _pure(base, scope) || base in scope.opaque
+        # Reading a global of a known module is pure too, as in `Sys.KERNEL` or `Package.VERSION`;
+        # globals of modules the analyzed code defines may be left unevaluated.
+        field isa QuoteNode && return _pure(base, scope)
         # `f.(x)` broadcasts `f`
         return field isa Expr && field.head === :tuple && _pure_callee(base, scope) && pure(field.args)
     end
@@ -490,13 +491,18 @@ function _definitions(ex)
     return Set{Symbol}(_bound_names(ex))
 end
 
-"Names a statement binds to whole modules, as `using A`, `import A.B` and `import A as B` do."
+"""
+Names a statement binds to whole modules of packages, as `using A`, `import A.B` and
+`import A as B` do. Modules the analyzed code defines, which `using .A` names, are left out.
+"""
 function _modules(ex)
     names = Set{Symbol}()
     ex isa Expr || return names
     if ex.head in (:using, :import)
         for path in ex.args
-            path isa Expr && path.head in (:., :as) && last(path.args) isa Symbol && push!(names, last(path.args))
+            path isa Expr && path.head === :as && (path = Expr(:., first(path.args).args..., last(path.args)))
+            path isa Expr && path.head === :. && !isempty(path.args) && first(path.args) !== :. &&
+                last(path.args) isa Symbol && push!(names, last(path.args))
         end
     elseif ex.head in (:block, :if, :elseif, :macrocall)
         foreach(arg -> union!(names, _modules(arg)), ex.args)
@@ -522,10 +528,11 @@ _closure(ex::Expr) = ex.head === :-> ||
 """
 Add the names whose values JETLS evaluates when it analyzes the top-level statement `ex`:
 arguments of `include` and `eval` calls, signatures of definitions, the control flow around
-these, and the conditions of branches that define closures, which JETLS evaluates to
-define them. Assignments in `ex` that these names depend on count too.
+these and around imports, and the conditions of branches that define closures, which JETLS
+evaluates to define them; with `includes`, only those of `include` calls. Assignments in
+`ex` that these names depend on count too.
 """
-function _reads!(needed::Set{Symbol}, ex)
+function _reads!(needed::Set{Symbol}, ex; includes::Bool=false)
     direct = Set{Symbol}()
     locals = Pair{Set{Symbol},Set{Symbol}}[]
     needs!(parts, controls) = (foreach(part -> _symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
@@ -537,17 +544,21 @@ function _reads!(needed::Set{Symbol}, ex)
         elseif head === :macrocall
             name = _macro_name(ex)
             name in _TEST_MACROS && return     # JETLS outlines their closures into thunks
-            name == "@eval" && return needs!(ex.args, controls)
+            name == "@eval" && return includes || needs!(ex.args, controls)
             # `@static` evaluates its condition when it expands.
-            name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
+            !includes && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
                 needs!(Any[first(last(ex.args).args)], controls)
             foreach(arg -> visit(arg, controls, branches), ex.args[2:end])
-        elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "eval")
+        elseif _is_include(ex)
             needs!(ex.args[2:end], controls)
+        elseif head === :call && _name(first(ex.args)) == "eval"
+            includes || needs!(ex.args[2:end], controls)
         elseif _method(ex)
-            _closure(ex) ? needs!(branches, Any[]) : needs!(Any[first(ex.args)], controls)
+            includes || (_closure(ex) ? needs!(branches, Any[]) : needs!(Any[first(ex.args)], controls))
         elseif head in (:struct, :abstract, :primitive)
-            needs!(Any[ex], controls)
+            includes || needs!(Any[ex], controls)
+        elseif head in (:using, :import)
+            includes || needs!(Any[], controls)
         elseif head in (:if, :elseif, :&&, :||)
             condition = first(ex.args)
             visit(condition, controls, branches)
@@ -556,7 +567,7 @@ function _reads!(needed::Set{Symbol}, ex)
             visit(first(ex.args), controls, branches)
             visit(last(ex.args), [controls; first(ex.args)], branches)
         else
-            head in (:generator, :comprehension, :typed_comprehension, :do) && needs!(branches, Any[])
+            !includes && head in (:generator, :comprehension, :typed_comprehension, :do) && needs!(branches, Any[])
             if head === :(=) && !_signature(first(ex.args))
                 push!(locals, _symbols(first(ex.args)) => union(_symbols(last(ex.args)), (_symbols(c) for c in controls)...))
             end
@@ -577,9 +588,9 @@ function _reads!(needed::Set{Symbol}, ex)
 end
 
 """
-Indices of the statements that analysis may evaluate. Run-dependent statements, and with
-`selection` impure assignments, are evaluated only where needed, or where JETLS evaluates
-part of them anyway. `excluded` statements are not.
+Indices of the statements that analysis may evaluate. Run-dependent statements are evaluated
+only where needed, or where JETLS evaluates part of them anyway; with `selection`, so are
+impure assignments that `include` calls need. `excluded` statements are not.
 """
 function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::Bool)
     shadowed = Set{Symbol}()
@@ -588,8 +599,9 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::B
     variable = setdiff(_PROCESS_NAMES, shadowed)
     bound = Set{Symbol}()
     selected = Set{Int}()
-    deferred = Tuple{Int,Vector{Symbol},Set{Symbol}}[]
-    needed = Set{Symbol}()
+    # Statements to evaluate where needed: their names, what they read, and whether pure.
+    deferred = Tuple{Int,Vector{Symbol},Set{Symbol},Bool}[]
+    needed, selectors = Set{Symbol}(), Set{Symbol}()
     for (i, ex) in pairs(expressions)
         binds = _binds!(Set{Symbol}(), ex)
         assignment = _assignment(ex)
@@ -597,7 +609,10 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::B
         known = i in excluded ? nothing : _evaluable(ex, scope, bound)
         setdiff!(scope.known, binds)
         if known === nothing
-            selection && !(i in excluded) && assignment !== nothing && push!(deferred, (i, first(assignment), reads))
+            if selection
+                !(i in excluded) && assignment !== nothing && push!(deferred, (i, first(assignment), reads, false))
+                _reads!(selectors, ex; includes=true)
+            end
             _reads!(needed, ex)
             setdiff!(variable, binds)
         elseif isdisjoint(reads, variable)
@@ -608,7 +623,7 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::B
             # JETLS evaluates part of a statement anyway when it defines a closure in a
             # branch, and then not the closure in the other branch: evaluating it whole is better.
             evaluated = _reads!(Set{Symbol}(), ex)
-            isempty(evaluated) ? push!(deferred, (i, collect(binds), reads)) : push!(selected, i)
+            isempty(evaluated) ? push!(deferred, (i, collect(binds), reads, true)) : push!(selected, i)
             union!(needed, evaluated)
             union!(scope.known, known)
             union!(variable, binds)
@@ -620,10 +635,10 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::B
     changed = true
     while changed
         changed = false
-        for (i, names, reads) in deferred
-            !(i in selected) && any(in(needed), names) || continue
+        for (i, names, reads, pure) in deferred
+            !(i in selected) && any(name -> name in selectors || pure && name in needed, names) || continue
             push!(selected, i)
-            union!(needed, reads)
+            union!(pure ? needed : selectors, reads)
             changed = true
         end
     end
@@ -768,13 +783,15 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
     text, nodes = _statements(file)
     bindings = Dict{Symbol,String}()
     for (node, ex) in nodes
-        # Included files run at top level, wherever the call is: a nested driver included
-        # inside a `@testset`, say.
+        # Top-level includes set up context, as helpers do. Included files run at top level
+        # wherever the call is, but other includes are test files, except nested drivers
+        # included inside a `@testset`, say.
         for include in _nested_includes!(Expr[], ex)
             path = _path(last(include.args), file, bindings, Dict{String,String}())
             path === nothing && continue
             path = normpath(dirname(file), path)
-            path != next && isfile(path) && _driver_statements!(statements, path, next, seen)
+            (_is_include(ex) || basename(path) == "runtests.jl") && path != next && isfile(path) &&
+                _driver_statements!(statements, path, next, seen)
         end
         _is_include(ex) && continue
         assignment = _assignment(ex)

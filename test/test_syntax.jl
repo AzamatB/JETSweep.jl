@@ -448,7 +448,7 @@ end
         if sandbox isa Module
             @test syntax_value(sandbox, :CHAIN_TOP) == 4
             @test syntax_call(sandbox, :body_helper) == 5 && syntax_call(sandbox, :deep_helper) == 7
-            @test isdefined(sandbox, :LOW) && isdefined(sandbox, :HIGH)
+            @test Base.invokelatest(isdefined, sandbox, :LOW) && Base.invokelatest(isdefined, sandbox, :HIGH)
         end
     end
 end
@@ -470,8 +470,10 @@ end
         include("missing.jl")
         include("helpers.jl")
         @testset "all" begin
-            include("testset.jl")
+            include("nested/runtests.jl")
+            include("testset_only.jl")
         end
+        skip_conditional() || include("conditional.jl")
         function later()
             include("function_only.jl")
         end
@@ -488,16 +490,19 @@ end
              "test/block_helpers.jl" => "from_block() = 1\n",
              "test/group.jl" => "from_group() = 1\ninclude(\"target.jl\")\n",
              "test/target.jl" => "from_target() = 1\n",
-             "test/testset.jl" => "from_testset() = 1\n",
+             "test/nested/runtests.jl" => "from_nested_driver() = 1\n",
+             "test/testset_only.jl" => "from_testset() = 1\n",
+             "test/conditional.jl" => "from_conditional() = 1\n",
              "test/function_only.jl" => "from_function() = 1\n",
              "test/loop_only.jl" => "from_loop() = 1\n")
     syntax_prelude(files...) do text, dir
         names = syntax_names(text)
         @test syntax_parses(text)
-        # Included files run at top level wherever the call is, as in a `@testset`.
+        # A nested driver establishes context wherever it is included, as in a `@testset`;
+        # other files included there are test files.
         @test [:from_helpers, :from_cycle, :from_nested, :from_plain_helpers, :from_block, :from_group,
-               :from_testset] ⊆ names
-        @test isdisjoint(names, [:from_target, :from_function, :from_loop])
+               :from_nested_driver] ⊆ names
+        @test isdisjoint(names, [:from_target, :from_function, :from_loop, :from_testset, :from_conditional])
         @test count("from_helpers()", text) == 1
         @test :from_const_helpers in names
     end
@@ -730,10 +735,16 @@ end
         const PICKED = isempty(ASKED) ? ["a"] : filter(f -> f in ASKED, ["a"])
         const SKIP = get(ENV, "SKIP", "")
         skipped() = SKIP
+        # JETLS evaluates the condition that chooses what to import.
+        const MEASURE = get(ARGS, 1, "") == "--measure"
+        if MEASURE
+            using Statistics
+        end
         """
     @test syntax_patterns(code) == ["const LEVEL = isempty(ARGS) ? 1 : 2",
         "const ASKED = isempty(ARGS) ? split(get(ENV, \"TESTS\", \"\"), \",\"; keepempty=false) : ARGS",
-        "const PICKED = isempty(ASKED) ? [\"a\"] : filter(f -> f in ASKED, [\"a\"])"]
+        "const PICKED = isempty(ASKED) ? [\"a\"] : filter(f -> f in ASKED, [\"a\"])",
+        "const MEASURE = get(ARGS, 1, \"\") == \"--measure\"", "if MEASURE\n    using Statistics\nend"]
 end
 
 @testset "concretization_patterns forgets values that other code may change" begin
@@ -758,6 +769,9 @@ end
         const H = helper
         const MAPPED = map(helper, 1:3)
         const W = map(x -> x + 1, 1:3)
+        # Globals of modules the analyzed code defines may be left unevaluated.
+        using .Local
+        const FROM_LOCAL = Local.ROOT
         """
     @test syntax_patterns(code) == ["errs = Float64[]", "const SEEN = Int[]", "const TABLE = Dict{String,Int}()",
                                     "const S = Base.range(1, 3)", "const W = map(x -> x + 1, 1:3)"]

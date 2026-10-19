@@ -31,22 +31,24 @@ From a checkout, `julia --project -m JETSweep DIRECTORY` runs the same command.
 ```sh
 jetsweep ~/Projects/Workspace                   # analyze everything, report to .jetsweep/
 jetsweep --plan ~/Projects/Workspace            # write the analysis plan only
-jetsweep --jobs 24 --fail-on warning DIRECTORY  # 24 CPU slots; fail only on warnings and errors
+jetsweep --jobs 24 --fail-on warning DIRECTORY  # 24 analyses at a time; fail only on warnings and errors
 jetsweep --exclude vendor --exclude '**/generated/*.jl' DIRECTORY
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `--jobs N` | CPU slots for parallel analyses. Default: the CPU threads, at most one per 3 GiB of memory. |
+| `--jobs N` | Analyses run in parallel. Default: the CPU threads, at most one per 3 GiB of memory. |
 | `--threads N` | Threads for package and extension analyses, whose signature analysis is parallel (default 4). Other analyses run single-threaded. |
 | `--timeout SECONDS` | Time limit per analysis or environment, 0 for none (default 1800). |
 | `--gpus auto\|none\|LIST` | GPUs assigned round-robin through `CUDA_VISIBLE_DEVICES` (default `auto`: the visible devices). |
 | `--output DIRECTORY` | Report directory, new or empty (default `DIRECTORY/.jetsweep/TIMESTAMP`). |
 | `--config FILE` | Configuration file (default `DIRECTORY/.JETSweep.toml`, if present). |
-| `--exclude GLOB` | Skip matching paths; repeatable. A pattern with `/`, or starting with `/` or `./`, matches the path relative to `DIRECTORY`; any other pattern matches a path segment. |
+| `--exclude GLOB` | Skip matching paths; repeatable. A pattern with `/` inside, or starting with `/` or `./`, matches the path relative to `DIRECTORY`; any other pattern matches a path segment. |
 | `--include-ignored`, `--tracked-only` | Include files Git ignores; include only files Git tracks. |
-| `--offline` | Use only packages that are already installed. |
+| `--offline` | Resolve environments among the package versions already installed, and download nothing. |
+| `--plan` | Write the inventory and the analysis plan without analyzing. |
 | `--fail-on LEVEL` | Lowest severity that fails the run: `error`, `warning`, `info`, `hint` (default) or `none`. |
+| `--version`, `-h`, `--help` | Show the version, or the help. |
 
 ## What is analyzed
 
@@ -61,28 +63,47 @@ grouped into analysis units, each covering its entry file and the files it inclu
 | --- | --- | --- |
 | Package | `src/Name.jl`, or the project's `entryfile` | The package is loaded and every method signature is analyzed (JETLS's Revise-based package analysis); its structs are checked for abstract fields. |
 | Extension | `ext/Name.jl` or `ext/Name/Name.jl` | Loaded with its parent package and trigger packages, then analyzed like a package. |
-| Test driver | `test/runtests.jl` | Script analysis in the package's test environment. |
-| Test file | any other test file | Script analysis after a prelude from its driver, for test files the driver includes at run time. |
+| Test driver | `test/runtests.jl` | Script analysis in the package's test environment. A nested `runtests.jl` its driver includes statically is part of its unit; one included at run time is a driver run by the one above it. |
+| Test file | any other test file | Script analysis after a prelude from the drivers that run it, for test files a driver includes at run time. |
 | Script | any other file | Script analysis in its nearest environment; a package's own scripts use its test environment. |
-| Orphan source | package or extension source that loading leaves out | Script analysis with the package's bindings and imports in scope, as if the package included it. |
+| Orphan source | package or extension source that loading leaves out | Script analysis with the bindings and imports of the package's or extension's module in scope, as if it included the file. |
 
 Test drivers commonly choose their test files at run time, as in
 `for file in (isempty(ARGS) ? ALL_TESTS : ARGS) include(file) end`, which static analysis cannot
 follow. Each such test file therefore gets its own unit, analyzed after a prelude of the
-driver's imports and definitions and the constants the test file refers to, copied with their
+drivers' imports and definitions and the constants the test file refers to, copied with their
 original source text; selection logic the test file does not depend on is left out. The
-driver's own analysis evaluates exactly the assignments that select its files, to get past
-the selection, and skips including the files analyzed separately.
+drivers' own analyses evaluate what selects their files, to get past the selection, and skip
+including the files analyzed separately.
 
-Script analysis evaluates definitions but not assignments, so a definition or `include` that
-needs an assigned value stops JETLS (`toplevel/missing-concretization`). JETSweep lets it
-evaluate the top-level statements that cannot have side effects: assignments of literals,
-paths and pure functions of names already bound, such as
-`const ROOT = normpath(joinpath(@__DIR__, ".."))`, and definition guards such as
-`if !@isdefined(Alias) const Alias = Package end`.
+Script analysis evaluates definitions, imports and includes but not assignments, so a
+definition or `include` that needs an assigned value stops JETLS
+(`toplevel/missing-concretization`), and other code sees assigned values only as types.
+JETSweep lets JETLS evaluate the top-level statements of the files a unit loads that cannot
+have side effects: assignments of literals, paths and pure functions of names already bound,
+such as `const ROOT = normpath(joinpath(@__DIR__, ".."))`, and blocks and conditionals made
+only of these, definitions and imports, such as `if !@isdefined(Alias) const Alias = Package end`.
+Values that depend on how the program is run (`ARGS`, `ENV`) are evaluated only where analysis
+needs them: in `include` arguments, definition signatures, and conditions of branches that
+define closures, which JETLS evaluates itself. A value that code left unevaluated may change,
+as `push!` or an indexed assignment does, is no longer evaluated from there on, and neither is
+a name the file rebinds, even one Base defines. Since JETLS matches these statements as
+patterns, in which names such as `x_` and `@__DIR__` are wildcards, a statement whose
+pattern would also match another statement of its file is not evaluated.
 
-Files an analysis does not reach, such as package files loading leaves out or files after an
-analysis stop, get follow-up units of their own, so every file is analyzed somewhere.
+JETSweep extends one JETLS rule. To define a closure in a branch, JETLS evaluates the
+branch's condition, and with it everything the condition depends on: in a test set, the
+test itself. So JETLS analyzes a `@test` expression that defines an anonymous function in a
+branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, inside a closure of its own.
+JETSweep treats generators and comprehensions alike, as in
+`@test r.ok && [a.b for a in r.items] == [1]`, which would otherwise run the whole test set in
+JETLS's interpreter.
+
+Files a finished analysis does not reach, such as package files loading leaves out or files
+after an analysis stop, get follow-up units of their own, in the same context: a package's
+missed files are analyzed in its module, each group under the file that includes the rest.
+Files of analyses that time out, fail or have no environment are not analyzed elsewhere; the
+summary lists every file no complete analysis covered.
 
 Every unit runs in a fresh worker process. Units with the same dependency context share one
 prepared environment: a scratch project in the report directory that combines the
@@ -90,17 +111,20 @@ package's dependencies, its test dependencies (test target or `test/Project.toml
 extension triggers, `[sources]`, workspaces, compat bounds and effective preferences, with
 the analyzer resolved alongside, so that packages both use, such as Revise, have one version.
 Existing manifests seed the resolution, keeping locked versions where they are consistent;
-when they are not, the environment is re-resolved and the report notes what changed. Each
-environment is precompiled once for all its units. Original projects, manifests, preferences
+when they are not, the environment is re-resolved and the units' notes say what changed.
+With `--offline`, resolution considers installed versions only. Each environment is then
+precompiled once for all its units; packages that fail to precompile, or that a timeout
+leaves without package images, load from source. Original projects, manifests, preferences
 and sources are never written, and package build scripts never run.
 
 The scheduler prepares environments first, then starts the longest analyses, as measured by
-the previous report in `DIRECTORY/.jetsweep` or estimated from source size, giving package
-and extension analyses `--threads` CPU slots each, and assigns GPUs round-robin. Workers run
-with Julia's default code generation flags, so they share the package images of ordinary
-sessions. Analysis is static, but it loads packages and runs their initialization, macros and
-generated functions, and the code JETLS evaluates to analyze scripts: use JETSweep only on
-code you trust.
+the latest report in `DIRECTORY/.jetsweep` that the same JETSweep version wrote, or
+estimated from source size, and assigns GPUs round-robin. Each analysis takes one of the
+`--jobs` slots: package analyses run on `--threads` threads, but use little more than one core
+on average. Workers run with Julia's default code generation flags, so they share the
+package images of ordinary sessions. Analysis is static, but it loads packages and runs their
+initialization, macros and generated functions, and the code JETLS evaluates to analyze
+scripts: use JETSweep only on code you trust.
 
 ## Configuration
 
@@ -110,10 +134,13 @@ concretization patterns apply. JETSweep prepares environments itself, so it sets
 `full_analysis.auto_instantiate = "never"`, and it keeps diagnostics enabled for all files.
 
 An optional `.JETSweep.toml` at the root adds exclusions and context for units that need it,
-such as scripts that expect arguments or a different environment. `exclude` and `match` are
-globs relative to the root, and each `match` must select at least one unit by its entry file;
-`project`, `setup` and `jetls_config` are paths relative to the configuration file. When
-several tables match a unit, each key a later table sets overrides earlier ones.
+such as scripts that expect arguments or a different environment. `exclude` patterns follow
+the `--exclude` rules. Each `match` is a glob that a unit's entry path, relative to the root,
+must match whole, and must select at least one planned unit; `project`, `setup` and
+`jetls_config` are paths relative to the configuration file. When several tables match a
+unit, each key a later table sets overrides earlier ones, except `env`, whose variables
+merge. Follow-up units inherit the context and settings of the unit they follow, without
+`setup` for orphans.
 
 ```toml
 exclude = ["vendor", "**/generated/*.jl"]
@@ -129,22 +156,25 @@ jetls_config = "tools/.JETLSConfig.toml"
 
 ## Reports
 
-The report directory contains `report.toml` (every unit's status, reasons and timing, and
-the deduplicated diagnostics), `summary.txt` (the diagnostics as `file:line:column` with
-messages, then the summary printed at the end of the run), the inventory and plan, and each
-unit's and environment's request, result and log.
+The report directory contains `report.toml` (every unit's status, reasons, notes and
+timing, and the deduplicated diagnostics), `summary.txt` (the diagnostics as
+`file:line:column` with messages, every incomplete unit with its reasons and log, and the
+files no complete analysis covered), the inventory and plan, and each unit's and
+environment's request, result and log. The terminal summary groups incomplete units by cause.
 
 | Exit | Meaning |
 | --- | --- |
 | 0 | Every analysis completed, with no diagnostic at or above `--fail-on`. |
 | 1 | Every analysis completed, with diagnostics at or above `--fail-on`. |
-| 2 | An analysis was incomplete, timed out or failed, discovery found broken project metadata, or an input changed during the run. |
+| 2 | An analysis was incomplete, timed out or failed; discovery reported an issue (an unreadable directory or Git repository, or broken project metadata); an input changed during the run; or the arguments or configuration are invalid. With `--plan`, only discovery issues count. |
 | 130 | Interrupted. |
 
-An analysis is complete when it covered all files of its unit and stopped at no top-level
-error. Diagnostics cover the analyzed code in its prepared environment; like any static
-analysis they do not prove every possible specialization type-stable, and analyzing a test
-file does not run its tests.
+An analysis is complete when JETLS stopped at no top-level error, parse error included, and
+logged no error of its own; turning a stop's diagnostic off in `.JETLSConfig.toml` hides the
+diagnostic, not the stop. Files a complete analysis did not reach are noted and get
+follow-up units. Diagnostics cover the analyzed code in its prepared environment; like any
+static analysis they do not prove every possible specialization type-stable, and analyzing
+a test file does not run its tests.
 
 ## Julia API
 

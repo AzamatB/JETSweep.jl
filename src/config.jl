@@ -32,9 +32,11 @@ _absolute(base::String, path::String) = (path = normpath(abspath(base, path)); l
 """
     read_config(root, file="") -> Config
 
-Read `file`, or `root/.JETSweep.toml` when it exists. `exclude` and `match` are globs
-relative to `root`; `project`, `setup` and `jetls_config` are paths relative to the file.
-When several `[[context]]` tables match a unit, each key a later table sets overrides it.
+Read `file`, or `root/.JETSweep.toml` when it exists. `exclude` patterns follow the
+`--exclude` rules; each `match` is a glob a unit's entry path, relative to `root`, must
+match whole. `project`, `setup` and `jetls_config` are paths relative to the file. When
+several `[[context]]` tables match a unit, each key a later table sets overrides it, except
+`env`, whose variables merge.
 
 ```toml
 exclude = ["vendor", "**/generated/*.jl"]

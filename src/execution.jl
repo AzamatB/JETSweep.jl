@@ -162,11 +162,13 @@ function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separ
     diagnostic["all_files"] = true
     if unit.kind in (:test, :script, :orphan)
         patterns = get!(full, "concretization_patterns", Any[])
-        selection = !isempty(separate)
         loaded = union((_reach(file, sweep.syntax; followed_only=true) for file in [unit.entry; unit.overrides.setup])...)
         for file in sort!(collect(loaded))
             isfile(file) && _within(file, root) || continue
             path = _glob_literal(relpath(file, root))
+            # A driver whose run-time includes are analyzed separately gets past its selection.
+            selection = !isempty(separate) && haskey(sweep.syntax, file) &&
+                any(include -> isempty(include.target) && include.followed, sweep.syntax[file].includes)
             for pattern in get!(() -> concretization_patterns(file; selection), sweep.patterns, (file, selection))
                 push!(patterns, Dict("pattern" => pattern, "path" => path))
             end
@@ -211,10 +213,9 @@ function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Unio
     generated = joinpath(directory, "entry.jl")
     drivers = _drivers(unit, sweep)
     unit.kind in (:test, :script) && write(generated, _generated_entry(unit, drivers))
-    # Test files a driver includes at run time are skipped by every unit that loads it.
-    separate = unique!(reduce(vcat, (get(sweep.separate, driver, String[]) for driver in [drivers; unit.entry]);
-                              init=String[]))
-    filter!(!=(unit.entry), separate)
+    # A driver's own unit skips the test files it includes at run time; the units of those
+    # files load only its prelude.
+    separate = get(sweep.separate, unit.entry, String[])
     name, uuid = _package(unit, sweep.inventory)
     request = _write_toml(joinpath(directory, "request.toml"), Dict(
         "kind" => String(unit.kind), "entry" => unit.entry, "environment" => environment.dir,

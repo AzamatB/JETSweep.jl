@@ -93,7 +93,7 @@ end
 function _cause(result::UnitResult)
     result.status === :timeout && return "time limit exceeded"
     reason = isempty(result.reasons) ? "" : first(split(first(result.reasons), '\n'))
-    stop = match(r"^analysis stopped at .* \[([^\]]+)\]", reason)
+    stop = match(r"^analysis stopped at .*?:\d+ \[([^\]]+)\]:", reason)
     stop === nothing || return "analysis stopped [$(stop[1])]"
     return length(reason) > 160 ? first(reason, 159) * "…" : reason
 end
