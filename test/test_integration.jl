@@ -85,6 +85,8 @@ end
 @testset "incomplete analyses are explicit" begin
     mktempdir() do root
         write(joinpath(root, "missing_package.jl"), "using NotAPackageAnywhere\nf(x::Int) = x\n")
+        # Where a message locates a method, it names the module as JETLS does.
+        write(joinpath(root, "kwdef.jl"), "Base.@kwdef struct Opts{T}\n    a::T = 1\nend\nmake() = Opts(1, 2)\n")
         # A line ending in "\r\n" ends before its '\r'.
         write(joinpath(root, "crlf.jl"), "crlf_failure() = sin(\"abc\")\r\ncrlf_failure()\r\n")
         write(joinpath(root, "unresolved.jl"), "const PATHS = rand(Bool) ? [\"a\"] : String[]\nstruct S\n    x::typeof(PATHS)\nend\n")
@@ -227,6 +229,9 @@ end
         status(name) = integration_status(result, realpath(joinpath(root, name)))
         reasons(name) = only(r.reasons for (u, r) in zip(result.units, result.results) if endswith(u.entry, name))
         @test status("missing_package.jl") === :incomplete
+        kwdef = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "kwdef.jl"))
+        @test any(f -> occursin("@ Main ", f.message), kwdef.findings)
+        @test !any(f -> occursin("JETSweepAnalysis", f.message), kwdef.findings)
         crlf = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "crlf.jl"))
         @test !isempty(crlf.findings) && all(f -> f.end_column <= 28, crlf.findings)
         @test any(f -> f.line == 1 && f.end_line == 1 && f.end_column == 28, crlf.findings)

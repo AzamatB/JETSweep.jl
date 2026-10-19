@@ -187,14 +187,18 @@ finds it by its path from `Main`.
 const CONTEXT = Core.eval(Main, :(module JETSweepAnalysis end))
 
 # JETLS names what it analyzes in JET's virtual module of `Main` as if `Main` defined it,
-# leaving `Main.` out. Name what is analyzed in the worker's context so too, leaving out only
-# the virtual module: JET leaves out every `Main.`, that of `MyMain.x` too.
+# leaving `Main.` out. Name what is analyzed in the worker's context so too, whether a message
+# names the virtual module or the context itself, as the locations of methods do, leaving out
+# only those modules: JET leaves out every `Main.`, that of `MyMain.x` too.
+"The worker's context in messages: its path before a name, or standing alone."
+const CONTEXT_PATH = Regex("\\Q$(CONTEXT)\\E(\\.|(?![\\w!]))")
 Core.eval(LS.JET, quote
     function (postprocessor::PostProcessor)(s::AbstractString)
         isdefined(postprocessor, :actual2virtual) || return s
         actual, virtual = postprocessor.actual2virtual
         actual == $(string(CONTEXT)) || return replace(s, virtual => actual)
-        return replace(s, virtual * "." => "", virtual => "Main")
+        s = replace(s, virtual * "." => "", virtual => "Main")
+        return replace(s, $CONTEXT_PATH => context -> endswith(context, ".") ? "" : "Main")
     end
 end)
 
