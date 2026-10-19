@@ -320,6 +320,7 @@ function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool)
     download && ops.download_source(ctx)
     ops.fixups_from_projectfile!(ctx)
     download && ops.download_artifacts(ctx; julia_version=ctx.julia_version)
+    _supply_revise!(ctx.env.manifest)
     Pkg.Types.write_env(ctx.env; update_undo=false)
     return nothing
 end
@@ -327,6 +328,18 @@ end
 const _JETLS = UUID("a3b70258-0602-4ee2-b5a6-54c2470400db")
 const _JETLSCORE = UUID("8d6afe4c-923b-5912-b63d-b990009c9e74")
 const _TESTRUNNER = UUID("65a77010-ae58-5cc9-8243-71cff1cf0f92")
+const _REVISE = UUID("295af30f-e4ad-537b-8983-00126c2a3abe")
+
+"""
+Make Revise a dependency of JETLSCore, which loads it for its Revise-based package analysis
+(`JETLS_DEV_MODE`). JETLS releases leave Revise out of JETLSCore's dependencies, since they
+never enable that mode themselves, so JETSweep supplies it.
+"""
+function _supply_revise!(manifest)
+    core = get(manifest, _JETLSCORE, nothing)
+    core === nothing || !haskey(manifest, _REVISE) || (core.deps["Revise"] = _REVISE)
+    return manifest
+end
 
 function _entry_source(entry::Pkg.Types.PackageEntry, manifest_file::String)
     entry.path === nothing || return Dict("path" => abspath(dirname(manifest_file), entry.path))
@@ -338,23 +351,54 @@ function _entry_source(entry::Pkg.Types.PackageEntry, manifest_file::String)
 end
 
 """
+Fail unless the project JETSweep was loaded from has the analyzer installed, which a
+checkout lacks until it is instantiated.
+"""
+function _require_tool()
+    tool = Pkg.Types.EnvCache(tool_project())
+    pending, seen = [_JETLS, _TESTRUNNER, _REVISE], Set{UUID}()
+    installed = true
+    while installed && !isempty(pending)
+        uuid = pop!(pending)
+        uuid in seen && continue
+        push!(seen, uuid)
+        entry = get(tool.manifest, uuid, nothing)
+        path = entry === nothing ? nothing : Pkg.Operations.source_path(tool.manifest_file, entry)
+        installed = path !== nothing && isdir(path) && Pkg.Operations.check_artifacts_downloaded(path)
+        installed && append!(pending, values(entry.deps))
+    end
+    installed && return nothing
+    directory = Base.shell_escape(dirname(tool.project_file))
+    error("JETSweep's project $directory is not instantiated; run ",
+          "`julia --project=$directory -e 'using Pkg; Pkg.instantiate()'` first")
+end
+
+"""
 Add the analyzer to a scratch environment: JETLS with its Revise-based package analysis
-enabled, and TestRunner, which JETLS requires as a direct dependency. Resolving tool and
-target together gives packages they share, such as Revise, one version for both.
+enabled, TestRunner, which JETLS requires as a direct dependency, and Revise, which that
+analysis needs (see `_supply_revise!`). Resolving tool and target together gives packages
+they share one version for both: the target keeps a Revise it locks if it is of the series
+the analyzer uses, whose release JETSweep pins.
 """
 function _add_tool!(project::Dict, preferences::Dict, manifest)
     tool = Pkg.Types.EnvCache(tool_project())
+    locked = haskey(manifest, _REVISE)
     for (uuid, entry) in tool.manifest
         haskey(manifest, uuid) || (manifest[uuid] = _absolute!(deepcopy(entry), tool.manifest_file))
     end
     mergewith!((a, _) -> a, manifest.registries, deepcopy(tool.manifest.registries))
     sources = get!(project, "sources", Dict{String,Dict{String,String}}())
-    for uuid in (_JETLS, _TESTRUNNER)
+    for uuid in (_JETLS, _TESTRUNNER, _REVISE)
         entry = tool.manifest[uuid]
         _merge_dep!(project["deps"], entry.name, uuid)
         source = _entry_source(entry, tool.manifest_file)
         source === nothing || haskey(sources, entry.name) || (sources[entry.name] = source)
     end
+    # A target that locks a Revise keeps it within the analyzer's series; others get the
+    # release JETSweep pins, also when the environment is re-resolved.
+    revise = tool.manifest[_REVISE].version
+    _merge_compat!(get!(project, "compat", Dict{String,String}()), "Revise",
+                   locked ? "$(revise.major).$(revise.minor)" : "=$revise")
     get!(project, "extras", Dict{String,String}())["JETLSCore"] = string(_JETLSCORE)
     preferences["JETLSCore"] = merge(get(preferences, "JETLSCore", Dict{String,Any}()), Dict("JETLS_DEV_MODE" => true))
     # Pkg applies root compat bounds by name, which would also constrain JETLS's privately

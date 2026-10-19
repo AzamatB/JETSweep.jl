@@ -178,6 +178,19 @@ function _read_project(file::String, issues::Vector{String})
     return Project(directory, file, name, uuid, entry, extensions)
 end
 
+"The start of a `CACHEDIR.TAG` file, which marks its directory as a cache (https://bford.info/cachedir/)."
+const _CACHE_SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55"
+
+"Whether a directory is tagged as a cache, as JETSweep tags its report directories."
+function _cache_tagged(directory::String)
+    tag = joinpath(directory, "CACHEDIR.TAG")
+    return try
+        isfile(tag) && String(read(tag, ncodeunits(_CACHE_SIGNATURE))) == _CACHE_SIGNATURE
+    catch
+        false
+    end
+end
+
 "`isdir` and `ispath` throw for unreadable paths and symlink loops; treat those as absent."
 _isdir(path::String) = try isdir(path) catch; false end
 _ispath(path::String) = try ispath(path) catch; false end
@@ -188,10 +201,11 @@ _ispath(path::String) = try ispath(path) catch; false end
 Recursively inventory the Julia projects and source files below `root`. Inside Git
 repositories, LibGit2 applies each repository's ignore rules, including nested
 repositories, and files Git tracks are kept even when ignored. Hidden directories are
-skipped unless Git tracks files inside them, as are `node_modules` and `__pycache__`.
-Symlinks are not followed: inside the root they are aliases of what discovery reaches
-anyway, or of what it excludes. `exclude` holds globs relative to `root`; `output` names
-a report directory to skip.
+skipped unless Git tracks files inside them, as are `node_modules` and `__pycache__`, and
+always directories a `CACHEDIR.TAG` marks as caches, such as earlier reports. Symlinks are
+not followed: inside the root they are aliases of what discovery reaches anyway, or of what
+it excludes. `exclude` holds globs relative to `root`; `output` names a report directory to
+skip.
 """
 function discover(root::AbstractString; exclude::Vector{String}=String[], output::AbstractString="",
                   include_ignored::Bool=false, tracked_only::Bool=false)::Inventory
@@ -233,6 +247,8 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], output
                 "excluded by pattern"
             elseif !isempty(output) && _within(path, output)
                 "report output"
+            elseif isdirectory && _cache_tagged(path)
+                "tagged cache directory"
             elseif isdirectory && name in _PRUNED
                 "dependency or cache directory"
             elseif git !== nothing && !(isdirectory && _ispath(joinpath(path, ".git")))

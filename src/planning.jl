@@ -75,8 +75,8 @@ file that defines `LIBDIR`, resolves on a second pass.
 function source_syntax(inventory::Inventory)
     projects = Dict(project.dir => project for project in inventory.projects)
     parse(source; exports=Dict{String,Dict{Symbol,String}}()) =
-        parse_source(source.path, _package_dirs(source, projects); exports)
-    syntax = Dict(source.path => parse(source) for source in inventory.sources)
+        parse_source(source.path, _packages(source, projects); exports)
+    syntax = Dict{String,Syntax}(source.path => parse(source) for source in inventory.sources)
     # The path constants a file defines, after those of the files it includes at top level.
     exports = Dict{String,Dict{Symbol,String}}()
     function exported(file::String, seen::Set{String})
@@ -235,10 +235,10 @@ function _imports!(units::Vector{Unit}, syntax::Dict{String,Syntax}, inventory::
                  unit.overrides, unit.notes) : unit for unit in units]
 end
 
-"Directories of packages a source can name in `pkgdir(Name)`: its owner, statically."
-function _package_dirs(source::Source, projects::Dict{String,Project})
+"Packages a source can name in `pkgdir(Name)` and `pathof(Name)`: its owner, statically."
+function _packages(source::Source, projects::Dict{String,Project})
     owner = get(projects, source.owner, nothing)
-    return owner === nothing || isempty(owner.name) ? Dict{String,String}() : Dict(owner.name => owner.dir)
+    return owner === nothing || isempty(owner.name) ? Dict{String,Project}() : Dict(owner.name => owner)
 end
 
 function _configure(units::Vector{Unit}, config::Config, root::String)
@@ -251,10 +251,15 @@ function _configure(units::Vector{Unit}, config::Config, root::String)
             context = unit.context
             "project" in rule.keys && (context = Context(rule.project, context.owner, context.test, context.triggers))
             current = unit.overrides
-            overrides = Overrides(set("setup", rule.setup, current.setup), set("args", rule.args, current.args),
-                                  merge(current.env, rule.env), set("jetls_config", rule.jetls_config, current.jetls_config))
+            # Only the generated entries of tests and scripts include setup files.
+            loaded = unit.kind in (:package, :extension, :orphan)
+            ignored = "$(config.file): setup does not apply to $(unit.kind) analysis, which loads the package itself"
+            notes = loaded && !isempty(rule.setup) ? sort!(union(unit.notes, [ignored])) : unit.notes
+            overrides = Overrides(loaded ? current.setup : set("setup", rule.setup, current.setup),
+                                  set("args", rule.args, current.args), merge(current.env, rule.env),
+                                  set("jetls_config", rule.jetls_config, current.jetls_config))
             units[i] = Unit(unit.id, unit.kind, unit.entry, context, unit.expected, unit.driver,
-                            unit.extension, overrides, unit.notes)
+                            unit.extension, overrides, notes)
         end
         matched || throw(ArgumentError("$(config.file): [[context]] match $(repr(rule.match)) selects no unit"))
     end

@@ -57,8 +57,11 @@ _symbols!(names::Set{Symbol}, ex::QuoteNode) = _symbols!(names, ex.value)
 _symbols!(names::Set{Symbol}, ::Any) = names
 _symbols(ex) = _symbols!(Set{Symbol}(), ex)
 
-"Evaluate a path expression built from literals, `@__DIR__`, `@__FILE__` and path calls."
-function _path(ex, file::String, bindings::Dict{Symbol,String}, packages::Dict{String,String})
+"""
+Evaluate a path expression built from literals, `@__DIR__`, `@__FILE__` and path calls,
+`pkgdir(Name)` and `pathof(Name)` among them for the packages `packages` names.
+"""
+function _path(ex, file::String, bindings::Dict{Symbol,String}, packages::Dict{String,Project})
     ex isa String && return ex
     ex isa Symbol && return get(bindings, ex, nothing)
     ex isa Expr || return nothing
@@ -74,11 +77,12 @@ function _path(ex, file::String, bindings::Dict{Symbol,String}, packages::Dict{S
         return nothing
     end
     name = _name(first(ex.args))
-    if name == "pkgdir"
-        length(ex.args) >= 2 || return nothing
-        root = get(packages, _name(ex.args[2]), nothing)
+    if name in ("pkgdir", "pathof")
+        package = length(ex.args) >= 2 ? get(packages, _name(ex.args[2]), nothing) : nothing
+        package === nothing && return nothing
+        name == "pathof" && return length(ex.args) == 2 && !isempty(package.entry) ? package.entry : nothing
         parts = [_path(arg, file, bindings, packages) for arg in ex.args[3:end]]
-        return root !== nothing && all(part -> part isa String, parts) ? joinpath(root, parts...) : nothing
+        return all(part -> part isa String, parts) ? joinpath(package.dir, parts...) : nothing
     end
     parts = [_path(arg, file, bindings, packages) for arg in ex.args[2:end]]
     all(part -> part isa String, parts) && !isempty(parts) || return nothing
@@ -94,7 +98,7 @@ end
 const _UPDATES = (:+=, :-=, :*=, :/=, :\=, :^=, :÷=, :%=, :|=, :&=, :⊻=, :<<=, :>>=, :>>>=, :.=, :$=)
 
 "Record or forget a path binding for an assignment-like expression."
-function _rebind!(bindings::Dict{Symbol,String}, ex::Expr, file::String, packages::Dict{String,String})
+function _rebind!(bindings::Dict{Symbol,String}, ex::Expr, file::String, packages::Dict{String,Project})
     lhs = first(ex.args)
     if ex.head === :(=) && lhs isa Symbol
         value = _path(last(ex.args), file, bindings, packages)
@@ -120,11 +124,11 @@ _loop_names(spec) = spec isa Expr && spec.head in (:(=), :block, :filter) ?
 """
     parse_source(file, packages=Dict(); exports=Dict()) -> Syntax
 
-Find the `include` calls of `file`. `packages` maps package names to their directories,
-which resolves `pkgdir(Name)` paths; `exports` maps files to the path constants they
-define, which code after including them can use.
+Find the `include` calls of `file`. `packages` maps package names to their projects,
+which resolves `pkgdir(Name)` and `pathof(Name)` paths; `exports` maps files to the path
+constants they define, which code after including them can use.
 """
-function parse_source(file::String, packages::Dict{String,String}=Dict{String,String}();
+function parse_source(file::String, packages::Dict{String,Project}=Dict{String,Project}();
                       exports::Dict{String,Dict{Symbol,String}}=Dict{String,Dict{Symbol,String}}())
     includes, notes, imports, modules = Include[], String[], String[], String[]
     tree = try
@@ -244,6 +248,21 @@ function _definition(ex)
     _macro_name(ex) == "@enum" && return true
     _macro_name(ex) == "@eval" && return false
     return any(_definition, ex.args)
+end
+
+"""
+Whether `ex` is a conditional, plain or `@static`, whose branches only define, import and
+assign, as definitions that depend on the Julia version are.
+"""
+function _conditional_definitions(ex)
+    ex isa Expr || return false
+    _macro_name(ex) == "@static" && return _conditional_definitions(last(ex.args))
+    ex.head in (:if, :elseif) || return false
+    # A string in a branch is no docstring, nor anything else.
+    member(ex) = ex isa Union{LineNumberNode,String} || ex isa Expr &&
+        (ex.head in (:using, :import) || _definition(ex) || _assignment(ex) !== nothing ||
+         _conditional_definitions(ex) || (ex.head === :block && all(member, ex.args)))
+    return all(member, ex.args[2:end])
 end
 
 "The names a definition or import statement binds."
@@ -927,11 +946,12 @@ end
 #
 # A test file that its driver (`test/runtests.jl`) includes from a run-time loop is
 # analyzed as its own unit after a prelude: the driver's imports and definitions, and only
-# those global assignments that the test file or those definitions refer to, transitively.
-# Selection logic such as `const TESTS = isempty(ARGS) ? ALL : ARGS` is left out, since
-# nothing the test file uses depends on it. Statements keep their original source text, with
-# `@__DIR__`, `@__FILE__` and relative include paths pinned to their original file. Pure
-# assignments are wrapped in `@eval`, which analysis always evaluates, since concretization
+# those global assignments, modules and conditional definitions, as in `@static if`, that
+# the test file or those definitions refer to, transitively. Selection logic such as
+# `const TESTS = isempty(ARGS) ? ALL : ARGS` is left out, since nothing the test file uses
+# depends on it. Statements keep their original source text, with `@__DIR__`, `@__FILE__`
+# and relative include paths pinned to their original file. Pure assignments and
+# conditionals are wrapped in `@eval`, which analysis always evaluates, since concretization
 # patterns cannot apply to the generated file.
 
 function _macro_identifier(node::JS.SyntaxNode)
@@ -987,7 +1007,7 @@ struct _DriverStatement
     file::String
     line::Int
     ex::Any
-    "The names an assignment binds; empty for imports and definitions."
+    "The names that select it, those an assignment, module or conditional binds; empty for imports and definitions."
     names::Vector{Symbol}
     text::String
 end
@@ -1004,7 +1024,8 @@ Collect the statements of `file` that set up what it includes as `next`: those b
 include of `next`, or before its first run-time include, also from the files it includes
 statically before then. Returns whether that include was reached.
 """
-function _driver_statements!(statements::Vector{_DriverStatement}, file::String, next::String, seen::Set{String})
+function _driver_statements!(statements::Vector{_DriverStatement}, file::String, next::String, seen::Set{String},
+                             packages::Dict{String,Project})
     file in seen && return false
     push!(seen, file)
     text, nodes = _statements(file)
@@ -1014,60 +1035,73 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
         # wherever the call is, but other includes are test files, except nested drivers
         # included inside a `@testset`, say.
         for include in _nested_includes!(Expr[], ex)
-            path = _path(last(include.args), file, bindings, Dict{String,String}())
+            path = _path(last(include.args), file, bindings, packages)
             path === nothing && return true
             path = normpath(dirname(file), path)
             path == next && return true
             (_is_include(ex) || basename(path) == "runtests.jl") && isfile(path) &&
-                _driver_statements!(statements, path, next, seen) && return true
+                _driver_statements!(statements, path, next, seen, packages) && return true
         end
         _is_include(ex) && continue
         assignment = _assignment(ex)
         if assignment !== nothing
             names, value = assignment
-            known = length(names) == 1 ? _path(value, file, bindings, Dict{String,String}()) : nothing
+            known = length(names) == 1 ? _path(value, file, bindings, packages) : nothing
             known === nothing ? foreach(name -> delete!(bindings, name), names) : (bindings[only(names)] = known)
         end
-        if ex isa Expr && (ex.head in (:using, :import) || _definition(ex) || assignment !== nothing)
-            # A module, like an assignment, is kept only where something refers to it.
-            names = assignment !== nothing ? first(assignment) : ex.head === :module ? _bound_names(ex) : Symbol[]
+        conditional = _conditional_definitions(ex)
+        if ex isa Expr && (ex.head in (:using, :import) || _definition(ex) || assignment !== nothing || conditional)
+            # A module or conditional, like an assignment, is kept only where something refers to what it
+            # binds, if anything.
+            # A conditional `using` of a whole module binds names that are not known statically, so it
+            # is kept as an import is.
+            names = assignment !== nothing ? first(assignment) : ex.head === :module ? _bound_names(ex) :
+                conditional && !_whole_using(ex) ? collect(_binds!(Set{Symbol}(), ex)) : Symbol[]
             push!(statements, _DriverStatement(file, JS.source_line(node), ex, names, _relocated(node, text, file)))
         end
     end
     return false
 end
 
-"The modules a relative import such as `using .Helpers` or `import ..Tools: f` names."
+"Whether `ex` runs a `using` of a whole module, as in `using Dates`, whose names are not known statically."
+_whole_using(ex) = ex isa Expr && (ex.head === :using ? any(path -> !(path isa Expr && path.head === :(:)), ex.args) :
+    ex.head in (:block, :if, :elseif, :macrocall) && any(_whole_using, ex.args))
+
+"The modules the relative imports in `ex`, such as `using .Helpers` or `import ..Tools: f`, name."
 function _relative_modules(ex)
-    ex isa Expr && ex.head in (:using, :import) || return Symbol[]
+    ex isa Expr || return Symbol[]
+    ex.head in (:block, :if, :elseif, :macrocall) && return reduce(vcat, (_relative_modules(arg) for arg in ex.args); init=Symbol[])
+    ex.head in (:using, :import) || return Symbol[]
     paths = [path isa Expr && path.head in (:(:), :as) ? first(path.args) : path for path in ex.args]
     return Symbol[path.args[2] for path in paths
                   if path isa Expr && path.head === :. && length(path.args) >= 2 && first(path.args) === :. &&
                      path.args[2] isa Symbol]
 end
 
-function _drivers_statements(drivers::Vector{String}, target::String)
+function _drivers_statements(drivers::Vector{String}, target::String, packages::Dict{String,Project})
     statements = _DriverStatement[]
     seen = Set{String}()
     for (i, driver) in pairs(drivers)
-        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen)
+        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen, packages)
     end
     return statements
 end
 
 "The modules the prelude of `drivers` for `target` imports, which `target` can read."
-prelude_modules(drivers::Vector{String}, target::String) =
-    union(Set{Symbol}(), (_modules(statement.ex) for statement in _drivers_statements(drivers, target))...)
+prelude_modules(drivers::Vector{String}, target::String; packages::Dict{String,Project}=Dict{String,Project}()) =
+    union(Set{Symbol}(), (_modules(statement.ex) for statement in _drivers_statements(drivers, target, packages))...)
 
 """
-    prelude(drivers, target) -> String
+    prelude(drivers, target; packages) -> String
 
 Source text recreating the context that `drivers`, outermost first, establish for `target`,
 which the last of them includes at run time: imports, definitions and the global
-assignments `target` transitively refers to, also from files the drivers include statically.
+assignments, modules and conditional definitions `target` transitively refers to, also from
+files the drivers include statically. `packages` are those whose `pkgdir` and `pathof` the
+files may name in include paths, by name.
 """
-function prelude(drivers::Vector{String}, target::String)
-    statements = _drivers_statements(drivers, target)
+function prelude(drivers::Vector{String}, target::String; packages::Dict{String,Project}=Dict{String,Project}())
+    statements = _drivers_statements(drivers, target, packages)
     needed = Set{Symbol}()
     pending, visited = [target], Set{String}()
     while !isempty(pending)
@@ -1075,7 +1109,7 @@ function prelude(drivers::Vector{String}, target::String)
         (file in visited || !isfile(file)) && continue
         push!(visited, file)
         _symbols!(needed, Meta.parseall(read(file, String); filename=file))
-        append!(pending, (i.target for i in parse_source(file).includes if !isempty(i.target)))
+        append!(pending, (i.target for i in parse_source(file, packages).includes if !isempty(i.target)))
     end
     # A relative import of a module the prelude does not define would fail.
     defined = Set{Symbol}(name for statement in statements if statement.ex.head === :module for name in statement.names)
@@ -1088,7 +1122,7 @@ function prelude(drivers::Vector{String}, target::String)
         changed = false
         for (i, statement) in pairs(statements)
             selected[i] && continue
-            any(in(needed), statement.names) || continue
+            any(in(needed), statement.names) && issubset(_relative_modules(statement.ex), defined) || continue
             selected[i] = changed = true
             _symbols!(needed, statement.ex)
         end
@@ -1098,8 +1132,7 @@ function prelude(drivers::Vector{String}, target::String)
     io = IOBuffer()
     for (i, statement) in pairs(statements)
         println(io, "#= ", statement.file, ":", statement.line, " =#")
-        evaluate = i in evaluated && !isempty(statement.names) && statement.ex.head !== :module
-        println(io, evaluate ? "@eval begin\n$(statement.text)\nend" : statement.text)
+        println(io, i in evaluated ? "@eval begin\n$(statement.text)\nend" : statement.text)
     end
     return String(take!(io))
 end

@@ -84,6 +84,9 @@ must stand at top level, keep it there.
 """
 outlinable_scope(ex) = ex isa Expr && ex.head in (:for, :while, :let) && branch_function(ex) && !imports(ex)
 
+"The name tag of the functions the worker outlines top-level code into."
+const OUTLINED = :jetsweep_outlined
+
 # JET analyzes any top-level expression it can outline the same way, such as
 # `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`, and
 # loops and `let` blocks. Closures with typed parameters stay, since lowering would evaluate
@@ -93,7 +96,68 @@ Core.eval(LS.JET, quote
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
         (should_wrap_test_expression_in_thunk(x) || $outlinable_scope(x)) && !$stays(x) && !$typed_closure(x) ||
             return x
-        return wrap_test_expression_in_thunk(x)
+        thunk = gensym($(QuoteNode(OUTLINED)))
+        return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), Expr(:block, x)), Expr(:call, thunk)))
+    end
+end)
+
+"The body of the function the worker outlined top-level code `x` into, if `x` is such code."
+function outlined_body(x)
+    Meta.isexpr(x, :let, 2) && Meta.isexpr(x.args[2], :block, 2) || return nothing
+    f = first(x.args[2].args)
+    Meta.isexpr(f, :function, 2) && Meta.isexpr(f.args[1], :call, 1) && f.args[1].args[1] isa Symbol &&
+        startswith(String(f.args[1].args[1]), "##$OUTLINED#") || return nothing
+    return f.args[2]
+end
+
+# JET lowers each top-level statement after the line node of its first line. An outlined
+# function starts there too, so that what is reported in it has its location: its loop
+# header or `let` bindings where they stand, and its body where that is.
+Core.eval(LS.Interpreter, quote
+    function JET.lower_with_err_handling(interp::LSInterpreter, node::JS.SyntaxNode, xblk::Expr)
+        body = $outlined_body(last(xblk.args))
+        body === nothing || !(first(xblk.args) isa LineNumberNode) || pushfirst!(body.args, first(xblk.args))
+        interp.current_node[] = node
+        @invoke JET.lower_with_err_handling(interp::JET.ConcreteInterpreter, node::JS.SyntaxNode, xblk::Expr)
+    end
+end)
+
+# JETLS reports a `@test` that always fails only in top-level code, since a function body is
+# inferred for each specialization, for some of which a test may fail while it passes for
+# others. A function the worker outlines top-level code into has one, so its tests count too:
+# unless a test set is declared `failfast=false` or has a custom type, test sets are
+# fail-fast, so the code after such a test is not analyzed, as at top level.
+Core.eval(LS.Analyzer, quote
+    function report_failing_test!(analyzer::LSAnalyzer, sv::CC.InferenceState, argtypes::Vector{Any})
+        def = sv.linfo.def
+        def isa Module || (def isa Method && startswith(String(def.name), $("#$OUTLINED#"))) || return false
+        length(argtypes) == 2 || return false
+        value = CC.widenconditional(argtypes[2])
+        if value isa Const && value.val === false
+            add_new_report!(analyzer, sv.result, FailingTestReport(sv, Bool))
+            return true
+        end
+        t = CC.widenconst(value)
+        t === Union{} && return false
+        CC.hasintersect(t, Bool) && return false
+        add_new_report!(analyzer, sv.result, FailingTestReport(sv, t))
+        return true
+    end
+end)
+
+# JETLS drops a report whose innermost frame has no file, as frames of code without line
+# information have, such as the closures JET outlines `@test` expressions into. Report it at
+# the nearest frame that has one instead.
+Core.eval(LS.Analyzer, quote
+    function inference_error_report_stack(@nospecialize report::JET.InferenceErrorReport)
+        stack = inference_error_report_stack_impl(report)
+        stack isa UnitRange{Int} && (stack = convert(StepRange{Int,Int}, stack))
+        stack isa StepRange{Int,Int} || error("Invalid implementation of `inference_error_report_stack_impl`")
+        while length(stack) > 1 && report.vst[first(stack)].file === :none
+            stack = first(stack)+step(stack):step(stack):last(stack)
+        end
+        @static JETLS_DEV_MODE && assert_valid_report_stack(report, stack, "display")
+        return stack
     end
 end)
 
@@ -113,6 +177,28 @@ Core.eval(LS.JET, quote
         callee_matches(f, Base, :getproperty) || callee_matches(f, Core, :getproperty) ||
             callee_matches(f, CC, :getproperty) || return false
         return any(name -> JuliaInterpreter.is_quotenode_egal(stmt.args[3], name), known_names(func))
+    end
+end)
+
+"""
+The module analyses run in, empty to keep worker globals out of reach of analyzed code. JET
+finds it by its path from `Main`.
+"""
+const CONTEXT = Core.eval(Main, :(module JETSweepAnalysis end))
+
+# JETLS names what it analyzes in JET's virtual module of `Main` as if `Main` defined it,
+# leaving `Main.` out. Name what is analyzed in the worker's context so too, whether a message
+# names the virtual module or the context itself, as the locations of methods do, leaving out
+# only those modules: JET leaves out every `Main.`, that of `MyMain.x` too.
+"The worker's context in messages: its path before a name, or standing alone."
+const CONTEXT_PATH = Regex("\\Q$(CONTEXT)\\E(\\.|(?![\\w!]))")
+Core.eval(LS.JET, quote
+    function (postprocessor::PostProcessor)(s::AbstractString)
+        isdefined(postprocessor, :actual2virtual) || return s
+        actual, virtual = postprocessor.actual2virtual
+        actual == $(string(CONTEXT)) || return replace(s, virtual => actual)
+        s = replace(s, virtual * "." => "", virtual => "Main")
+        return replace(s, $CONTEXT_PATH => context -> endswith(context, ".") ? "" : "Main")
     end
 end)
 
@@ -261,22 +347,66 @@ function abstract_fields(target::Module, files::Vector{String})
     return reports
 end
 
-"Diagnostics of original files. Skipped includes are reported as missing coverage instead."
-function findings(uri2diagnostics, generated::String)
+"""
+The end of a range that starts at `start` in `text` as the file now is. JETLS ends a whole-line
+range at character typemax(Int32), which LSP reads as the end of the line: before its "\\r\\n"
+or "\\n". A line the file no longer has, or a range the file's changes would turn around, ends
+where it starts.
+"""
+function range_end(text::Vector{UInt8}, starts::Vector{Int}, encoding, start, stop)
+    if stop.character == typemax(Int32)
+        stop.line < length(starts) || return start
+        offset = LS._xy_to_offset(text, stop, encoding, starts)
+        1 < offset <= length(text) && text[offset] == UInt8('\n') && text[offset-1] == UInt8('\r') && (offset -= 1)
+        stop = LS._offset_to_xy(text, offset, encoding, starts)
+    end
+    return (stop.line, stop.character) < (start.line, start.character) ? start : stop
+end
+
+"""
+Diagnostics of original files, with positions in `encoding`. Skipped includes are reported
+as missing coverage instead.
+"""
+function findings(uri2diagnostics, generated::String, encoding)
     rows = Dict{String,Any}[]
-    for (uri, diagnostics) in uri2diagnostics, diagnostic in diagnostics
+    for (uri, diagnostics) in uri2diagnostics
         file = LS.uri2filepath(uri)
         (file === nothing || canonical(file) == generated) && continue
-        diagnostic.code == "toplevel/analysis-skipped" && continue
-        range = diagnostic.range
-        push!(rows, Dict{String,Any}("file" => file,
-            "line" => range.start.line + 1, "column" => range.start.character + 1,
-            "end_line" => range.var"end".line + 1, "end_column" => range.var"end".character + 1,
-            "severity" => Int(something(diagnostic.severity, LS.DiagnosticSeverity.Error)),
-            "code" => string(something(diagnostic.code, "")), "message" => LS.get_raw_message(diagnostic)))
+        text = isfile(file) ? read(file) : UInt8[]
+        starts = LS.build_line_starts(text)
+        for diagnostic in diagnostics
+            diagnostic.code == "toplevel/analysis-skipped" && continue
+            (; start) = diagnostic.range
+            stop = range_end(text, starts, encoding, start, diagnostic.range.var"end")
+            push!(rows, Dict{String,Any}("file" => file,
+                "line" => start.line + 1, "column" => start.character + 1,
+                "end_line" => stop.line + 1, "end_column" => stop.character + 1,
+                "severity" => Int(something(diagnostic.severity, LS.DiagnosticSeverity.Error)),
+                "code" => string(something(diagnostic.code, "")), "message" => LS.get_raw_message(diagnostic)))
+        end
     end
     sort!(unique!(rows); by=row -> (row["file"], row["line"], row["column"], row["code"], row["message"]))
     return rows
+end
+
+"The line before each statement a prelude copies, naming where the statement is from."
+const MARKER = r"^#= (.+):(\d+) =#$"
+
+"""
+The original file and line of line `line` of the generated entry `file`, if a statement its
+prelude copies is there: after its marker, inside `@eval begin … end` if it is evaluated.
+"""
+function original(file::String, line::Int)
+    lines = readlines(file)
+    marker = findlast(i -> occursin(MARKER, lines[i]), 1:min(line, length(lines)))
+    marker === nothing && return nothing
+    source, start = match(MARKER, lines[marker])
+    # The statement ends where it parses to, before any include that follows the prelude.
+    text = join(lines[marker+1:end], '\n')
+    span = count('\n', text[1:prevind(text, last(Meta.parse(text, 1; raise=false)))])
+    line - marker <= span || return nothing
+    evaluated = lines[marker+1] == "@eval begin"
+    return source, parse(Int, start) + clamp(line - marker - 1 - evaluated, 0, span - 1 - 2evaluated)
 end
 
 function analyze(request, log::ErrorLog)
@@ -295,9 +425,7 @@ function analyze(request, log::ErrorLog)
     # A script runs as the program, so `abspath(PROGRAM_FILE) == @__FILE__` holds as it would.
     kind in ("test", "script", "orphan") && (Base.PROGRAM_FILE = request["entry"])
     merge!(ENV, request["env"])
-    # An empty module keeps worker globals out of reach of analyzed code. JET finds the
-    # context by its path from `Main`.
-    LS.FULL_ANALYSIS_CONTEXT[] = Core.eval(Main, :(module JETSweepAnalysis end))
+    LS.FULL_ANALYSIS_CONTEXT[] = CONTEXT
     target = nothing
     if kind in ("package", "extension", "orphan")
         target = load(request, log)
@@ -347,8 +475,11 @@ function analyze(request, log::ErrorLog)
         for (uri, list) in diagnostics, diagnostic in list
             code = string(something(diagnostic.code, ""))
             code in STOPS || continue
-            location = "$(something(LS.uri2filepath(uri), string(uri))):$(diagnostic.range.start.line + 1)"
-            push!(reasons, "analysis stopped at $location [$code]: " *
+            file, line = something(LS.uri2filepath(uri), string(uri)), Int(diagnostic.range.start.line) + 1
+            # A stop in a prelude is at the driver's statement it copies, as the driver's unit
+            # reports it.
+            canonical(file) == generated && ((file, line) = something(original(generated, line), (file, line)))
+            push!(reasons, "analysis stopped at $file:$line [$code]: " *
                 first(split(LS.get_raw_message(diagnostic), '\n')))
         end
         for (uri, list) in diagnostics
@@ -356,7 +487,8 @@ function analyze(request, log::ErrorLog)
         end
         timings["lowering"] = time() - mark
         return Dict{String,Any}("analyzed" => sort!(filter(!=(generated), files)),
-                                "findings" => findings(diagnostics, generated), "reasons" => unique!(reasons),
+                                "findings" => findings(diagnostics, generated, server.state.encoding),
+                                "reasons" => unique!(reasons),
                                 "timings" => timings)
     finally
         LS.cleanup_cli_tasks(server)

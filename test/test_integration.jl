@@ -29,20 +29,41 @@ integration_status(result, entry) = only(r.status for (u, r) in zip(result.units
         @test all(r -> r.status in (:clean, :findings), result.results)
         @test integration_status(result, file("Witness/test/runtests.jl")) === :clean
         @test integration_status(result, file("scripts/clean.jl")) === :clean
-        found = Set((relpath(f.file, root), f.line, f.code) for f in JETSweep.unique_findings(result.results))
+        findings = JETSweep.unique_findings(result.results)
+        messages = Dict((relpath(f.file, root), f.line, f.code) => f.message for f in findings)
+        found = Set(keys(messages))
         @test found == Set([
             ("Witness/src/Witness.jl", 6, "inference/method-error"),
             ("Witness/src/nested.jl", 1, "inference/method-error"),
             ("Witness/src/nested.jl", 4, "toplevel/abstract-field"),
             ("Witness/src/inactive.jl", 1, "inference/method-error"),
             ("Witness/src/disconnected.jl", 1, "inference/method-error"),
+            ("Witness/src/disconnected.jl", 2, "inference/undef-global-var"),
+            ("Witness/src/disconnected.jl", 2, "lowering/undef-global-var"),
             ("Witness/ext/WitnessTestExt.jl", 6, "inference/method-error"),
             ("Witness/ext/helper.jl", 1, "inference/method-error"),
             # Analyzed in the extension's module, where `extension_failure` is defined.
             ("Witness/ext/dormant.jl", 1, "inference/method-error"),
             ("Witness/test/test_dynamic.jl", 1, "inference/method-error"),
             ("scripts/main.jl", 3, "inference/method-error"),
+            ("scripts/main.jl", 9, "inference/field-error"),
+            ("scripts/main.jl", 11, "inference/undef-global-var"),
+            ("scripts/main.jl", 11, "lowering/undef-global-var"),
+            ("scripts/main.jl", 13, "inference/method-error"),
             ("tools/report.jl", 3, "inference/method-error")])
+        # Messages name what scripts and orphans define as JETLS names what `Main` defines,
+        # without the module they are analyzed in, and without mangling `MyMain`.
+        @test messages["scripts/main.jl", 9, "inference/field-error"] ==
+              "FieldError: type `Point` has no field `y`, available fields: `x`"
+        @test messages["scripts/main.jl", 11, "inference/undef-global-var"] ==
+              messages["scripts/main.jl", 11, "lowering/undef-global-var"] == "`MyMain.not_defined_in_mymain` is not defined"
+        @test messages["Witness/src/disconnected.jl", 2, "inference/undef-global-var"] ==
+              "`not_defined_anywhere` is not defined"
+        # Columns count UTF-16 code units, as LSP positions do, and a whole-line diagnostic
+        # ends where its line does.
+        wide = only(f for f in findings if relpath(f.file, root) == "scripts/main.jl" && f.line == 13)
+        @test (wide.column, wide.end_line, wide.end_column) == (1, 13, 28)
+        @test all(f -> f.end_column <= length(transcode(UInt16, readlines(f.file)[f.end_line])) + 1, findings)
         package = only(r for (u, r) in zip(result.units, result.results) if u.kind === :package)
         @test any(note -> occursin("inactive.jl", note), package.notes)
         @test result.exit_code == 1
@@ -64,6 +85,10 @@ end
 @testset "incomplete analyses are explicit" begin
     mktempdir() do root
         write(joinpath(root, "missing_package.jl"), "using NotAPackageAnywhere\nf(x::Int) = x\n")
+        # Where a message locates a method, it names the module as JETLS does.
+        write(joinpath(root, "kwdef.jl"), "Base.@kwdef struct Opts{T}\n    a::T = 1\nend\nmake() = Opts(1, 2)\n")
+        # A line ending in "\r\n" ends before its '\r'.
+        write(joinpath(root, "crlf.jl"), "crlf_failure() = sin(\"abc\")\r\ncrlf_failure()\r\n")
         write(joinpath(root, "unresolved.jl"), "const PATHS = rand(Bool) ? [\"a\"] : String[]\nstruct S\n    x::typeof(PATHS)\nend\n")
         mkpath(joinpath(root, "Broken", "src"))
         mkpath(joinpath(root, "Broken", "ext"))
@@ -123,6 +148,27 @@ end
             end
             after() = 1 + "one"
             """)
+        # What outlined code does wrong is reported where it does it.
+        write(joinpath(root, "inside.jl"), """
+            const LOCK = rand(Bool) ? nothing : 1
+            LOCK === nothing || (sin("one"); atexit(() -> close(LOCK)))
+            for item in readdir(@__DIR__)
+                if isdir(item)
+                    foreach(x -> println(x), item)
+                end
+                cos("two")
+            end
+            using Test
+            @test isempty(ARGS) || (tan("three") > 0 && all(a -> a > 0, [1]))
+            for n in 1:2
+                @test n
+                n > 1 && foreach(x -> println(x), 1:n)
+            end
+            for item in readdir(sin("four"))
+                # The header is reported where it stands.
+                isdir(item) && foreach(x -> println(x), item)
+            end
+            """)
         # A script runs as the program, so a check for that holds as it would.
         write(joinpath(root, "main_check.jl"), """
             const MAIN = abspath(PROGRAM_FILE) == abspath(@__FILE__)
@@ -139,6 +185,34 @@ end
             use() = Bootstrapped.value() + "one"
             """)
         write(joinpath(root, "bootstrapped.txt"), "module Bootstrapped\nvalue() = 1\nend\n")
+        # A stop in the prelude of a test file a driver includes at run time is reported where
+        # the driver stops.
+        mkpath(joinpath(root, "Preluded", "src"))
+        mkpath(joinpath(root, "Preluded", "test"))
+        write(joinpath(root, "Preluded", "Project.toml"), """
+            name = "Preluded"
+            uuid = "0c5a3f2e-7d41-4b8a-9e6f-3a2b1c0d9e8f"
+            version = "0.1.0"
+            [extras]
+            Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+            [targets]
+            test = ["Test"]
+            """)
+        write(joinpath(root, "Preluded", "src", "Preluded.jl"), "module Preluded\nend\n")
+        write(joinpath(root, "Preluded", "test", "runtests.jl"), """
+            using Test
+
+            const TESTS = ["wrapped.jl"]
+
+            struct Wrapper{T<:NotDefinedAnywhere}
+                x::T
+            end
+
+            for file in (isempty(ARGS) ? TESTS : ARGS)
+                include(file)
+            end
+            """)
+        write(joinpath(root, "Preluded", "test", "wrapped.jl"), "@test Wrapper(1).x == 1\n")
         # A generator in a branch of a `@test` expression does not make JETLS run the test.
         write(joinpath(root, "outlined.jl"), """
             using Test
@@ -155,6 +229,12 @@ end
         status(name) = integration_status(result, realpath(joinpath(root, name)))
         reasons(name) = only(r.reasons for (u, r) in zip(result.units, result.results) if endswith(u.entry, name))
         @test status("missing_package.jl") === :incomplete
+        kwdef = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "kwdef.jl"))
+        @test any(f -> occursin("@ Main ", f.message), kwdef.findings)
+        @test !any(f -> occursin("JETSweepAnalysis", f.message), kwdef.findings)
+        crlf = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "crlf.jl"))
+        @test !isempty(crlf.findings) && all(f -> f.end_column <= 28, crlf.findings)
+        @test any(f -> f.line == 1 && f.end_line == 1 && f.end_column == 28, crlf.findings)
         @test status("unresolved.jl") === :incomplete
         @test status("Broken/ext/BrokenTestExt.jl") === :failed
         @test status("Broken/src/Broken.jl") === :clean
@@ -171,6 +251,14 @@ end
         @test status("bootstrap.jl") === :findings
         @test status("main_check.jl") === :findings
         @test status("loop.jl") === :findings
+        inside = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "inside.jl"))
+        @test issubset([2, 7, 10, 15], [f.line for f in inside.findings if f.code == "inference/method-error"])
+        # A test that always fails is reported in outlined code as at top level.
+        @test any(f -> f.code == "inference/failing-test" && f.line == 12, inside.findings)
+        @test status("Preluded/test/wrapped.jl") === :incomplete
+        @test reasons("Preluded/test/wrapped.jl") == reasons("Preluded/test/runtests.jl")
+        @test any(reason -> occursin("Preluded/test/runtests.jl:5 [toplevel/error]", reason),
+                  reasons("Preluded/test/wrapped.jl"))
         @test status("uses_sibling.jl") === :findings
         sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
         @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)

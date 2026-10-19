@@ -1,22 +1,24 @@
 name = "JETSweep"
 uuid = "18e08a99-dc2d-4e8e-aade-23241d8adbd6"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Azamat Berdyshev <aberdysh@gmail.com>"]
 
 [deps]
 JETLS = "a3b70258-0602-4ee2-b5a6-54c2470400db"
 LibGit2 = "76f85450-5226-5b5a-8eaa-529ad045b433"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
 [sources]
-JETLS = {rev = "64dd3587efd096ae15d04899cd465c195ed09531", url = "https://github.com/aviatesk/JETLS.jl"}
+JETLS = {rev = "88881856f97eb4750264aec5543b22b76c15dc48", url = "https://github.com/aviatesk/JETLS.jl"}
 
 [compat]
-JETLS = "=2026.10.14"
+JETLS = "=2026.10.18"
 LibGit2 = "1"
 Pkg = "1.13"
+Revise = "=3.17.3"
 SHA = "1"
 TOML = "1"
 julia = "1.13"

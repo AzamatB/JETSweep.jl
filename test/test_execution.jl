@@ -330,8 +330,15 @@ end
             (["--gpus", "0", "--gpus", "1", "a"], "--gpus given more than once"))
         @test_throws ArgumentError(message) JETSweep.parse_arguments(arguments)
     end
-    @test_throws ArgumentError JETSweep.parse_arguments(["--jobs", "many", "a"])
-    @test_throws ArgumentError JETSweep.parse_arguments(["--timeout", "soon", "a"])
+    # A value that is not a number names its option.
+    for (arguments, message) in (
+            (["--jobs", "many", "a"], "--jobs needs an integer, not \"many\""),
+            (["--jobs=1.5", "a"], "--jobs needs an integer, not \"1.5\""),
+            (["--jobs", "99999999999999999999", "a"], "--jobs needs an integer, not \"99999999999999999999\""),
+            (["--threads=two", "a"], "--threads needs an integer, not \"two\""),
+            (["--timeout", "soon", "a"], "--timeout needs a number, not \"soon\""))
+        @test_throws ArgumentError(message) JETSweep.parse_arguments(arguments)
+    end
 end
 
 "Call `f` with standard output and error redirected; return its value and both outputs."
@@ -370,6 +377,68 @@ end
         @test code == 2
         @test occursin("jobs must be positive", err)
         @test isempty(readdir(directory))
+    end
+    # A checkout that was never instantiated lacks the analyzer: a run fails before writing
+    # anything, saying how to instantiate it. A plan needs no analyzer.
+    mktempdir() do tool
+        cp(joinpath(pkgdir(JETSweep), "Project.toml"), joinpath(tool, "Project.toml"))
+        loaded = JETSweep._LOADED_PROJECT[]
+        JETSweep._LOADED_PROJECT[] = joinpath(tool, "Project.toml")
+        try
+            mktempdir() do directory
+                write(joinpath(directory, "script.jl"), "f() = 1\n")
+                code, out, err = execution_capture(() -> JETSweep.main([directory]))
+                @test code == 2
+                @test err == "jetsweep: JETSweep's project $tool is not instantiated; run " *
+                             "`julia --project=$tool -e 'using Pkg; Pkg.instantiate()'` first\n"
+                @test readdir(directory) == ["script.jl"]
+                @test first(execution_capture(() -> JETSweep.main(["--plan", "--output", joinpath(directory, "plan"),
+                                                                   directory]))) == 0
+            end
+        finally
+            JETSweep._LOADED_PROJECT[] = loaded
+        end
+    end
+end
+
+@testset "only the analyzer needs to be installed" begin
+    # Packages of JETSweep's environment that the analyzer does not depend on may be missing.
+    mktempdir() do tool
+        cp(joinpath(pkgdir(JETSweep), "Project.toml"), joinpath(tool, "Project.toml"))
+        manifest = TOML.parsefile(joinpath(pkgdir(JETSweep), "Manifest.toml"))
+        manifest["deps"]["NeverInstalled"] = [Dict{String,Any}("uuid" => "6a1a2b3c-4d5e-4f60-8a71-92b3c4d5e6f7",
+                                                               "version" => "1.0.0", "git-tree-sha1" => repeat("ab", 20))]
+        open(io -> TOML.print(io, manifest), joinpath(tool, "Manifest.toml"), "w")
+        loaded = JETSweep._LOADED_PROJECT[]
+        JETSweep._LOADED_PROJECT[] = joinpath(tool, "Project.toml")
+        try
+            @test JETSweep._require_tool() === nothing
+        finally
+            JETSweep._LOADED_PROJECT[] = loaded
+        end
+    end
+end
+
+@testset "Sweeps started in the same second get their own report directories" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        write(joinpath(root, "script.jl"), "f() = 1\n")
+        reports = joinpath(root, "reports")
+        @test JETSweep._new_directory(reports, "run") == joinpath(reports, "run")
+        @test JETSweep._new_directory(reports, "run") == joinpath(reports, "run-2")
+        touch(joinpath(reports, "run-3"))
+        @test JETSweep._new_directory(reports, "run") == joinpath(reports, "run-4")
+        @test isdir(joinpath(reports, "run-2")) && isdir(joinpath(reports, "run-4"))
+        # The default report directories of other sweeps started this minute, empty or not.
+        started = time()
+        taken = [joinpath(root, ".jetsweep", Libc.strftime("%Y%m%d-%H%M%S", started + s)) for s in 0:60]
+        foreach(path -> write(joinpath(mkpath(path), "plan.toml"), ""), taken[1:2:end])
+        foreach(mkpath, taken[2:2:end])
+        result = sweep(root; options=SweepOptions(plan_only=true), io=devnull)
+        @test result.output in taken .* "-2"
+        @test isfile(joinpath(result.output, "plan.toml"))
+        @test all(path -> read(joinpath(path, "plan.toml"), String) == "", taken[1:2:end])
+        @test all(path -> isempty(readdir(path)), taken[2:2:end])
     end
 end
 
@@ -446,6 +515,7 @@ const EXECUTION_USER_JETLS = """
     [full_analysis]
     debounce = 2.0
     auto_instantiate = "always"
+    concretization_timeout = 30
 
     [[full_analysis.concretization_patterns]]
     pattern = "const C_ = v_"
@@ -483,6 +553,8 @@ const EXECUTION_USER_JETLS = """
         base, data = execution_jetls(unit, root)
         @test base == root
         @test data["full_analysis"]["auto_instantiate"] == "never"
+        # A batch limit on evaluating each top-level statement, not the editor's 10 s.
+        @test data["full_analysis"]["concretization_timeout"] == 300.0
         @test data["diagnostic"] == Dict("enabled" => true, "all_files" => true)
         @test Set(execution_patterns(data)) == Set(pure)
         @test !haskey(data, "initialization_options")
@@ -501,6 +573,7 @@ const EXECUTION_USER_JETLS = """
         @test read(user, String) == EXECUTION_USER_JETLS
         @test data["full_analysis"]["debounce"] == 2.0
         @test data["full_analysis"]["auto_instantiate"] == "never"
+        @test data["full_analysis"]["concretization_timeout"] == 30
         patterns = execution_patterns(data)
         @test first(patterns) == ("const C_ = v_", "")
         @test Set(patterns[2:end]) == Set(pure)
@@ -532,6 +605,7 @@ const EXECUTION_USER_JETLS = """
         base, data = execution_jetls(execution_unit(script; kind=:script, setup=[setup]), root)
         @test base == root
         @test data["full_analysis"]["debounce"] == 9.0
+        @test data["full_analysis"]["concretization_timeout"] == 300.0
         @test Set(execution_patterns(data)) ==
               Set([("const N = 2 + 3", "scripts/deep/run.jl"), ("const MODE = \"fast\"", "scripts/setup.jl")])
 
@@ -600,6 +674,105 @@ end
         base, data = execution_jetls(execution_unit(driver; setup=[setup]), root)
         @test execution_concretized(data, "const DIR = @__DIR__", files, base) == [driver]
         @test execution_concretized(data, "const MODE = \"fast\"", files, base) == [setup]
+    end
+end
+
+@testset "Report directories are tagged as caches, so later sweeps skip them" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        script = execution_touch(joinpath(root, "script.jl"), "f() = 1\n")
+        earlier = sweep(root; options=SweepOptions(plan_only=true, output=joinpath(root, "reports", "a")), io=devnull)
+        @test startswith(read(joinpath(earlier.output, "CACHEDIR.TAG"), String),
+                         "Signature: 8a477f597d28d172789f06886806bc55\n")
+        # What an analysis leaves there: generated entries and prepared environments.
+        execution_touch(joinpath(earlier.output, "units", "script-1", "entry.jl"), "include($(repr(script)))\n")
+        execution_touch(joinpath(earlier.output, "environments", "1", "env", "Project.toml"), "")
+        later = sweep(root; options=SweepOptions(plan_only=true, output=joinpath(root, "reports", "b")), io=devnull)
+        @test [source.path for source in later.inventory.sources] == [script]
+        @test isempty(later.inventory.projects)
+        @test only(later.units).entry == script
+        @test isfile(joinpath(sweep(root; options=SweepOptions(plan_only=true), io=devnull).output, "CACHEDIR.TAG"))
+    end
+end
+
+@testset "A plan prints the discovery issues that fail it" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        execution_touch(joinpath(root, "Broken", "Project.toml"), "name = \"Broken\"\nuuid = \"not-a-uuid\"\n")
+        execution_touch(joinpath(root, "Broken", "src", "Broken.jl"), "module Broken\nend\n")
+        io = IOBuffer()
+        result = sweep(root; options=SweepOptions(plan_only=true, output=joinpath(root, "plan")), io)
+        @test result.exit_code == 2
+        @test occursin("\nDiscovery issue: Broken/Project.toml: invalid project UUID \"not-a-uuid\"\nPlan written to ",
+                       String(take!(io)))
+    end
+end
+
+@testset "The units of an unavailable environment point to its log, if it has one" begin
+    mktempdir() do output
+        unit = execution_unit(execution_touch(joinpath(output, "root", "script.jl")); kind=:script)
+        sweep = execution_sweep(unit, joinpath(output, "root"), output)
+        failed = JETSweep.Environment(:failed, joinpath(output, "environments", "env"), "invalid project")
+        result = JETSweep._analyze(unit, failed, sweep, nothing)
+        @test (result.status, result.reasons, result.log) == (:unavailable, ["environment unavailable: invalid project"], "")
+        @test !ispath(joinpath(output, "units"))
+        log = execution_touch(joinpath(output, "environments", JETSweep._context_key(unit.context), "log.txt"), "")
+        @test JETSweep._analyze(unit, failed, sweep, nothing).log == ""
+        write(log, "ERROR: preparation failed\n")
+        @test JETSweep._analyze(unit, failed, sweep, nothing).log == log
+    end
+end
+
+execution_script(name) = JETSweep.Unit("script-$name", :script, "/root/$name.jl", execution_context(name),
+                                       ["/root/$name.jl"], "", "", JETSweep.Overrides(), String[])
+execution_incomplete(name, status, reasons, notes=String[]; log="") =
+    JETSweep.UnitResult("script-$name", status, JETSweep.Finding[], String[], reasons, notes, 1.0, log)
+
+"Report a sweep of `/root` with these units and results; return the terminal summary and summary.txt."
+function execution_report(output, units, results)
+    inventory = JETSweep.Inventory("/root", JETSweep.Project[], JETSweep.Source[], String[], String[])
+    io = IOBuffer()
+    JETSweep.write_report(JETSweep.SweepResult("/root", output, inventory, units, results, String[], 1.0, 2); io)
+    return String(take!(io)), read(joinpath(output, "summary.txt"), String)
+end
+
+@testset "Incomplete units are grouped by cause, whichever environment's log it points to" begin
+    mktempdir() do output
+        timed_out(key) = "environment unavailable: environment preparation timed out; see $output/environments/$key/log.txt"
+        exited(key) = "environment unavailable: environment preparation exited with code 1; see /out dir/$key/log.txt"
+        units = execution_script.(["a", "b", "c", "d"])
+        results = [execution_incomplete("a", :unavailable, [timed_out("1")]),
+                   execution_incomplete("b", :unavailable, [timed_out("2")]),
+                   execution_incomplete("c", :unavailable, [exited("3")]),
+                   execution_incomplete("d", :unavailable, [exited("4")])]
+        @test JETSweep._cause(results[1]) == "environment unavailable: environment preparation timed out"
+        @test JETSweep._cause(results[3]) == "environment unavailable: environment preparation exited with code 1"
+        terminal, _ = execution_report(output, units, results)
+        @test occursin("\n    2  unavailable environment unavailable: environment preparation timed out\n" *
+                       "         a.jl, b.jl\n", terminal)
+        @test occursin("\n    2  unavailable environment unavailable: environment preparation exited with code 1\n" *
+                       "         c.jl, d.jl\n", terminal)
+    end
+end
+
+@testset "The summary shows an incomplete unit's notes with its reasons" begin
+    mktempdir() do output
+        stop = "analysis stopped at /root/report.jl:1 [toplevel/error]: JET could not execute this top-level code: " *
+               "ArgumentError: Package Humanize not found in current path.\n- Run `import Pkg; Pkg.add(\"Humanize\")`"
+        left_out = "environment: Packages imported without being declared that could not be added: Humanize " *
+                   "(downloads are disabled, and the installed packages do not satisfy this context)."
+        units = execution_script.(["report", "clean"])
+        results = [execution_incomplete("report", :incomplete, [stop], [left_out]; log="/out/units/script-report/log.txt"),
+                   execution_incomplete("clean", :clean, String[], ["environment: Precompilation timed out."])]
+        _, summary = execution_report(output, units, results)
+        @test occursin("""
+            incomplete  report.jl
+                analysis stopped at report.jl:1 [toplevel/error]: JET could not execute this top-level code: \
+            ArgumentError: Package Humanize not found in current path.
+                note: $left_out
+                log: /out/units/script-report/log.txt
+            """, summary)
+        @test !occursin("Precompilation", summary)
     end
 end
 
@@ -689,5 +862,18 @@ end
         @test JETSweep._task(package, previous).weight == JETSweep._task(slow, previous).weight == 1
         write(joinpath(root, ".jetsweep", "2", "report.toml"), "not toml [")
         @test isempty(JETSweep._previous_seconds(root))
+    end
+end
+
+@testset "a worker that exits without a result is reported with its error" begin
+    mktempdir() do directory
+        log = joinpath(directory, "log.txt")
+        @test JETSweep._worker_error(log, 1) === nothing
+        write(log, "ERROR: caught\nStacktrace:\nERROR: LoadError: ArgumentError: Cannot load Revise\nStacktrace:\n")
+        @test JETSweep._worker_error(log, 1) == ": LoadError: ArgumentError: Cannot load Revise"
+        # A signal ends a worker without an error of its own.
+        @test JETSweep._worker_error(log, 137) === nothing
+        write(log, "killed\n")
+        @test JETSweep._worker_error(log, 1) === nothing
     end
 end

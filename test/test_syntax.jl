@@ -10,7 +10,7 @@ function syntax_write(root::String, relative::String, content::String)
 end
 
 "Parse `code` as `source.jl` in a fresh directory: its directory, path and `Syntax`."
-function syntax_parse(code::String; packages=Dict{String,String}())
+function syntax_parse(code::String; packages=Dict{String,JETSweep.Project}())
     mktempdir() do directory
         dir = realpath(directory)
         file = syntax_write(dir, "source.jl", code)
@@ -129,20 +129,82 @@ end
     @test defined.syntax.notes == [syntax_dynamic(defined.file, 2)]
 end
 
-@testset "parse_source resolves pkgdir through the packages map" begin
+@testset "prelude keeps conditional imports that can load" begin
+    # A whole-module import binds names not known statically; the test file may use any.
+    driver = "using Test\n@static if VERSION >= v\"1.0\"\n    using Dates\nend\nfor f in ARGS\n    include(f)\nend\n"
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "@test year(Date(2020, 1, 1)) == 2020\n") do text, dir
+        @test occursin("using Dates", text)
+        loaded = Module()
+        Core.eval(loaded, :(include_string(@__MODULE__, $text)))
+        @test Core.eval(loaded, :(year(Date(2020, 1, 1)))) == 2020
+    end
+    # A relative import of a module the prelude does not define would fail, inside a conditional too.
+    hidden = "@eval module Helpers
+h() = 1
+end
+@static if VERSION >= v\"1.0\"\n    using .Helpers: h\nend\n" *
+             "for f in ARGS\n    include(f)\nend\n"
+    syntax_prelude("test/runtests.jl" => hidden, "test/target.jl" => "h()\n") do text, dir
+        @test !occursin("using .Helpers", text)
+        @test Core.eval(Module(), :(include_string(@__MODULE__, $text); true))
+    end
+    shown = "module Helpers
+h() = 1
+end
+@static if VERSION >= v\"1.0\"\n    using .Helpers: h\nend\n" *
+            "for f in ARGS\n    include(f)\nend\n"
+    syntax_prelude("test/runtests.jl" => shown, "test/target.jl" => "h()\n") do text, dir
+        @test occursin("using .Helpers: h", text)
+        loaded = Module()
+        Core.eval(loaded, :(include_string(@__MODULE__, $text)))
+        @test Core.eval(loaded, :(h())) == 1
+    end
+end
+
+@testset "prelude follows includes through pkgdir and pathof of the unit's package" begin
+    mktempdir() do directory
+        dir = realpath(directory)
+        driver = syntax_write(dir, "test/runtests.jl", """
+            include(joinpath(pkgdir(Dep), "test", "helpers.jl"))
+            include(joinpath(dirname(pathof(Dep)), "..", "test", "more.jl"))
+            for file in ARGS
+                include(file)
+            end
+            """)
+        syntax_write(dir, "test/helpers.jl", "helper() = 1\n")
+        syntax_write(dir, "test/more.jl", "more() = 2\n")
+        target = syntax_write(dir, "test/target.jl", "helper() + more()\n")
+        dep = JETSweep.Project(dir, joinpath(dir, "Project.toml"), "Dep", "", joinpath(dir, "src", "Dep.jl"),
+                               Dict{String,Dict{String,String}}())
+        # Without the package, the first include ends what the prelude can know.
+        @test !occursin("helper() = 1", JETSweep.prelude([driver], target))
+        text = JETSweep.prelude([driver], target; packages=Dict("Dep" => dep))
+        @test occursin("helper() = 1", text) && occursin("more() = 2", text)
+    end
+end
+
+@testset "parse_source resolves pkgdir and pathof through the packages map" begin
     root = "/depot/packages/Dep"
     code = """
         include(joinpath(pkgdir(Dep), "bootstrap.jl"))
         include(pkgdir(Dep, "src", "part.jl"))
+        include(joinpath(dirname(pathof(Dep)), "../test/object.jl"))
+        include(Base.pathof(Dep))
         include(pkgdir(Unknown, "unknown.jl"))
         include(pkgdir(Dep, name))
+        include(joinpath(dirname(pathof(Unknown)), "unknown.jl"))
+        include(pathof(Dep, "extra"))
         """
-    parsed = syntax_parse(code; packages=Dict("Dep" => root))
+    dep = JETSweep.Project(root, joinpath(root, "Project.toml"), "Dep", "", joinpath(root, "lib", "Main.jl"),
+                           Dict{String,Dict{String,String}}())
+    parsed = syntax_parse(code; packages=Dict("Dep" => dep))
     @test parsed.syntax.includes == [SyntaxInclude(joinpath(root, "bootstrap.jl"), 1, true),
                                      SyntaxInclude(joinpath(root, "src", "part.jl"), 2, true),
-                                     SyntaxInclude("", 3, true), SyntaxInclude("", 4, true)]
-    @test parsed.syntax.notes == [syntax_dynamic(parsed.file, line) for line in 3:4]
-    @test syntax_parse(code).syntax.includes == [SyntaxInclude("", line, true) for line in 1:4]
+                                     SyntaxInclude(joinpath(root, "test", "object.jl"), 3, true),
+                                     SyntaxInclude(dep.entry, 4, true),
+                                     (SyntaxInclude("", line, true) for line in 5:8)...]
+    @test parsed.syntax.notes == [syntax_dynamic(parsed.file, line) for line in 5:8]
+    @test syntax_parse(code).syntax.includes == [SyntaxInclude("", line, true) for line in 1:8]
 end
 
 @testset "parse_source follows bindings to literal paths" begin
@@ -458,6 +520,60 @@ end
             @test syntax_value(sandbox, :CHAIN_TOP) == 4
             @test syntax_call(sandbox, :body_helper) == 5 && syntax_call(sandbox, :deep_helper) == 7
             @test Base.invokelatest(isdefined, sandbox, :LOW) && Base.invokelatest(isdefined, sandbox, :HIGH)
+        end
+    end
+end
+
+@testset "prelude keeps the conditional definitions the target and kept definitions refer to" begin
+    driver = """
+        using Test
+        const NEW = VERSION >= v"1.0"
+        @static if NEW
+            static_helper(x) = x + 1
+        end
+        if VERSION >= v"1.0"
+            if_helper(x) = x + 2
+        elseif VERSION >= v"0.7"
+            if_helper(x) = x + 20
+        else
+            const IF_CONST = 1
+        end
+        uses_nested() = nested_helper()
+        @static if VERSION >= v"1.0"
+            @static if Sys.WORD_SIZE > 0
+                "A nested helper."
+                nested_helper() = 4
+            end
+        end
+        struct Wrapped end
+        if VERSION >= v"1.0"
+            Base.length(::Wrapped) = 5
+        end
+        if VERSION >= v"1.0"
+            unused_helper() = 6
+        end
+        if VERSION >= v"1.0"
+            println("conditional side effect")
+            mixed_helper() = 7
+        end
+        for file in ARGS
+            include(file)
+        end
+        """
+    target = "@test static_helper(1) + if_helper(1) + uses_nested() == 9\n@test mixed_helper() == 7\n"
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => target) do text, dir
+        @test syntax_parses(text)
+        @test occursin("@static if NEW", text) && occursin("const NEW", text)
+        @test occursin("@eval begin\nif VERSION >= v\"1.0\"\n    if_helper(x) = x + 2", text)
+        @test occursin("nested_helper() = 4", text) && occursin("Base.length(::Wrapped)", text)
+        @test !occursin("unused_helper", text) && !occursin("mixed_helper", text) && !occursin("side effect", text)
+        sandbox = syntax_load(text)
+        @test sandbox isa Module
+        if sandbox isa Module
+            @test syntax_call(sandbox, :static_helper, 1) == 2
+            @test syntax_call(sandbox, :if_helper, 1) == 3
+            @test syntax_call(sandbox, :uses_nested) == 4
+            @test Base.invokelatest(length, syntax_call(sandbox, :Wrapped)) == 5
         end
     end
 end

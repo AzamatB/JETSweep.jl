@@ -1,5 +1,12 @@
 _display(path::String, root::String) = _within(path, root) ? relpath(path, root) : path
 
+"Tag a report directory as a cache, which keeps later sweeps, and backup tools, out of it."
+write_tag(directory::String) = write(joinpath(directory, "CACHEDIR.TAG"), _CACHE_SIGNATURE, """
+
+    # This file is a cache directory tag created by JETSweep for its report directory.
+    # For information about cache directory tags, see https://bford.info/cachedir/
+    """)
+
 function write_inventory(file::String, inventory::Inventory)
     _write_toml(file, Dict(
         "root" => inventory.root,
@@ -34,6 +41,9 @@ function report_progress(io::IO, unit::Unit, result::UnitResult, done::Int, tota
             isempty(unit.extension) ? "" : " ($(unit.extension))", isempty(detail) ? "" : " — $detail")
     flush(io)
 end
+
+report_issues(io::IO, inventory::Inventory) =
+    foreach(issue -> println(io, "Discovery issue: ", _relative(issue, inventory.root)), inventory.issues)
 
 "Findings deduplicated across units, which can analyze the same file."
 function unique_findings(results::Vector{UnitResult})
@@ -91,29 +101,29 @@ function write_report(result::SweepResult; io::IO=stderr)
 end
 
 """
-Why a unit did not complete, without what differs from unit to unit: the location of a stop
-and the names in backquotes, as in "`X` must have a concrete value".
+Why a unit did not complete, without what differs from unit to unit: the location of a stop,
+the names in backquotes, as in "`X` must have a concrete value", and the log of an
+environment that failed to prepare, as in "timed out; see …/log.txt".
 """
 function _cause(result::UnitResult)
     result.status === :timeout && return "time limit exceeded"
     reason = isempty(result.reasons) ? "" : first(split(first(result.reasons), '\n'))
-    reason = replace(reason, r"^analysis stopped at .*?:\d+ \[" => "[", r"`[^`]*`" => "`…`")
+    reason = replace(reason, r"^analysis stopped at .*?:\d+ \[" => "[", r"`[^`]*`" => "`…`",
+                     r"; see .*?log\.txt" => "")
     return length(reason) > 160 ? first(reason, 159) * "…" : reason
 end
 
 function _summarize(io::IO, result::SweepResult, findings, statuses, severities, codes, unanalyzed, byid; detailed::Bool)
     root = result.root
     println(io)
-    println(io, "JETSweep analyzed $(length(result.units)) units in $(round(result.seconds; digits=1)) s: ",
-            join(("$n $status" for (status, n) in sort!(collect(statuses))), ", "))
+    println(io, "JETSweep analyzed $(length(result.units)) units in $(round(result.seconds; digits=1)) s",
+            isempty(statuses) ? "" : ": " * join(("$n $status" for (status, n) in sort!(collect(statuses))), ", "))
     println(io, length(findings), " unique diagnostics",
             isempty(findings) ? "" : ": " * join(("$n $(_severity(level))" for (level, n) in pairs(severities) if n > 0), ", "))
     for (code, n) in first(sort!(collect(codes); by=last, rev=true), 10)
         println(io, "  ", lpad(n, 6), "  ", code)
     end
-    for issue in result.inventory.issues
-        println(io, "Discovery issue: ", _relative(issue, root))
-    end
+    report_issues(io, result.inventory)
     for file in result.changed
         println(io, "Changed during the run: ", _display(file, root))
     end
@@ -123,6 +133,8 @@ function _summarize(io::IO, result::SweepResult, findings, statuses, severities,
         for r in incomplete
             println(io, rpad(String(r.status), 11), " ", name(byid[r.unit]))
             foreach(reason -> println(io, "    ", _relative(first(split(reason, '\n')), root)), r.reasons)
+            # Notes can explain the reasons, such as a stop at an import the environment left out.
+            foreach(note -> println(io, "    note: ", _relative(first(split(note, '\n')), root)), r.notes)
             isempty(r.log) || println(io, "    log: ", r.log)
         end
         isempty(unanalyzed) || println(io, "Files no complete analysis covered:")

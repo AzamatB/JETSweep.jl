@@ -158,6 +158,7 @@ end
             using Test, Tested
             include("setup.jl")
             include(joinpath(pkgdir(Tested), "test", "located.jl"))
+            include(joinpath(dirname(pathof(Tested)), "../test/found.jl"))
             @testset "grouped" include("grouped.jl")
             const TESTS = ["unit_a.jl", "unit_b.jl"]
             for file in TESTS
@@ -167,7 +168,7 @@ end
                 include("lazy.jl")
             end
             """)
-        statics = [planning_file(tested, "test/$name.jl") for name in ("setup", "located", "grouped")]
+        statics = [planning_file(tested, "test/$name.jl") for name in ("setup", "located", "found", "grouped")]
         unit_a = planning_file(tested, "test/unit_a.jl", "include(\"helpers/common.jl\")\n")
         unit_b = planning_file(tested, "test/unit_b.jl", "include(\"setup.jl\")\ninclude(\"helpers/common.jl\")\n")
         common = planning_file(tested, "test/helpers/common.jl")
@@ -205,7 +206,7 @@ end
         @test main.driver == ""
         @test main.expected == sort([driver; statics])
         @test main.context == context
-        @test main.notes == ["$driver:7: include target is only known at run time"]
+        @test main.notes == ["$driver:8: include target is only known at run time"]
         for file in [unit_a, unit_b, lazy, cycle_x, recursive]
             @test planning_unit(units, file).kind === :test
             @test planning_unit(units, file).driver == driver
@@ -290,6 +291,18 @@ end
         @test [unit.entry for unit in units] == [first(outer)]
         @test [unit.expected for unit in units] == [[leaf; inner; outer]]
         planning_invariants(inventory, units)
+    end
+end
+
+@testset "a tree without Julia files plans no units" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        @test isempty(last(planning_plan(root)))
+        planning_file(root, "README.md", "# Notes\n")
+        planning_project(root, "env")
+        inventory, units = planning_plan(root)
+        @test isempty(inventory.sources) && !isempty(inventory.projects)
+        @test isempty(units)
     end
 end
 
@@ -555,6 +568,38 @@ end
         unit = planning_unit(last(planning_plan(root)), loose)
         @test unit.overrides.args == ["--all"]
         @test unit.overrides.env == Dict("A" => "1", "B" => "2")
+    end
+end
+
+@testset "setup applies to tests and scripts, and package analyses note it does not" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        setup = planning_file(root, "setup.jl")
+        package = planning_package(root, "Pkg", "Pkg"; weakdeps=Dict("Dates" => PLANNING_DATES),
+                                   extensions=Dict("PkgDatesExt" => "Dates"))
+        entry = planning_file(package, "src/Pkg.jl", "module Pkg\nend\n")
+        extension = planning_file(package, "ext/PkgDatesExt.jl")
+        orphan = planning_file(package, "ext/Stray.jl")
+        driver = planning_file(package, "test/runtests.jl")
+        script = planning_file(package, "scripts/run.jl")
+        config = planning_file(root, ".JETSweep.toml", """
+            [[context]]
+            match = "Pkg/**"
+            setup = ["setup.jl"]
+            args = ["--fast"]
+            """)
+        inventory, units = planning_plan(root)
+        for file in (driver, script)
+            @test planning_overrides(planning_unit(units, file).overrides) == ([setup], ["--fast"], Dict{String,String}(), "")
+            @test isempty(planning_unit(units, file).notes)
+        end
+        for (file, kind) in ((entry, :package), (extension, :extension), (orphan, :orphan))
+            unit = planning_unit(units, file)
+            @test unit.kind === kind
+            @test planning_overrides(unit.overrides) == (String[], ["--fast"], Dict{String,String}(), "")
+            @test unit.notes == ["$config: setup does not apply to $kind analysis, which loads the package itself"]
+        end
+        planning_invariants(inventory, units)
     end
 end
 
