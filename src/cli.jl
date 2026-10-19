@@ -16,17 +16,18 @@ const HELP = """
                           `/` or `./`, matches paths relative to DIRECTORY, others any segment
       --include-ignored   Include files Git ignores
       --tracked-only      Include only files Git tracks
-      --offline           Use only packages already installed
+      --offline           Resolve among installed package versions; download nothing
       --plan              Write the inventory and analysis plan without analyzing
       --fail-on LEVEL     Lowest severity that fails: error, warning, info, hint or none
                           (default: hint)
       --version           Show the version
-      --help              Show this help
+      -h, --help          Show this help
 
     Exit status: 0 when every analysis completed without diagnostics at or above the
-    --fail-on level, 1 when some did, 2 when an analysis is incomplete or failed, a project's
-    metadata is broken, an input changed during the run or the arguments are invalid, and 130
-    when interrupted.
+    --fail-on level, 1 when some did, 2 when an analysis is incomplete or failed, discovery
+    reported an issue (an unreadable directory or Git repository, or broken project
+    metadata), an input changed during the run, or the arguments or configuration are
+    invalid, and 130 when interrupted.
 
     Analysis loads packages and runs their top-level code, macros and generated functions;
     use JETSweep only on code you trust.
@@ -78,8 +79,8 @@ function parse_arguments(arguments::Vector{String})
 end
 
 function (@main)(arguments::Vector{String})::Cint
-    arguments in (["--help"], ["-h"]) && (print(stdout, HELP); return 0)
-    arguments == ["--version"] && (println(stdout, "JETSweep ", pkgversion(@__MODULE__)); return 0)
+    any(in(("--help", "-h")), arguments) && (print(stdout, HELP); return 0)
+    "--version" in arguments && (println(stdout, "JETSweep ", pkgversion(@__MODULE__)); return 0)
     try
         directory, options = parse_arguments(arguments)
         return sweep(directory; options).exit_code

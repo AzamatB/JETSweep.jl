@@ -23,13 +23,12 @@ write_plan(file::String, units::Vector{Unit}, root::String) =
     _write_toml(file, Dict("root" => root, "units" => _unit_dict.(units)))
 
 function report_progress(io::IO, unit::Unit, result::UnitResult, done::Int, total::Int, root::String)
-    width = ndigits(total)
     detail = if !complete(result)
-        isempty(result.reasons) ? "" : first(split(first(result.reasons), '\n'))
+        isempty(result.reasons) ? "" : _relative(first(split(first(result.reasons), '\n')), root)
     else
         isempty(result.findings) ? "" : "$(length(result.findings)) diagnostics"
     end
-    println(io, "[", lpad(done, width), "/", total, "] ", rpad(String(result.status), 11),
+    println(io, "[", done, "/", total, "] ", rpad(String(result.status), 11),
             lpad(string(round(result.seconds; digits=1), "s"), 7), "  ", _display(unit.entry, root),
             isempty(unit.extension) ? "" : " ($(unit.extension))", isempty(detail) ? "" : " — $detail")
     flush(io)
@@ -47,18 +46,21 @@ function exit_code(inventory::Inventory, results::Vector{UnitResult}, changed::V
     return any(f -> f.severity <= threshold, unique_findings(results)) ? 1 : 0
 end
 
-const _SEVERITY_NAMES = ("error", "warning", "info", "hint")
+_severity(level::Integer) = String(SEVERITIES[level])
+
+"Text with paths below `root` shown relative to it."
+_relative(text::AbstractString, root::String) = replace(text, root * "/" => "")
 
 function write_report(result::SweepResult; io::IO=stderr)
     root = result.root
     findings = unique_findings(result.results)
     statuses = Dict{String,Int}()
     foreach(r -> statuses[String(r.status)] = get(statuses, String(r.status), 0) + 1, result.results)
-    severities = [count(f -> f.severity == s, findings) for s in 1:4]
+    severities = [count(f -> f.severity == level, findings) for level in eachindex(SEVERITIES)]
     codes = Dict{String,Int}()
     foreach(f -> codes[f.code] = get(codes, f.code, 0) + 1, findings)
     analyzed = Set(file for r in result.results if complete(r) for file in r.analyzed)
-    unanalyzed = sort!([s.path for s in result.inventory.sources if !(realpath(s.path) in analyzed)])
+    unanalyzed = sort!([s.path for s in result.inventory.sources if !(s.path in analyzed)])
     byid = Dict(unit.id => unit for unit in result.units)
     _write_toml(joinpath(result.output, "report.toml"), Dict(
         "root" => root, "julia" => string(VERSION), "jetsweep" => string(pkgversion(@__MODULE__)),
@@ -70,12 +72,12 @@ function write_report(result::SweepResult; io::IO=stderr)
                            "status" => String(r.status), "seconds" => r.seconds, "findings" => length(r.findings),
                            "reasons" => r.reasons, "notes" => r.notes, "log" => r.log) for r in result.results],
         "findings" => [Dict("file" => f.file, "line" => f.line, "column" => f.column, "end_line" => f.end_line,
-                            "end_column" => f.end_column, "severity" => _SEVERITY_NAMES[f.severity],
+                            "end_column" => f.end_column, "severity" => _severity(f.severity),
                             "code" => f.code, "message" => f.message) for f in findings]))
     open(joinpath(result.output, "summary.txt"), "w") do summary
         for finding in findings
             println(summary, _display(finding.file, root), ':', finding.line, ':', finding.column, ": ",
-                    _SEVERITY_NAMES[finding.severity], " [", finding.code, "]")
+                    _severity(finding.severity), " [", finding.code, "]")
             for line in eachsplit(finding.message, '\n')
                 println(summary, "    ", line)
             end
@@ -87,34 +89,52 @@ function write_report(result::SweepResult; io::IO=stderr)
     return nothing
 end
 
+"Why a unit did not complete, without the locations that differ from unit to unit."
+function _cause(result::UnitResult)
+    result.status === :timeout && return "time limit exceeded"
+    reason = isempty(result.reasons) ? "" : first(split(first(result.reasons), '\n'))
+    stop = match(r"^analysis stopped at .* \[([^\]]+)\]", reason)
+    stop === nothing || return "analysis stopped [$(stop[1])]"
+    return length(reason) > 160 ? first(reason, 159) * "…" : reason
+end
+
 function _summarize(io::IO, result::SweepResult, findings, statuses, severities, codes, unanalyzed, byid; detailed::Bool)
     root = result.root
     println(io)
     println(io, "JETSweep analyzed $(length(result.units)) units in $(round(result.seconds; digits=1)) s: ",
             join(("$n $status" for (status, n) in sort!(collect(statuses))), ", "))
     println(io, length(findings), " unique diagnostics",
-            isempty(findings) ? "" : ": " * join(("$n $(_SEVERITY_NAMES[s])" for (s, n) in pairs(severities) if n > 0), ", "))
+            isempty(findings) ? "" : ": " * join(("$n $(_severity(level))" for (level, n) in pairs(severities) if n > 0), ", "))
     for (code, n) in first(sort!(collect(codes); by=last, rev=true), 10)
         println(io, "  ", lpad(n, 6), "  ", code)
     end
     for issue in result.inventory.issues
-        println(io, "Discovery issue: ", issue)
+        println(io, "Discovery issue: ", _relative(issue, root))
     end
     for file in result.changed
         println(io, "Changed during the run: ", _display(file, root))
     end
-    for r in result.results
-        complete(r) && continue
-        unit = byid[r.unit]
-        println(io, rpad(String(r.status), 11), " ", _display(unit.entry, root),
-                isempty(unit.extension) ? "" : " ($(unit.extension))")
-        for reason in (detailed ? r.reasons : first(r.reasons, 1))
-            line = first(split(reason, '\n'))
-            println(io, "    ", detailed ? line : first(line, 200))
+    name(unit) = _display(unit.entry, root) * (isempty(unit.extension) ? "" : " ($(unit.extension))")
+    incomplete = filter(!complete, result.results)
+    if detailed
+        for r in incomplete
+            println(io, rpad(String(r.status), 11), " ", name(byid[r.unit]))
+            foreach(reason -> println(io, "    ", _relative(first(split(reason, '\n')), root)), r.reasons)
+            isempty(r.log) || println(io, "    log: ", r.log)
         end
-        detailed && !isempty(r.log) && println(io, "    log: ", r.log)
+        isempty(unanalyzed) || println(io, "Files no complete analysis covered:")
+        foreach(file -> println(io, "    ", _display(file, root)), unanalyzed)
+    else
+        groups = Dict{Tuple{Symbol,String},Vector{UnitResult}}()
+        foreach(r -> push!(get!(groups, (r.status, _relative(_cause(r), root)), UnitResult[]), r), incomplete)
+        for ((status, cause), members) in sort!(collect(groups); by=group -> -length(last(group)))
+            println(io, lpad(length(members), 5), "  ", rpad(String(status), 11), " ", cause)
+            examples = join((name(byid[r.unit]) for r in first(members, 3)), ", ")
+            println(io, "         ", examples, length(members) > 3 ? ", and $(length(members) - 3) more" : "")
+        end
+        isempty(unanalyzed) || println(io, length(unanalyzed), length(unanalyzed) == 1 ? " file" : " files",
+                                       " not covered by a complete analysis; see the summary")
     end
-    isempty(unanalyzed) || println(io, length(unanalyzed), " files were not covered by a complete analysis")
     println(io, "Report: ", joinpath(result.output, "report.toml"))
     println(io, "Summary: ", joinpath(result.output, "summary.txt"))
     return nothing

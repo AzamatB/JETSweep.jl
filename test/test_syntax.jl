@@ -24,13 +24,13 @@ function syntax_targets(code::String)
     return [isempty(i.target) ? "" : relpath(i.target, parsed.dir) for i in parsed.syntax.includes]
 end
 
-"Write `files` under a fresh directory and call `f(prelude, dir)` for `driver` and `target`."
+"Write `files` under a fresh directory and call `f(prelude, dir)` for `drivers` and `target`."
 function syntax_prelude(f, files::Pair{String,String}...;
-                        driver="test/runtests.jl", target="test/target.jl")
+                        drivers=["test/runtests.jl"], target="test/target.jl")
     mktempdir() do directory
         dir = realpath(directory)
         foreach(((path, code),) -> syntax_write(dir, path, code), files)
-        return f(JETSweep.prelude(joinpath(dir, driver), joinpath(dir, target)), dir)
+        return f(JETSweep.prelude(joinpath.(dir, drivers), joinpath(dir, target)), dir)
     end
 end
 
@@ -470,7 +470,10 @@ end
         include("missing.jl")
         include("helpers.jl")
         @testset "all" begin
-            include("testset_only.jl")
+            include("testset.jl")
+        end
+        function later()
+            include("function_only.jl")
         end
         for file in ("loop_only.jl",)
             include(file)
@@ -485,13 +488,16 @@ end
              "test/block_helpers.jl" => "from_block() = 1\n",
              "test/group.jl" => "from_group() = 1\ninclude(\"target.jl\")\n",
              "test/target.jl" => "from_target() = 1\n",
-             "test/testset_only.jl" => "from_testset() = 1\n",
+             "test/testset.jl" => "from_testset() = 1\n",
+             "test/function_only.jl" => "from_function() = 1\n",
              "test/loop_only.jl" => "from_loop() = 1\n")
     syntax_prelude(files...) do text, dir
         names = syntax_names(text)
         @test syntax_parses(text)
-        @test [:from_helpers, :from_cycle, :from_nested, :from_plain_helpers, :from_block, :from_group] ⊆ names
-        @test isdisjoint(names, [:from_target, :from_testset, :from_loop])
+        # Included files run at top level wherever the call is, as in a `@testset`.
+        @test [:from_helpers, :from_cycle, :from_nested, :from_plain_helpers, :from_block, :from_group,
+               :from_testset] ⊆ names
+        @test isdisjoint(names, [:from_target, :from_function, :from_loop])
         @test count("from_helpers()", text) == 1
         @test :from_const_helpers in names
     end
@@ -523,6 +529,10 @@ end
         tests = joinpath(dir, "test")
         @test syntax_parses(text)
         @test !occursin("@__DIR__", text) && !occursin("@__FILE__", text)
+        # Analysis always evaluates `@eval`, which the generated file needs for its pure
+        # assignments, since concretization patterns cannot apply to it.
+        @test occursin("@eval const DATA_DIR = joinpath(DRIVER_DIR, \"data\")", text)
+        @test !occursin("@eval data_path", text)
         sandbox = syntax_load(text)
         @test sandbox isa Module
         if sandbox isa Module
@@ -692,17 +702,117 @@ end
         const INNER = 1 + 2
         end
         const DATA_ = 4
+        const STALE = value * 2
         f(x) = x + 1
         """
     @test syntax_patterns(code) == [
         "const ROOT = normpath(joinpath(@__DIR__, \"..\", \"..\"))", "const POLY = [(0.0, 0.0), (1.0, 0.5)]",
         "const PORT = length(POLY) + 1", "const NAMES = (imin = \"inlet\", imax = \"outlet\")",
         "const ALIAS = LinearAlgebra", "const STATS = Stats.mean", "const LOW, HIGH = 1, 2", "value = 3",
-        "DIR = @__DIR__", "if !@isdefined(GUARDED)\n    const GUARDED = LinearAlgebra\nend", "const INNER = 1 + 2"]
-    # A pattern matches its statement exactly, so JETLS evaluates nothing else.
+        "DIR = @__DIR__", "if !@isdefined(GUARDED)\n    const GUARDED = LinearAlgebra\nend", "const INNER = 1 + 2",
+        "const DATA_ = 4"]
     for pattern in syntax_patterns(code)
         @test Meta.parse(pattern) isa Expr
     end
+end
+
+@testset "concretization_patterns evaluates run-dependent values only where analysis needs them" begin
+    code = """
+        outdir = ARGS[1]
+        mesh, case = ARGS
+        const KEY = ENV["HOME"]
+        const LEVEL = isempty(ARGS) ? 1 : 2
+        level_method(::Val{LEVEL}) = 1
+        const ASKED = isempty(ARGS) ? split(get(ENV, "TESTS", ""), ","; keepempty=false) : ARGS
+        # JETLS evaluates a condition to define the closures in its branches, and then
+        # does not define those in the branch not taken, unless the whole statement is evaluated.
+        const RUN = isempty(ASKED) ? FILES : filter(f -> f in ASKED, FILES)
+        const PICKED = isempty(ASKED) ? ["a"] : filter(f -> f in ASKED, ["a"])
+        const SKIP = get(ENV, "SKIP", "")
+        skipped() = SKIP
+        """
+    @test syntax_patterns(code) == ["const LEVEL = isempty(ARGS) ? 1 : 2",
+        "const ASKED = isempty(ARGS) ? split(get(ENV, \"TESTS\", \"\"), \",\"; keepempty=false) : ARGS",
+        "const PICKED = isempty(ASKED) ? [\"a\"] : filter(f -> f in ASKED, [\"a\"])"]
+end
+
+@testset "concretization_patterns forgets values that other code may change" begin
+    code = """
+        errs = Float64[]
+        for i in 1:3
+            push!(errs, i)
+        end
+        ratio = errs[1] / errs[2]
+        const SEEN = Int[]
+        note(h) = push!(SEEN, h)
+        sparse = first(SEEN)
+        const TABLE = Dict{String,Int}()
+        TABLE["a"] = 1
+        const COUNT = length(TABLE)
+        fld = open(read, "data.bin")
+        mesh = joinpath("meshes", "mesh_\$(fld.yaw).jls")
+        range(a, b) = (println("range"); a:b)
+        const R = range(1, 3)
+        const S = Base.range(1, 3)
+        helper() = 1
+        const H = helper
+        const MAPPED = map(helper, 1:3)
+        const W = map(x -> x + 1, 1:3)
+        """
+    @test syntax_patterns(code) == ["errs = Float64[]", "const SEEN = Int[]", "const TABLE = Dict{String,Int}()",
+                                    "const S = Base.range(1, 3)", "const W = map(x -> x + 1, 1:3)"]
+end
+
+@testset "concretization_patterns takes blocks and conditionals whole, as JETLS matches them" begin
+    code = """
+        begin
+            const ROOT = dirname(@__DIR__)
+            names = collect(1:3)
+        end
+        begin
+            const A = 1
+            y = rand()
+        end
+        const DATA = joinpath(ROOT, "data")
+        const AFTER_A = A + 1
+        if Sys.iswindows()
+            const EXT = ".exe"
+        else
+            const EXT = ""
+        end
+        const BIN = "tool" * EXT
+        if Sys.iswindows()
+            const ONLY_WINDOWS = 1
+        end
+        const READ_ONLY_WINDOWS = ONLY_WINDOWS + 1
+        """
+    @test syntax_patterns(code) == [
+        "begin\n    const ROOT = dirname(@__DIR__)\n    names = collect(1:3)\nend", "const DATA = joinpath(ROOT, \"data\")",
+        "if Sys.iswindows()\n    const EXT = \".exe\"\nelse\n    const EXT = \"\"\nend", "const BIN = \"tool\" * EXT",
+        "if Sys.iswindows()\n    const ONLY_WINDOWS = 1\nend", "const READ_ONLY_WINDOWS = ONLY_WINDOWS + 1"]
+end
+
+@testset "concretization_patterns leaves out patterns that would match other statements" begin
+    # MacroTools matches structurally, with names such as `x_` and `@__DIR__` as wildcards.
+    code = """
+        x = rand(3)
+        n = length(x)
+        x = [1.0, 2.0]
+        n = length(x)
+        const D = @__DIR__
+        const D = @something(nothing, 1)
+        A_ = 1
+        const B = A_ + 1
+        const B = rand() + 1
+        const ANY_ = 4
+        const LAST = 4
+        """
+    # `const ANY_ = 4` matches `const LAST = 4` too, which is evaluated anyway.
+    @test syntax_patterns(code) == ["x = [1.0, 2.0]", "A_ = 1", "const ANY_ = 4", "const LAST = 4"]
+    @test JETSweep._may_match(:(const D = @__DIR__), :(const D = @anything(1, 2)))
+    @test JETSweep._may_match(:(const X_ = 4), :(const Y = 4))
+    @test !JETSweep._may_match(:(const X = 4), :(const Y = 4))
+    @test JETSweep._may_match(Expr(:block, :(a = 1)), :(a = 1))
 end
 
 @testset "concretization_patterns of a test driver evaluates its file selection" begin
@@ -718,16 +828,16 @@ end
             end
         end
         """
-    @test syntax_patterns(driver) == ["const FILES = [\"test_a.jl\", \"test_b.jl\"]"]
-    @test syntax_patterns(driver; selection=true) == [
-        "const FILES = [\"test_a.jl\", \"test_b.jl\"]",
+    selected = ["const FILES = [\"test_a.jl\", \"test_b.jl\"]",
         "const ASKED = isempty(ARGS) ? split(get(ENV, \"TESTS\", \"\"), \",\"; keepempty = false) : ARGS",
         "const RUN = isempty(ASKED) ? FILES : filter(in(ASKED), FILES)"]
-    mktempdir() do directory
-        file = syntax_write(realpath(directory), "runtests.jl", driver)
-        @test JETSweep.include_selectors(file) == Set([:FILES, :ASKED, :RUN])
-    end
+    @test syntax_patterns(driver) == selected
+    @test syntax_patterns(driver; selection=true) == selected
+    # With `selection`, what an include needs is evaluated even when not pure.
+    listing = "const FILES = list_tests()\nfor file in FILES\n    include(file)\nend\n"
+    @test syntax_patterns(listing) == String[]
+    @test syntax_patterns(listing; selection=true) == ["const FILES = list_tests()"]
     # Includes inside functions run only when called, so nothing selects them statically.
-    @test syntax_patterns("const FILES = readdir()\nrun(f) = include(f)\nforeach(run, FILES)\n"; selection=true) ==
+    @test syntax_patterns("const FILES = list_tests()\nrun(f) = include(f)\nforeach(run, FILES)\n"; selection=true) ==
           String[]
 end

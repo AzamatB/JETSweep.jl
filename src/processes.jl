@@ -49,9 +49,9 @@ end
 
 function _terminate_all()
     processes = @lock _ACTIVE_LOCK collect(_ACTIVE)
-    for (pid, process) in processes
-        _terminate(process, pid)
-    end
+    # Signal every group before waiting for any.
+    Sys.isunix() && foreach(((pid, _),) -> ccall(:kill, Cint, (Cint, Cint), -pid, Base.SIGTERM), processes)
+    foreach(((pid, process),) -> _terminate(process, pid), processes)
 end
 
 """

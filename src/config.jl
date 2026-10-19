@@ -27,7 +27,7 @@ function _strings(value, key::String, file::String)
 end
 
 "An absolute, normalized path without a trailing separator."
-_absolute(base::String, path::String) = (path = normpath(abspath(base, path)); length(path) > 1 ? rstrip(path, '/') : path)
+_absolute(base::String, path::String) = (path = normpath(abspath(base, path)); length(path) > 1 ? String(rstrip(path, '/')) : path)
 
 """
     read_config(root, file="") -> Config

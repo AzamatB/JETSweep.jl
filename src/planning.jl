@@ -37,13 +37,16 @@ function _entries(files::Vector{String}, syntax::Dict{String,Syntax})
     return entries
 end
 
-"The nearest `runtests.jl` above `file` within its package's test directory."
-function _driver(file::String, owner::String, sources::Dict{String,Source})
+"""
+The test driver that runs `file`: the nearest `runtests.jl` above it within its package's
+test directory, or the driver unit covering that file when another driver includes it.
+"""
+function _driver(file::String, owner::String, covering::Dict{String,String})
     tests = joinpath(owner, "test")
     directory = dirname(file)
     while _within(directory, tests)
         candidate = joinpath(directory, "runtests.jl")
-        candidate != file && haskey(sources, candidate) && return candidate
+        candidate != file && haskey(covering, candidate) && return covering[candidate]
         directory == tests && break
         directory = dirname(directory)
     end
@@ -64,8 +67,14 @@ function _test_context(owner::String)
     return Context(project, owner, true, Dict{String,String}())
 end
 
+"The include facts of every inventoried source."
+source_syntax(inventory::Inventory) =
+    let projects = Dict(project.dir => project for project in inventory.projects)
+        Dict(source.path => parse_source(source.path, _package_dirs(source, projects)) for source in inventory.sources)
+    end
+
 """
-    plan(inventory, config=Config()) -> Vector{Unit}
+    plan(inventory, config=Config(); syntax=source_syntax(inventory)) -> Vector{Unit}
 
 Partition the inventory into analysis units:
 
@@ -73,19 +82,18 @@ Partition the inventory into analysis units:
   for a package also its other `src/` files: those loading leaves out become orphan units
   during the sweep;
 - each package's `test/runtests.jl`, covering the files analysis follows from it, and
-  every other test file as its own unit after a prelude of the driver's definitions;
+  every other test file as its own unit after a prelude of the definitions of the drivers
+  that run it;
 - scripts, grouped by the files they include, in their nearest environment; a package's
   own scripts use its test environment;
 - extension sources no extension includes, with the package's bindings in scope.
 
 Includes are found by parsing, without executing any code.
 """
-function plan(inventory::Inventory, config::Config=Config())::Vector{Unit}
+function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String,Syntax}=source_syntax(inventory))::Vector{Unit}
     root = inventory.root
     sources = Dict(source.path => source for source in inventory.sources)
     projects = Dict(project.dir => project for project in inventory.projects)
-    syntax = Dict(source.path => parse_source(source.path, _package_dirs(source, projects))
-                  for source in inventory.sources)
     notes(files) = sort!(unique!(reduce(vcat, (syntax[file].notes for file in files if haskey(syntax, file)); init=String[])))
     units = Unit[]
     covered = Set{String}()
@@ -114,6 +122,9 @@ function plan(inventory::Inventory, config::Config=Config())::Vector{Unit}
 
     # Test files are analyzed in their package's test environment. Each package's
     # runtests.jl comes first, so the files it includes statically need no units of their own.
+    # A nested runtests.jl that one of them includes statically is part of its unit; another
+    # is a driver unit run by the nearest one above it.
+    covering = Dict{String,String}()
     tests = Dict{String,Vector{String}}()
     for source in inventory.sources
         source.path in covered && continue
@@ -125,10 +136,12 @@ function plan(inventory::Inventory, config::Config=Config())::Vector{Unit}
         context = _test_context(owner)
         for driver in sort!(filter(file -> basename(file) == "runtests.jl", files); by=length)
             driver in covered && continue
-            add!(:test, driver, context, filter(file -> !(file in covered), _reach(driver, syntax; followed_only=true)))
+            expected = filter(file -> !(file in covered), _reach(driver, syntax; followed_only=true))
+            add!(:test, driver, context, expected; driver=_driver(driver, owner, covering))
+            foreach(file -> covering[file] = driver, expected)
         end
         for (entry, expected) in _entries(filter(file -> !(file in covered), files), syntax)
-            add!(:test, entry, context, expected; driver=_driver(entry, owner, sources))
+            add!(:test, entry, context, expected; driver=_driver(entry, owner, covering))
         end
     end
 

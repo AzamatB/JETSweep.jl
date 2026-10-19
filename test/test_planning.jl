@@ -179,6 +179,14 @@ end
         plain_driver = planning_file(plain, "test/runtests.jl", "include(\"basic.jl\")\n")
         basic = planning_file(plain, "test/basic.jl")
 
+        # A nested driver included statically is part of its outer driver's unit.
+        nested = planning_package(root, "Nested", "Nested")
+        planning_file(nested, "src/Nested.jl", "module Nested\nend\n")
+        nested_driver = planning_file(nested, "test/runtests.jl",
+                                      "@testset \"all\" begin\n    include(\"core/runtests.jl\")\nend\n")
+        core_driver = planning_file(nested, "test/core/runtests.jl", "for file in ARGS\n    include(file)\nend\n")
+        core_test = planning_file(nested, "test/core/test_x.jl")
+
         driverless = planning_package(root, "Driverless", "Driverless")
         planning_file(driverless, "src/Driverless.jl", "module Driverless\nend\n")
         driverless_environment = planning_project(driverless, "test"; file="JuliaProject.toml")
@@ -203,8 +211,9 @@ end
         @test planning_unit(units, cycle_x).expected == [cycle_x, cycle_y]
         @test planning_unit(units, recursive).expected == [recursive]
         @test isdisjoint(planning_entries(units), vcat(common, cycle_y, statics))
+        # A nested driver the outer one does not include statically runs under it.
         @test planning_unit(units, sub_driver).kind === :test
-        @test planning_unit(units, sub_driver).driver == ""
+        @test planning_unit(units, sub_driver).driver == driver
         @test planning_unit(units, sub_driver).expected == [sub_driver]
         @test planning_unit(units, sub_driver).context == context
         @test length(unique(unit.context for unit in units if unit.context.owner == tested)) == 2
@@ -216,6 +225,9 @@ end
         @test planning_unit(units, plain_driver).expected == sort([plain_driver, basic])
         @test planning_unit(units, plain_driver).context == planning_context(plain, plain, true)
         @test !(basic in planning_entries(units))
+        @test planning_unit(units, nested_driver).expected == [core_driver, nested_driver]
+        @test !(core_driver in planning_entries(units))
+        @test planning_unit(units, core_test).driver == nested_driver
         @test planning_unit(units, only_test).kind === :test
         @test planning_unit(units, only_test).driver == ""
         @test planning_unit(units, only_test).context == planning_context(driverless_environment, driverless, true)

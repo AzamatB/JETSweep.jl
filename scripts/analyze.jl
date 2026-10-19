@@ -11,9 +11,29 @@ using JETLS, TOML
 
 const LS = Base.require(JETLS, :JETLSCore)
 
-# Codes after which JETLS analyzes no further code of the unit.
+# JET outlines a test expression into a thunk when it defines an anonymous function in a
+# conditional branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, because realizing a
+# closure there concretely executes the conditions before it: the test itself, in JET's
+# interpreter. Generators and comprehensions define closures too, so treat them alike;
+# otherwise `@test r.ok && [a.b for a in r.items] == [1]` runs whatever computes `r`.
+Core.eval(LS.JET, quote
+    function is_anonymous_test_function(@nospecialize(ex))
+        isexpr(ex, (:->, :generator, :flatten, :comprehension, :typed_comprehension)) && return true
+        isexpr(ex, :function, 2) || return false
+        sig = first(ex.args)
+        while isexpr(sig, (:(::), :where)) && !isempty(sig.args)
+            sig = first(sig.args)
+        end
+        return isexpr(sig, :tuple)
+    end
+end)
+# JETLS dispatches in the world it was loaded in, to stay clear of analyzed code.
+LS.advance_server_world!()
+
+# Codes after which JETLS analyzes no further code of the unit. JET stops at any parse
+# error, which JETLS reports only as a syntax diagnostic.
 const STOPS = ("toplevel/error", "toplevel/missing-concretization", "toplevel/concretization-timeout",
-               "toplevel/analysis-stopped")
+               "toplevel/analysis-stopped", "syntax/parse-error")
 
 """
 Collects error-level log records. The analyzer's errors signal analysis problems it does not
@@ -45,25 +65,25 @@ end
 
 canonical(path::AbstractString) = ispath(path) ? realpath(path) : abspath(path)
 
-"Load a package, an extension's parent and triggers, and return the module to analyze."
+"Load a package, or an extension with its parent and triggers, and return its module."
 function load(request, log::ErrorLog)
     package = Base.PkgId(Base.UUID(request["uuid"]), request["package"])
     parent = Base.require(package)
     # Revise resolves a file's outer `module` block by name; bind the loaded module so a
     # single-file package is not attributed to `Base.__toplevel__`.
     bind(parent)
-    request["kind"] == "extension" || return parent
-    for (name, uuid) in sort!(collect(request["triggers"]); by=first)
-        Base.require(Base.PkgId(Base.UUID(uuid), name))
-    end
     name = request["extension"]
+    isempty(name) && return parent
+    for (trigger, uuid) in sort!(collect(request["triggers"]); by=first)
+        Base.require(Base.PkgId(Base.UUID(uuid), trigger))
+    end
     # A failed extension can still be registered, half defined, so check the loader's log.
     failure = findfirst(text -> occursin("extension $name ", text), log.loading)
     failure === nothing || error("extension $name failed to load: ", log.loading[failure])
     extension = Base.get_extension(parent, Symbol(name))
     extension isa Module || error("extension $name did not load with its triggers")
-    canonical(something(pathof(extension), "")) == canonical(request["entry"]) ||
-        error("extension $(request["extension"]) loaded from $(pathof(extension)), not $(request["entry"])")
+    request["kind"] == "extension" && canonical(something(pathof(extension), "")) != canonical(request["entry"]) &&
+        error("extension $name loaded from $(pathof(extension)), not $(request["entry"])")
     bind(extension)
     return extension
 end
@@ -78,10 +98,14 @@ end
 
 """
 An entry file that recreates the scope of `parent` before including `file`: the modules it
-uses and every binding it defines or imports.
+uses and every binding it defines or imports. A used module is named through `parent` when
+`parent` binds it, since its package need not be loadable from the environment by name: a
+dependency of a dependency, say.
 """
 function orphan_entry(parent::Module, file::String)
-    usings = [join(fullname(m), '.') for m in ccall(:jl_module_usings, Any, (Any,), parent)
+    path(m) = isdefined(parent, nameof(m)) && getglobal(parent, nameof(m)) === m ?
+        "$(nameof(parent)).$(nameof(m))" : join(fullname(m), '.')
+    usings = [path(m) for m in ccall(:jl_module_usings, Any, (Any,), parent)
               if m !== Base && m !== Core && m !== parent && first(fullname(m)) !== :Main]
     bindings = filter(names(parent; all=true, imported=true)) do name
         Base.isidentifier(name) && !startswith(String(name), '#') && !(name in (:eval, :include)) &&
@@ -170,12 +194,12 @@ function analyze(request, log::ErrorLog)
     # context by its path from `Main`.
     LS.FULL_ANALYSIS_CONTEXT[] = Core.eval(Main, :(module JETSweepAnalysis end))
     target = nothing
-    generated = canonical(request["generated"])
     if kind in ("package", "extension", "orphan")
         target = load(request, log)
         timings["load"] = time() - started
-        kind == "orphan" && (write(generated, orphan_entry(target, request["entry"])); target = nothing)
+        kind == "orphan" && (write(request["generated"], orphan_entry(target, request["entry"])); target = nothing)
     end
+    generated = canonical(request["generated"])
     cd(dirname(request["entry"]))
     server = LS.start_cli_server(request["config"])
     server.state.root_path = request["root"]
@@ -198,34 +222,32 @@ function analyze(request, log::ErrorLog)
         timings["analysis"] = mark - started - get(timings, "load", 0.0)
         info = LS.get_analysis_info(server.state.analysis_manager, uri)
         info isa LS.AnalysisResult || error("JETLS produced no analysis result: $(typeof(info))")
+        files = [canonical(file) for file in (LS.uri2filepath(uri) for uri in keys(info.analyzed_file_infos))
+                 if file !== nothing]
         uris = LS.collect_workspace_uris(server)
         diagnostics = LS.get_full_diagnostics(server)
         if target !== nothing
-            files = [file for file in (LS.uri2filepath(uri) for uri in keys(info.analyzed_file_infos)) if file !== nothing]
             LS.toplevel_warning_reports_to_diagnostics!(diagnostics, abstract_fields(target, files), server,
                                                         LS.JET.PostProcessor())
         end
         progress = LS.ProgressContext(LS.PROGRESS_NONE, stderr)
         LS.run_per_file_diagnostics!(diagnostics, uris, server, request["root"], progress; skip_analysis=false)
-        for (uri, list) in diagnostics
-            LS.apply_diagnostic_config!(list, server.state.config_manager, uri, request["root"])
-        end
-        timings["lowering"] = time() - mark
-        analyzed = sort!([canonical(file) for file in (LS.uri2filepath(uri) for uri in keys(info.analyzed_file_infos))
-                          if file !== nothing && canonical(file) != generated])
-        rows = findings(diagnostics, generated)
+        # Before the user's severity configuration applies, which could turn the stops off.
         reasons = String[]
         for (uri, list) in diagnostics, diagnostic in list
             code = string(something(diagnostic.code, ""))
             code in STOPS || continue
-            file = something(LS.uri2filepath(uri), string(uri))
-            location = canonical(file) == generated ? "the generated context" : "$file:$(diagnostic.range.start.line + 1)"
+            location = "$(something(LS.uri2filepath(uri), string(uri))):$(diagnostic.range.start.line + 1)"
             push!(reasons, "analysis stopped at $location [$code]: " *
                 first(split(LS.get_raw_message(diagnostic), '\n')))
         end
-        missing = filter(file -> !(canonical(file) in analyzed), request["expected"])
-        return Dict{String,Any}("analyzed" => analyzed, "findings" => rows, "reasons" => unique!(reasons),
-                                "missing" => missing, "timings" => timings)
+        for (uri, list) in diagnostics
+            LS.apply_diagnostic_config!(list, server.state.config_manager, uri, request["root"])
+        end
+        timings["lowering"] = time() - mark
+        return Dict{String,Any}("analyzed" => sort!(filter(!=(generated), files)),
+                                "findings" => findings(diagnostics, generated), "reasons" => unique!(reasons),
+                                "timings" => timings)
     finally
         LS.cleanup_cli_tasks(server)
     end

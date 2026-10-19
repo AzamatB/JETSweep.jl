@@ -111,6 +111,28 @@ function execution_gone(pid::Integer)
     return gone
 end
 
+@testset "An interrupt stops every running worker at once" begin
+    mktempdir() do directory
+        started = time()
+        tasks = [execution_task("w$i", 1, (0, i)) for i in 1:3]
+        failure = try
+            JETSweep._dispatch(tasks, 3) do task
+                name = execution_name(task)
+                name == "w3" && (sleep(1.0); throw(InterruptException()))
+                JETSweep.run_worker(execution_sh("echo \$\$ > \"\$1\"; exec sleep 60", joinpath(directory, name)),
+                                    joinpath(directory, "log"), 0.0)
+                return JETSweep._Task[]
+            end
+            nothing
+        catch err
+            err
+        end
+        @test failure isa InterruptException
+        @test time() - started < 15
+        @test all(name -> execution_gone(parse(Int, readchomp(joinpath(directory, name)))), ["w1", "w2"])
+    end
+end
+
 @testset "Worker exit codes, signals and logs" begin
     mktempdir() do directory
         log = joinpath(directory, "worker.log")
@@ -369,10 +391,21 @@ execution_unit(entry; kind=:test, expected=[entry], setup=String[], jetls_config
     JETSweep.Unit("$kind-unit", kind, entry, execution_context("unit"), expected, "", "",
                   JETSweep.Overrides(; setup, jetls_config), String[])
 
+"A sweep of `root` in which `unit`'s entry statically includes its other expected files."
+function execution_sweep(unit, root, output)
+    inventory = JETSweep.Inventory(root, JETSweep.Project[], JETSweep.Source[], String[], String[])
+    includes = [JETSweep.Include(file, 1, true) for file in unit.expected if file != unit.entry]
+    syntax = Dict(unit.entry => JETSweep.Syntax(includes, String[]))
+    return JETSweep._Sweep(inventory, output, SweepOptions(), syntax, Dict{String,JETSweep.Unit}(),
+                           Dict{String,Vector{String}}(), Dict{Tuple{String,Bool},Vector{String}}())
+end
+
+"Write `unit`'s JETLS configuration; returns the root its paths are relative to and the configuration."
 function execution_jetls(unit, root, separate=String[])
     directory = mktempdir()
-    base = JETSweep._write_jetls_config(unit, directory, root, separate)
-    return base, TOML.parsefile(joinpath(directory, "config", ".JETLSConfig.toml"))
+    config = JETSweep._write_jetls_config(unit, directory, execution_sweep(unit, root, directory), separate)
+    @test config == joinpath(directory, "config")
+    return root, TOML.parsefile(joinpath(config, ".JETLSConfig.toml"))
 end
 
 execution_touch(path, content="nothing\n") = (mkpath(dirname(path)); write(path, content); path)
@@ -427,9 +460,10 @@ const EXECUTION_USER_JETLS = """
         separate = [execution_touch(joinpath(root, "Pkg", "test", "sub", "first.jl")),
                     execution_touch(joinpath(root, "Pkg", "test", "second.jl"))]
         unit = execution_unit(driver; expected=[driver, helper])
-        # Statically side-effect-free statements, matched exactly; `seed = rand()` is not one.
-        pure = [("const DIR = @__DIR__", "Pkg/test/runtests.jl"), ("const LIMIT = 3", "Pkg/test/helper.jl"),
-                ("var\"odd name\" = 4", "Pkg/test/helper.jl")]
+        # Statically side-effect-free statements of the files the unit loads, matched exactly;
+        # `seed = rand()` is not one.
+        pure = [("const DIR = @__DIR__", "Pkg/test/runtests.jl"), (EXECUTION_SELECTION, "Pkg/test/runtests.jl"),
+                ("const LIMIT = 3", "Pkg/test/helper.jl"), ("var\"odd name\" = 4", "Pkg/test/helper.jl")]
 
         base, data = execution_jetls(unit, root)
         @test base == root
@@ -440,7 +474,7 @@ const EXECUTION_USER_JETLS = """
 
         base, data = execution_jetls(unit, root, separate)
         @test base == root
-        @test Set(execution_patterns(data)) == Set([pure; (EXECUTION_SELECTION, "Pkg/test/runtests.jl")])
+        @test Set(execution_patterns(data)) == Set(pure)
         @test execution_skips(data) == execution_skip.(["Pkg/test/sub/first.jl", "Pkg/test/second.jl"])
 
         # The nearest configuration applies, with its paths rebased onto the sweep root.
@@ -454,7 +488,7 @@ const EXECUTION_USER_JETLS = """
         @test data["full_analysis"]["auto_instantiate"] == "never"
         patterns = execution_patterns(data)
         @test first(patterns) == ("const C_ = v_", "")
-        @test Set(patterns[2:end]) == Set([pure; (EXECUTION_SELECTION, "Pkg/test/runtests.jl")])
+        @test Set(patterns[2:end]) == Set(pure)
         @test data["diagnostic"]["enabled"] === true && data["diagnostic"]["all_files"] === true
         @test data["diagnostic"]["patterns"] == [Dict("pattern" => "lowering/unused-argument",
               "match_by" => "code", "match_type" => "literal", "severity" => "off")]
@@ -551,27 +585,34 @@ end
         root = realpath(directory)
         package = joinpath(root, "Pkg")
         entry = execution_touch(joinpath(package, "src", "Pkg.jl"), "module Pkg\nend\n")
-        inactive = execution_touch(joinpath(package, "src", "inactive.jl"))
+        inactive = execution_touch(joinpath(package, "src", "inactive.jl"), "include(\"part.jl\")\n")
+        part = execution_touch(joinpath(package, "src", "part.jl"))
         test = execution_touch(joinpath(package, "test", "runtests.jl"), "include(\"helper.jl\")\n")
         helper = execution_touch(joinpath(package, "test", "helper.jl"), "include(\"leaf.jl\")\n")
         leaf = execution_touch(joinpath(package, "test", "leaf.jl"))
         inventory = discover(root)
-        sources = Dict(source.path => source for source in inventory.sources)
+        sweep = JETSweep._Sweep(inventory, root, SweepOptions(), JETSweep.source_syntax(inventory),
+                                Dict{String,JETSweep.Unit}(), Dict{String,Vector{String}}(),
+                                Dict{Tuple{String,Bool},Vector{String}}())
         analyzed(files...) = JETSweep.UnitResult("unit", :incomplete, JETSweep.Finding[], [realpath.(files)...],
                                                  String[], String[], 0.0, "")
-        context = JETSweep.Context(package, package, false, Dict{String,String}())
-        unit = JETSweep.Unit("package-unit", :package, entry, context, [entry, inactive], "", "",
-                             JETSweep.Overrides(), String[])
-        orphan = only(JETSweep._followups(unit, analyzed(entry), inventory, Set([entry]), sources))
-        @test (orphan.kind, orphan.entry, orphan.expected, orphan.context) == (:orphan, inactive, [inactive], context)
-        @test isempty(JETSweep._followups(unit, analyzed(entry), inventory, Set([entry, inactive]), sources))
+        # An extension's orphans load in its context and module, with its run-time settings.
+        context = JETSweep.Context(package, package, false, Dict("Trigger" => string(Base.UUID(1))))
+        settings = JETSweep.Overrides(; setup=["setup.jl"], args=["--fast"], env=Dict("MODE" => "x"))
+        unit = JETSweep.Unit("extension-unit", :extension, entry, context, [entry, inactive, part], "", "PkgExt",
+                             settings, String[])
+        orphan = only(JETSweep._followups(unit, analyzed(entry), sweep, Set([entry])))
+        @test (orphan.kind, orphan.entry, orphan.expected, orphan.context) == (:orphan, inactive, [inactive, part], context)
+        @test orphan.extension == "PkgExt"
+        @test (orphan.overrides.setup, orphan.overrides.args, orphan.overrides.env) == (String[], ["--fast"], Dict("MODE" => "x"))
+        @test isempty(JETSweep._followups(unit, analyzed(entry), sweep, Set([entry, inactive, part])))
         failed = JETSweep.UnitResult("unit", :failed, JETSweep.Finding[], String[], ["load error"], String[], 0.0, "")
-        @test isempty(JETSweep._followups(unit, failed, inventory, Set([entry]), sources))
+        @test isempty(JETSweep._followups(unit, failed, sweep, Set([entry])))
 
         tests = JETSweep.Context(package, package, true, Dict{String,String}())
         overrides = JETSweep.Overrides(; args=["--quick"])
         unit = JETSweep.Unit("test-unit", :test, test, tests, [test, helper, leaf], "", "", overrides, String[])
-        followup = only(JETSweep._followups(unit, analyzed(test), inventory, Set([test]), sources))
+        followup = only(JETSweep._followups(unit, analyzed(test), sweep, Set([test])))
         # The unreached helper covers the leaf it includes, in the same context, after the driver.
         @test (followup.kind, followup.entry, followup.expected) == (:test, helper, [helper, leaf])
         @test (followup.context, followup.driver, followup.overrides.args) == (tests, test, ["--quick"])
@@ -582,15 +623,23 @@ end
     mktempdir() do directory
         root = realpath(directory)
         @test isempty(JETSweep._previous_seconds(root))
-        for (run, seconds) in (("1", 5.0), ("2", 200.0))
-            report = joinpath(root, ".jetsweep", run, "report.toml")
-            mkpath(dirname(report))
-            open(io -> TOML.print(io, Dict("results" => [Dict("unit" => "test-slow", "seconds" => seconds)])), report, "w")
-            touch(report)
+        version = string(pkgversion(JETSweep))
+        function report(run, results; jetsweep=version)
+            file = joinpath(root, ".jetsweep", run, "report.toml")
+            mkpath(dirname(file))
+            open(io -> TOML.print(io, Dict("jetsweep" => jetsweep, "results" => results)), file, "w")
             sleep(0.01)
         end
+        result(unit, seconds, status="clean") = Dict("unit" => unit, "seconds" => seconds, "status" => status)
+        report("1", [result("test-slow", 5.0)])
+        report("2", [result("test-slow", 200.0), result("test-stopped", 300.0, "incomplete")])
         previous = JETSweep._previous_seconds(root)
+        # Only analyses that completed tell how long one takes.
         @test previous == Dict("test-slow" => 200.0)
+        # Another version of JETSweep may take differently long.
+        report("3", [result("test-slow", 1.0)]; jetsweep="0.0.1")
+        @test isempty(JETSweep._previous_seconds(root))
+        rm(joinpath(root, ".jetsweep", "3"); recursive=true)
         small = execution_touch(joinpath(root, "small.jl"))
         slow = JETSweep.Unit("test-slow", :test, small, execution_context("a"), [small], "", "",
                              JETSweep.Overrides(), String[])
@@ -598,12 +647,11 @@ end
                               JETSweep.Overrides(), String[])
         @test JETSweep._cost(slow, previous) == 200.0
         @test JETSweep._cost(fresh, previous) < 20
-        options = SweepOptions(threads=3)
-        @test JETSweep._task(slow, options, previous).priority < JETSweep._task(fresh, options, previous).priority
+        @test JETSweep._task(slow, previous).priority < JETSweep._task(fresh, previous).priority
         package = JETSweep.Unit("package-x", :package, small, execution_context("a"), [small], "", "",
                                 JETSweep.Overrides(), String[])
-        @test JETSweep._task(package, options, previous).weight == 3
-        @test JETSweep._task(slow, options, previous).weight == 1
+        # Package analyses run on several threads but use about one core.
+        @test JETSweep._task(package, previous).weight == JETSweep._task(slow, previous).weight == 1
         write(joinpath(root, ".jetsweep", "2", "report.toml"), "not toml [")
         @test isempty(JETSweep._previous_seconds(root))
     end

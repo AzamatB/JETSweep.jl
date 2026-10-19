@@ -161,17 +161,20 @@ end
 # Top-level statements
 # ====================
 
-"Top-level statements of a file with their expressions and source text, flattening blocks."
-function _statements(file::String; modules::Bool=false)
+"""
+Top-level statements of a file with their expressions and source text. `blocks` flattens
+`begin` blocks, which JETLS matches against concretization patterns as single statements.
+"""
+function _statements(file::String; modules::Bool=false, blocks::Bool=true)
     text = read(file, String)
     tree = JS.parseall(JS.SyntaxNode, text; filename=file, ignore_errors=true)
     statements = Tuple{JS.SyntaxNode,Any}[]
     function flatten(node)
         kind = JS.kind(node)
-        if kind in (JS.K"toplevel", JS.K"block")
+        if kind == JS.K"toplevel" || (blocks && kind == JS.K"block")
             foreach(flatten, JS.children(node))
         elseif modules && kind == JS.K"module"
-            flatten(last(JS.children(node)))
+            foreach(flatten, JS.children(last(JS.children(node))))
         elseif kind != JS.K"error"
             ex = try
                 Expr(node)
@@ -216,7 +219,8 @@ end
 function _bound_names(ex)
     ex isa Expr || return Symbol[]
     if ex.head in (:using, :import)
-        names = Symbol[]
+        # Paths built by interpolation, as in `@eval using $name`, bind nothing known.
+        names = Any[]
         for path in ex.args
             path isa Expr || continue
             if path.head === :(:)
@@ -227,7 +231,7 @@ function _bound_names(ex)
                 push!(names, last(path.args))
             end
         end
-        return filter(name -> name isa Symbol, names)
+        return Symbol[name for name in names if name isa Symbol]
     elseif ex.head === :macrocall
         return reduce(vcat, (_bound_names(arg) for arg in ex.args); init=Symbol[])
     elseif ex.head in (:struct, :module)
@@ -252,143 +256,433 @@ end
 # Concretization
 # ==============
 #
-# Script analysis evaluates definitions but not assignments, so a definition or `include`
-# that needs an assigned value stops it (`toplevel/missing-concretization`). JETSweep lets
-# JETLS evaluate top-level statements that cannot have side effects: assignments of values
-# built from literals, paths, names already bound and pure functions of them, and guards
-# such as `if !@isdefined(X) const X = Package end`. In a test driver it also evaluates the
-# assignments that select the files the driver includes at run time.
+# Script analysis evaluates definitions, imports and includes but not assignments, so a
+# definition or `include` that needs an assigned value stops it
+# (`toplevel/missing-concretization`), and other code sees assigned values only as types.
+# JETSweep lets JETLS evaluate the top-level statements that cannot have side effects:
+# assignments of values built from literals, paths and pure functions of names already
+# bound, and blocks and conditionals made only of these, definitions and imports. Values
+# that depend on how the program is run (`ARGS`, `ENV`) are evaluated only where analysis
+# needs them: in `include` arguments, definition signatures, and the conditions JETLS
+# evaluates to define the closures in their branches. A test driver whose run-time includes
+# are analyzed as their own units also evaluates whatever selects those files.
 
 const _PURE_NAMES = Set([:nothing, :missing, :true, :false, :Inf, :NaN, :pi, :π, :ℯ])
+"Names whose values depend on how the analyzed program is run."
+const _PROCESS_NAMES = Set([:ARGS, :ENV])
 const _PURE_CALLS = Set(Symbol.(split("""
-    joinpath normpath dirname basename splitext splitdir string repr * + - / // ^ % ÷ \\ div rem mod
-    fld cld min max abs sqrt cbrt exp exp2 exp10 log log2 log10 sin cos tan hypot round floor ceil
-    trunc length Dict Set Pair => : range collect Tuple NamedTuple Symbol Int Int8 Int16 Int32 Int64
-    UInt UInt8 UInt16 UInt32 UInt64 Float16 Float32 Float64 Bool String Char BigInt BigFloat
-    Rational Complex zero one typemax typemin == != < <= > >= ! isempty first last reverse sort vcat
-    hcat lowercase uppercase VersionNumber fill zeros ones sum prod maximum minimum in ∈ ∉ get
-    haskey getindex isodd iseven deg2rad rad2deg""")))
-const _PURE_MACROS = Set(["@__DIR__", "@__FILE__", "@__MODULE__", "@r_str", "@raw_str", "@v_str", "@big_str",
-                          "@isdefined"])
+    joinpath normpath dirname basename splitext splitdir splitpath relpath isabspath isfile isdir
+    ispath readdir string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
+    exp2 exp10 log log2 log10 sin cos tan hypot round floor ceil trunc length Dict Set Pair => :
+    range collect Tuple NamedTuple tuple Symbol Int Int8 Int16 Int32 Int64 UInt UInt8 UInt16 UInt32
+    UInt64 Float16 Float32 Float64 Bool String Char BigInt BigFloat Rational Complex VersionNumber Vector Matrix
+    Regex zero one typemax typemin == != === !== < <= > >= ! isempty first last reverse sort unique
+    vcat hcat keys values pairs merge union intersect setdiff lowercase uppercase titlecase
+    uppercasefirst lowercasefirst split rsplit strip lstrip rstrip chomp chop startswith endswith
+    occursin contains replace join lpad rpad repeat parse tryparse match something isnothing
+    ismissing identity sum prod maximum minimum extrema in ∈ ∉ get haskey getindex isodd iseven
+    deg2rad rad2deg map filter any all count findfirst findall enumerate zip eltype typeof isa
+    iswindows islinux isapple isunix isbsd""")))
+"Pure functions that call a function argument, which must then be pure as well."
+const _HIGHER_ORDER = Set([:map, :filter, :any, :all, :count, :findfirst, :findall, :sum, :prod, :maximum,
+                           :minimum, :extrema, :sort, :unique])
+const _PURE_MACROS = Set(["@__DIR__", "@__FILE__", "@__MODULE__", "@__LINE__", "@r_str", "@raw_str", "@s_str",
+                          "@v_str", "@big_str", "@isdefined"])
 
-function _pure_callee(f)
-    f isa Symbol && return f in _PURE_CALLS || f === :isdefined
-    return f isa Expr && f.head === :. && first(f.args) === :Base && Symbol(_name(f)) in _PURE_CALLS
+"What a file's top-level names are, as far as purity depends on them."
+struct _Scope
+    "Names bound to values evaluation reproduces: by pure assignments and module imports, so far."
+    known::Set{Symbol}
+    "Names of the file's functions and types and of imported bindings: calling them runs other code."
+    opaque::Set{Symbol}
+    "Names the file binds anywhere, which hide Base's."
+    shadowed::Set{Symbol}
 end
 
-"Whether evaluating `ex` is free of side effects, reading only `known` names, literals and Base."
-function _pure(ex, known::Set{Symbol})
+_within_scope(scope::_Scope, names) =
+    _Scope(union(scope.known, names), setdiff(scope.opaque, names), scope.shadowed)
+
+"Base's constant types, functions, modules and immutable values."
+function _pure_global(name::Symbol)
+    isdefined(Base, name) && isconst(Base, name) && !Base.isdeprecated(Base, name) || return false
+    value = getglobal(Base, name)
+    return value isa Union{Type,Function,Module,String,Symbol,VersionNumber} || isbits(value)
+end
+
+function _pure_callee(f, scope::_Scope)
+    f isa Symbol && return (f in _PURE_CALLS || f === :isdefined) && !(f in scope.shadowed)
+    f isa Expr || return false
+    f.head === :curly && return _pure_callee(first(f.args), scope) && all(arg -> _pure_type(arg, scope), f.args[2:end])
+    return f.head === :. && first(f.args) in (:Base, :Sys) && Symbol(_name(f)) in _PURE_CALLS
+end
+
+"A type parameter: the file's own types count, since naming a type runs no code."
+_pure_type(ex, scope::_Scope) =
+    ex isa Symbol ? ex in scope.opaque || _pure(ex, scope) :
+    ex isa Expr && ex.head in (:curly, :<:, :>:) ? all(arg -> _pure_type(arg, scope), ex.args) : _pure(ex, scope)
+
+"Whether evaluating `ex` is free of side effects, reading only literals, Base and names `scope` knows."
+function _pure(ex, scope::_Scope)
     ex isa Union{Number,String,Char,Nothing,LineNumberNode} && return true
     ex isa QuoteNode && return ex.value isa Symbol
-    ex isa Symbol && return ex in known || ex in _PURE_NAMES || isdefined(Base, ex)
+    if ex isa Symbol
+        ex in scope.known && return true
+        (ex in scope.opaque || ex in scope.shadowed) && return false
+        return ex in _PURE_NAMES || ex in _PROCESS_NAMES || _pure_global(ex)
+    end
     ex isa Expr || return false
-    pure(args) = all(arg -> _pure(arg, known), args)
-    ex.head === :macrocall && return _macro_name(ex) in _PURE_MACROS &&
+    pure(args) = all(arg -> _pure(arg, scope), args)
+    head = ex.head
+    head === :macrocall && return _macro_name(ex) in _PURE_MACROS &&
         all(arg -> arg isa Union{Symbol,String,LineNumberNode}, ex.args[2:end])
-    ex.head in (:tuple, :vect, :vcat, :hcat, :row, :nrow, :ncat, :parameters, :string, :&&, :||, :if,
-                :elseif, :comparison, :ref, :curly) && return pure(ex.args)
-    ex.head === :. && return length(ex.args) == 2 && last(ex.args) isa QuoteNode && _pure(first(ex.args), known)
-    ex.head in (:kw, :(=)) && return first(ex.args) isa Symbol && _pure(last(ex.args), known)
-    ex.head === :call && return _pure_callee(first(ex.args)) && pure(ex.args[2:end])
-    return false
+    head in (:tuple, :vect, :vcat, :hcat, :row, :nrow, :ncat, :parameters, :string, :&&, :||, :if, :elseif,
+             :block, :comparison, :ref, :comprehension, :flatten) && return pure(ex.args)
+    head === :typed_comprehension && return _pure_type(first(ex.args), scope) && pure(ex.args[2:end])
+    head === :curly && return all(arg -> _pure_type(arg, scope), ex.args)
+    head in (:kw, :(=)) && return first(ex.args) isa Symbol && _pure(last(ex.args), scope)
+    head === :-> && return _pure_function(ex, scope)
+    head === :generator && return _pure_generator(ex, scope)
+    if head === :.
+        length(ex.args) == 2 || return false
+        base, field = ex.args
+        # Reading a global of a module is pure too, as in `Sys.KERNEL` or `Package.VERSION`.
+        field isa QuoteNode && return _pure(base, scope) || base in scope.opaque
+        # `f.(x)` broadcasts `f`
+        return field isa Expr && field.head === :tuple && _pure_callee(base, scope) && pure(field.args)
+    end
+    head === :call || return false
+    callee = first(ex.args)
+    _pure_callee(callee, scope) || return false
+    arguments = ex.args[2:end]
+    if callee in _HIGHER_ORDER
+        # A function argument must be pure itself: not the file's or a package's function.
+        position = findfirst(arg -> !(arg isa Expr && arg.head === :parameters), arguments)
+        function_argument = position === nothing ? nothing : arguments[position]
+        function_argument isa Expr && function_argument.head === :. && return false
+    end
+    return pure(arguments)
 end
 
-_subexpressions(ex) = ex isa Expr ? vcat(Any[ex], (_subexpressions(arg) for arg in ex.args)...) : Any[ex]
-_checks_definition(ex) = _macro_name(ex) == "@isdefined" ||
-    (ex isa Expr && ex.head === :call && _name(first(ex.args)) == "isdefined")
-
-"Whether `ex` is a definition guard, as in `if !@isdefined(X) const X = Package end`, free of side effects."
-function _guard(ex, known::Set{Symbol})
-    ex isa Expr && ex.head in (:if, :elseif) || return false
-    condition = first(ex.args)
-    _pure(condition, known) && any(_checks_definition, _subexpressions(condition)) || return false
-    for branch in ex.args[2:end]
-        if branch isa Expr && branch.head === :elseif
-            _guard(branch, known) || return false
-            continue
+function _pure_function(ex::Expr, scope::_Scope)
+    parameters = first(ex.args)
+    parameters isa Expr && parameters.head === :tuple || (parameters = Expr(:tuple, parameters))
+    names = Symbol[]
+    for parameter in parameters.args
+        if parameter isa Expr && parameter.head === :(::) && length(parameter.args) == 2
+            _pure_type(last(parameter.args), scope) || return false
+            parameter = first(parameter.args)
         end
-        for statement in (branch isa Expr && branch.head === :block ? branch.args : Any[branch])
+        parameter isa Symbol || return false
+        push!(names, parameter)
+    end
+    return _pure(last(ex.args), _within_scope(scope, names))
+end
+
+function _pure_generator(ex::Expr, scope::_Scope)
+    body, specs = first(ex.args), ex.args[2:end]
+    condition = nothing
+    if length(specs) == 1 && only(specs) isa Expr && only(specs).head === :filter
+        condition, specs = first(only(specs).args), only(specs).args[2:end]
+    end
+    names = Set{Symbol}()
+    for spec in specs
+        spec isa Expr && spec.head === :(=) && _pure(last(spec.args), scope) || return false
+        _symbols!(names, first(spec.args))
+    end
+    inner = _within_scope(scope, names)
+    return _pure(body, inner) && (condition === nothing || _pure(condition, inner))
+end
+
+"Names a top-level statement binds globally: assignments outside local scopes, definitions and imports."
+function _binds!(names::Set{Symbol}, ex)
+    ex isa Expr || return names
+    assignment = _assignment(ex)
+    if assignment !== nothing
+        union!(names, first(assignment))
+    elseif ex.head in _UPDATES
+        union!(names, _assignees(first(ex.args)))
+    elseif ex.head in (:block, :toplevel, :if, :elseif, :&&, :||)
+        foreach(arg -> _binds!(names, arg), ex.args)
+    elseif ex.head === :macrocall
+        union!(names, _bound_names(ex))
+        foreach(arg -> _binds!(names, arg), ex.args)
+    else
+        union!(names, _bound_names(ex))
+    end
+    return names
+end
+
+"""
+Names that `ex` may mutate, or rebind from a local scope, invisibly to a later evaluation:
+arguments of `!` functions, objects of indexed, field and broadcast assignments, and names
+assigned as `global` in functions and loops.
+"""
+function _mutated!(names::Set{Symbol}, ex, scoped::Bool=false)
+    ex isa Expr || return names
+    ex.head in (:quote, :inert) && return names
+    root(ex) = ex isa Symbol ? ex : ex isa Expr && ex.head in (:ref, :.) && !isempty(ex.args) ? root(first(ex.args)) : nothing
+    target = nothing
+    if ex.head === :call && length(ex.args) >= 2 && endswith(_name(first(ex.args)), '!')
+        position = findfirst(arg -> !(arg isa Expr && arg.head === :parameters), ex.args[2:end])
+        position === nothing || (target = root(ex.args[position+1]))
+    elseif (ex.head === :(=) || ex.head in _UPDATES) && first(ex.args) isa Expr && first(ex.args).head in (:ref, :.)
+        target = root(first(ex.args))
+    elseif ex.head === :.=
+        target = root(first(ex.args))
+    elseif ex.head === :global && scoped
+        foreach(arg -> _assigned!(names, arg), ex.args)
+    end
+    target === nothing || push!(names, target)
+    scoped = scoped || _method(ex) || ex.head in (:let, :for, :while, :try)
+    foreach(arg -> _mutated!(names, arg, scoped), ex.args)
+    return names
+end
+
+"""
+The names known after evaluating the top-level statement `ex`, if evaluating it is free of
+side effects: a pure assignment, or a block or conditional made of those, definitions and
+imports. `nothing` otherwise. `bound` holds the names earlier statements bind.
+"""
+function _evaluable(ex, scope::_Scope, bound::Set{Symbol})
+    assignment = _assignment(ex)
+    if assignment !== nothing
+        names, value = assignment
+        return _pure(value, scope) ? names : nothing
+    end
+    ex isa Expr || return nothing
+    if ex.head === :block
+        inner = _Scope(copy(scope.known), copy(scope.opaque), scope.shadowed)
+        known = Symbol[]
+        for statement in ex.args
             statement isa LineNumberNode && continue
-            assignment = _assignment(statement)
-            assignment === nothing ? (_definition(statement) || return false) :
-                (_pure(last(assignment), known) || return false)
+            names = _member(statement, inner, bound)
+            names === nothing && return nothing
+            union!(inner.known, names)
+            _define!(inner, statement)
+            append!(known, names)
         end
+        return known
+    elseif ex.head in (:if, :elseif)
+        _pure(first(ex.args), scope) || return nothing
+        branches = [_member(branch, scope, bound) for branch in ex.args[2:end]]
+        any(isnothing, branches) && return nothing
+        # Evaluation takes the branch the program takes. Names that branch may leave unbound
+        # count only if nothing bound them before.
+        complete = length(ex.args) == 3 ? intersect(branches...) : Symbol[]
+        return union(complete, setdiff(union(branches...), bound))
     end
-    return true
+    return nothing
 end
 
-"""
-Whether MacroTools would read a name in `ex` as a pattern variable, which could match other
-statements. Macro names such as `@__DIR__` are exempt: only a macro could take their place.
-"""
-_wildcards(ex) = any(_symbols(ex)) do name
-    text = String(name)
-    !startswith(text, '@') && (endswith(text, '_') || endswith(text, "__str"))
+"Like `_evaluable`, for a statement inside a block or branch, where definitions and imports may also appear."
+function _member(ex, scope::_Scope, bound::Set{Symbol})
+    ex isa LineNumberNode && return Symbol[]
+    ex isa Expr && ex.head === :module && return nothing
+    ex isa Expr && (ex.head in (:using, :import) || _definition(ex)) && return Symbol[]
+    return _evaluable(ex, scope, bound)
 end
 
-"Names of a driver's top-level assignments that its run-time includes depend on, transitively."
-function include_selectors(file::String)
-    needed = Set{Symbol}()
-    function visit(ex, context::Vector{Any})
-        ex isa Expr && ex.head !== :quote && !_method(ex) || return
-        if _is_include(ex)
-            _symbols!(needed, last(ex.args))
-            foreach(c -> _symbols!(needed, c), context)
+"Names of the functions, types, modules and imported bindings a statement defines."
+function _definitions(ex)
+    ex isa Expr || return Set{Symbol}()
+    _assignment(ex) === nothing || return Set{Symbol}()
+    ex.head in (:block, :if, :elseif) && return union(Set{Symbol}(), (_definitions(arg) for arg in ex.args)...)
+    return Set{Symbol}(_bound_names(ex))
+end
+
+"Names a statement binds to whole modules, as `using A`, `import A.B` and `import A as B` do."
+function _modules(ex)
+    names = Set{Symbol}()
+    ex isa Expr || return names
+    if ex.head in (:using, :import)
+        for path in ex.args
+            path isa Expr && path.head in (:., :as) && last(path.args) isa Symbol && push!(names, last(path.args))
+        end
+    elseif ex.head in (:block, :if, :elseif, :macrocall)
+        foreach(arg -> union!(names, _modules(arg)), ex.args)
+    end
+    return names
+end
+
+"Record what `ex` defines: modules are values evaluation can read, other definitions are opaque."
+function _define!(scope::_Scope, ex)
+    modules = _modules(ex)
+    union!(scope.known, modules)
+    union!(scope.opaque, setdiff(_definitions(ex), modules))
+    return scope
+end
+
+const _TEST_MACROS = Set(["@test", "@test_broken", "@test_skip", "@test_throws", "@test_logs", "@test_warn",
+                          "@test_nowarn", "@test_deprecated", "@inferred"])
+
+"Whether a method definition is a closure: an anonymous function or a `do` block."
+_closure(ex::Expr) = ex.head === :-> ||
+    (ex.head === :function && first(ex.args) isa Expr && first(ex.args).head === :tuple)
+
+"""
+Add the names whose values JETLS evaluates when it analyzes the top-level statement `ex`:
+arguments of `include` and `eval` calls, signatures of definitions, the control flow around
+these, and the conditions of branches that define closures, which JETLS evaluates to
+define them. Assignments in `ex` that these names depend on count too.
+"""
+function _reads!(needed::Set{Symbol}, ex)
+    direct = Set{Symbol}()
+    locals = Pair{Set{Symbol},Set{Symbol}}[]
+    needs!(parts, controls) = (foreach(part -> _symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
+    function visit(ex, controls::Vector{Any}, branches::Vector{Any})
+        ex isa Expr || return
+        head = ex.head
+        if head in (:quote, :inert, :module)
             return
+        elseif head === :macrocall
+            name = _macro_name(ex)
+            name in _TEST_MACROS && return     # JETLS outlines their closures into thunks
+            name == "@eval" && return needs!(ex.args, controls)
+            # `@static` evaluates its condition when it expands.
+            name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
+                needs!(Any[first(last(ex.args).args)], controls)
+            foreach(arg -> visit(arg, controls, branches), ex.args[2:end])
+        elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "eval")
+            needs!(ex.args[2:end], controls)
+        elseif _method(ex)
+            _closure(ex) ? needs!(branches, Any[]) : needs!(Any[first(ex.args)], controls)
+        elseif head in (:struct, :abstract, :primitive)
+            needs!(Any[ex], controls)
+        elseif head in (:if, :elseif, :&&, :||)
+            condition = first(ex.args)
+            visit(condition, controls, branches)
+            foreach(arg -> visit(arg, [controls; condition], [branches; condition]), ex.args[2:end])
+        elseif head in (:for, :while)
+            visit(first(ex.args), controls, branches)
+            visit(last(ex.args), [controls; first(ex.args)], branches)
+        else
+            head in (:generator, :comprehension, :typed_comprehension, :do) && needs!(branches, Any[])
+            if head === :(=) && !_signature(first(ex.args))
+                push!(locals, _symbols(first(ex.args)) => union(_symbols(last(ex.args)), (_symbols(c) for c in controls)...))
+            end
+            foreach(arg -> visit(arg, controls, branches), ex.args)
         end
-        condition = ex.head in (:for, :while, :if, :elseif) ? Any[first(ex.args)] : Any[]
-        foreach(arg -> visit(arg, [context; condition]), ex.args)
     end
-    visit(Meta.parseall(read(file, String); filename=file), Any[])
-    assignments = [assignment for (_, ex) in last(_statements(file; modules=true))
-                   for assignment in (_assignment(ex),) if assignment !== nothing]
-    selected = Set{Symbol}()
+    visit(ex, Any[], Any[])
     changed = true
     while changed
         changed = false
-        for (names, value) in assignments
-            any(in(needed), names) && !all(in(selected), names) || continue
-            union!(selected, names)
-            union!(needed, names)
-            _symbols!(needed, value)
+        for (assigned, dependencies) in locals
+            (isdisjoint(assigned, direct) || issubset(dependencies, direct)) && continue
+            union!(direct, dependencies)
+            changed = true
+        end
+    end
+    return union!(needed, direct)
+end
+
+"""
+Indices of the statements that analysis may evaluate. Run-dependent statements, and with
+`selection` impure assignments, are evaluated only where needed, or where JETLS evaluates
+part of them anyway. `excluded` statements are not.
+"""
+function _concretized(expressions::Vector{Any}, excluded::Set{Int}, selection::Bool)
+    shadowed = Set{Symbol}()
+    foreach(ex -> (_assigned!(shadowed, ex); union!(shadowed, _definitions(ex))), expressions)
+    scope = _Scope(Set{Symbol}(), Set{Symbol}(), shadowed)
+    variable = setdiff(_PROCESS_NAMES, shadowed)
+    bound = Set{Symbol}()
+    selected = Set{Int}()
+    deferred = Tuple{Int,Vector{Symbol},Set{Symbol}}[]
+    needed = Set{Symbol}()
+    for (i, ex) in pairs(expressions)
+        binds = _binds!(Set{Symbol}(), ex)
+        assignment = _assignment(ex)
+        reads = assignment === nothing ? _symbols(ex) : _symbols(last(assignment))
+        known = i in excluded ? nothing : _evaluable(ex, scope, bound)
+        setdiff!(scope.known, binds)
+        if known === nothing
+            selection && !(i in excluded) && assignment !== nothing && push!(deferred, (i, first(assignment), reads))
+            _reads!(needed, ex)
+            setdiff!(variable, binds)
+        elseif isdisjoint(reads, variable)
+            push!(selected, i)
+            union!(scope.known, known)
+            setdiff!(variable, binds)
+        else
+            # JETLS evaluates part of a statement anyway when it defines a closure in a
+            # branch, and then not the closure in the other branch: evaluating it whole is better.
+            evaluated = _reads!(Set{Symbol}(), ex)
+            isempty(evaluated) ? push!(deferred, (i, collect(binds), reads)) : push!(selected, i)
+            union!(needed, evaluated)
+            union!(scope.known, known)
+            union!(variable, binds)
+        end
+        _define!(scope, ex)
+        setdiff!(scope.known, _mutated!(Set{Symbol}(), ex))
+        union!(bound, binds)
+    end
+    changed = true
+    while changed
+        changed = false
+        for (i, names, reads) in deferred
+            !(i in selected) && any(in(needed), names) || continue
+            push!(selected, i)
+            union!(needed, reads)
             changed = true
         end
     end
     return selected
 end
 
+_binding(name) = name isa Symbol && (name === :_ || occursin(r"[^_]_(_str)?$", String(name)))
+_slurp(name) = name isa Symbol && (name === :__ || occursin(r"[^_]__$", String(name)))
+
+function _normalise(ex)
+    while ex isa Expr && ex.head === :block
+        statements = filter(arg -> !(arg isa LineNumberNode), ex.args)
+        length(statements) == 1 || break
+        ex = only(statements)
+    end
+    ex isa QuoteNode && return Expr(:quote, ex.value)
+    ex isa Expr && ex.head === :inert && return Expr(:quote, only(ex.args))
+    ex isa Expr && ex.head === :kw && return Expr(:(=), ex.args...)
+    return ex
+end
+
+"""
+Whether MacroTools may match pattern `pattern` to `ex`, as JETLS matches concretization
+patterns: names such as `x_` match any expression and names such as `@__DIR__` any number
+of them. Bindings that must repeat are not checked, so this may claim a match that is none.
+"""
+function _may_match(pattern, ex)
+    pattern, ex = _normalise(pattern), _normalise(ex)
+    (_binding(pattern) || _slurp(pattern)) && return true
+    pattern isa Expr && ex isa Expr || return pattern == ex
+    pattern.head === :block && ex.head !== :block && (ex = Expr(:block, ex))
+    ex.head === :block && pattern.head !== :block && (pattern = Expr(:block, pattern))
+    pattern.head === ex.head || return false
+    patterns = filter(arg -> !(arg isa LineNumberNode), pattern.args)
+    arguments = filter(arg -> !(arg isa LineNumberNode), ex.args)
+    any(_slurp, patterns) && return true
+    return length(patterns) == length(arguments) && all(_may_match(p, a) for (p, a) in zip(patterns, arguments))
+end
+
 """
     concretization_patterns(file; selection=false) -> Vector{String}
 
-The source text of `file`'s top-level statements that analysis may evaluate: pure
-assignments and definition guards, and with `selection`, the assignments a test driver's
-run-time includes depend on. Each text is a JETLS concretization pattern that matches
-exactly its statement.
+The source text of the top-level statements of `file` that analysis may evaluate, each a
+JETLS concretization pattern. With `selection`, also the assignments its `include` calls
+depend on, which a test driver whose run-time includes are analyzed separately evaluates
+to get past them.
 """
 function concretization_patterns(file::String; selection::Bool=false)
-    selected = selection ? include_selectors(file) : Set{Symbol}()
-    text, statements = _statements(file; modules=true)
-    known = Set{Symbol}()
-    patterns = String[]
-    for (node, ex) in statements
-        assignment = _assignment(ex)
-        if assignment !== nothing
-            names, value = assignment
-            if (_pure(value, known) || any(in(selected), names)) && !_wildcards(ex)
-                push!(patterns, _source_text(node, text))
-                union!(known, names)
-            else
-                setdiff!(known, names)
-            end
-        elseif _guard(ex, known) && !_wildcards(ex)
-            push!(patterns, _source_text(node, text))
-            _assigned!(known, ex)
-            foreach(e -> union!(known, _bound_names(e)), _subexpressions(ex))
-        else
-            union!(known, _bound_names(ex))
-        end
+    text, statements = _statements(file; modules=true, blocks=false)
+    expressions = Any[last(statement) for statement in statements]
+    excluded = Set{Int}()
+    while true
+        selected = _concretized(expressions, excluded, selection)
+        # A pattern selects every statement of its file that it matches.
+        conflicts = filter(i -> any(j -> !(j in selected) && _may_match(expressions[i], expressions[j]),
+                                    eachindex(expressions)), selected)
+        isempty(conflicts) && return [_source_text(first(statements[i]), text) for i in sort!(collect(selected))]
+        union!(excluded, conflicts)
     end
-    return patterns
 end
 
 # Test-driver preludes
@@ -399,7 +693,9 @@ end
 # those global assignments that the test file or those definitions refer to, transitively.
 # Selection logic such as `const TESTS = isempty(ARGS) ? ALL : ARGS` is left out, since
 # nothing the test file uses depends on it. Statements keep their original source text, with
-# `@__DIR__`, `@__FILE__` and relative include paths pinned to their original file.
+# `@__DIR__`, `@__FILE__` and relative include paths pinned to their original file. Pure
+# assignments are wrapped in `@eval`, which analysis always evaluates, since concretization
+# patterns cannot apply to the generated file.
 
 function _macro_identifier(node::JS.SyntaxNode)
     JS.kind(node) == JS.K"macrocall" || return nothing
@@ -450,19 +746,37 @@ function _relocated(node::JS.SyntaxNode, text::String, file::String)
     return String(take!(io))
 end
 
-function _driver_statements!(statements, file::String, target::String, seen::Set{String})
+struct _DriverStatement
+    file::String
+    line::Int
+    ex::Any
+    "The names an assignment binds; empty for imports and definitions."
+    names::Vector{Symbol}
+    text::String
+end
+
+"Include calls in `ex` that run when it does, outside function bodies."
+function _nested_includes!(includes::Vector{Expr}, ex)
+    ex isa Expr && !(ex.head in (:quote, :inert, :module)) && !_method(ex) || return includes
+    _is_include(ex) ? push!(includes, ex) : foreach(arg -> _nested_includes!(includes, arg), ex.args)
+    return includes
+end
+
+function _driver_statements!(statements::Vector{_DriverStatement}, file::String, next::String, seen::Set{String})
     file in seen && return statements
     push!(seen, file)
     text, nodes = _statements(file)
     bindings = Dict{Symbol,String}()
     for (node, ex) in nodes
-        if _is_include(ex)
-            path = _path(last(ex.args), file, bindings, Dict{String,String}())
+        # Included files run at top level, wherever the call is: a nested driver included
+        # inside a `@testset`, say.
+        for include in _nested_includes!(Expr[], ex)
+            path = _path(last(include.args), file, bindings, Dict{String,String}())
             path === nothing && continue
             path = normpath(dirname(file), path)
-            path != target && isfile(path) && _driver_statements!(statements, path, target, seen)
-            continue
+            path != next && isfile(path) && _driver_statements!(statements, path, next, seen)
         end
+        _is_include(ex) && continue
         assignment = _assignment(ex)
         if assignment !== nothing
             names, value = assignment
@@ -470,28 +784,33 @@ function _driver_statements!(statements, file::String, target::String, seen::Set
             known === nothing ? foreach(name -> delete!(bindings, name), names) : (bindings[only(names)] = known)
         end
         if ex isa Expr && (ex.head in (:using, :import) || _definition(ex) || assignment !== nothing)
-            push!(statements, (; file, line=JS.source_line(node), ex, names=assignment === nothing ? Symbol[] : first(assignment),
-                                 text=_relocated(node, text, file)))
+            push!(statements, _DriverStatement(file, JS.source_line(node), ex,
+                                               assignment === nothing ? Symbol[] : first(assignment),
+                                               _relocated(node, text, file)))
         end
     end
     return statements
 end
 
 """
-    prelude(driver, target) -> String
+    prelude(drivers, target) -> String
 
-Source text recreating the context `driver` establishes for `target`, which it includes
-at run time: imports, definitions and the global assignments `target` transitively
-refers to, also from files `driver` includes statically.
+Source text recreating the context that `drivers`, outermost first, establish for `target`,
+which the last of them includes at run time: imports, definitions and the global
+assignments `target` transitively refers to, also from files the drivers include statically.
 """
-function prelude(driver::String, target::String)
-    statements = _driver_statements!(NamedTuple[], driver, target, Set{String}())
+function prelude(drivers::Vector{String}, target::String)
+    statements = _DriverStatement[]
+    seen = Set{String}()
+    for (i, driver) in pairs(drivers)
+        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen)
+    end
     needed = Set{Symbol}()
-    pending, seen = [target], Set{String}()
+    pending, visited = [target], Set{String}()
     while !isempty(pending)
         file = pop!(pending)
-        (file in seen || !isfile(file)) && continue
-        push!(seen, file)
+        (file in visited || !isfile(file)) && continue
+        push!(visited, file)
         _symbols!(needed, Meta.parseall(read(file, String); filename=file))
         append!(pending, (i.target for i in parse_source(file).includes if !isempty(i.target)))
     end
@@ -509,9 +828,12 @@ function prelude(driver::String, target::String)
             _symbols!(needed, statement.ex)
         end
     end
+    statements = statements[selected]
+    evaluated = _concretized(Any[statement.ex for statement in statements], Set{Int}(), false)
     io = IOBuffer()
-    for (statement, keep) in zip(statements, selected)
-        keep && println(io, "#= ", statement.file, ":", statement.line, " =#\n", statement.text)
+    for (i, statement) in pairs(statements)
+        println(io, "#= ", statement.file, ":", statement.line, " =#")
+        println(io, i in evaluated && !isempty(statement.names) ? "@eval " : "", statement.text)
     end
     return String(take!(io))
 end

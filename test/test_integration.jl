@@ -8,9 +8,8 @@ function integration_copy(directory)
     return root
 end
 
-integration_sweep(root, output; kwargs...) =
-    sweep(root; options=SweepOptions(; jobs=8, threads=2, gpus=["none"], timeout=900.0, output, kwargs...),
-          io=devnull)
+integration_sweep(root, output; io=devnull, kwargs...) =
+    sweep(root; options=SweepOptions(; jobs=8, threads=2, gpus=["none"], timeout=900.0, output, kwargs...), io)
 
 integration_status(result, entry) = only(r.status for (u, r) in zip(result.units, result.results) if u.entry == entry)
 
@@ -76,17 +75,50 @@ end
             """)
         write(joinpath(root, "Broken", "src", "Broken.jl"), "module Broken\nvalue() = 1\nend\n")
         write(joinpath(root, "Broken", "ext", "BrokenTestExt.jl"), "module BrokenTestExt\nerror(\"broken extension\")\nend\n")
+        # JET analyzes nothing after a parse error.
+        write(joinpath(root, "unparsable.jl"), "f(x) = x + 1\ny = )\nundefined_thing()\n")
+        # Turning a stop's diagnostic off does not hide the stop.
+        mkpath(joinpath(root, "silenced"))
+        write(joinpath(root, "silenced", "stop.jl"),
+              "name = rand() > 2 ? \"a\" : \"b\"\ninclude(joinpath(@__DIR__, name * \".jl\"))\nh() = 2\n")
+        write(joinpath(root, "silenced", ".JETLSConfig.toml"), """
+            [[diagnostic.patterns]]
+            pattern = "toplevel/missing-concretization"
+            match_by = "code"
+            match_type = "literal"
+            severity = "off"
+            """)
+        # Arguments are not evaluated where analysis does not need them; a selection that
+        # JETLS evaluates to define the closure in its branch is.
+        write(joinpath(root, "arguments.jl"), "outdir = ARGS[1]\noutput(name) = joinpath(outdir, name)\n")
+        write(joinpath(root, "selection.jl"), """
+            const ASKED = isempty(ARGS) ? split(get(ENV, "NOTHING_ASKED_FOR", ""), ","; keepempty=false) : ARGS
+            const RUN = isempty(ASKED) ? ["a"] : filter(name -> name in ASKED, ["a"])
+            selected() = RUN
+            """)
         output = joinpath(root, ".jetsweep", "report")
-        result = integration_sweep(root, output; fail_on=:none)
+        io = IOBuffer()
+        result = integration_sweep(root, output; io, fail_on=:none)
         status(name) = integration_status(result, realpath(joinpath(root, name)))
+        reasons(name) = only(r.reasons for (u, r) in zip(result.units, result.results) if endswith(u.entry, name))
         @test status("missing_package.jl") === :incomplete
         @test status("unresolved.jl") === :incomplete
         @test status("Broken/ext/BrokenTestExt.jl") === :failed
         @test status("Broken/src/Broken.jl") === :clean
-        reasons = only(r.reasons for (u, r) in zip(result.units, result.results) if endswith(u.entry, "missing_package.jl"))
-        @test any(reason -> occursin("toplevel/error", reason) && occursin("NotAPackageAnywhere", reason), reasons)
+        @test any(reason -> occursin("toplevel/error", reason) && occursin("NotAPackageAnywhere", reason),
+                  reasons("missing_package.jl"))
+        @test status("unparsable.jl") === :incomplete
+        @test any(reason -> occursin("syntax/parse-error", reason), reasons("unparsable.jl"))
+        @test status("silenced/stop.jl") === :incomplete
+        @test any(reason -> occursin("toplevel/missing-concretization", reason), reasons("silenced/stop.jl"))
+        @test status("arguments.jl") in (:clean, :findings)
+        @test status("selection.jl") === :clean
         @test result.exit_code == 2
         @test !isempty(TOML.parsefile(joinpath(output, "report.toml"))["unanalyzed"])
+        # The terminal summary groups incomplete analyses by cause, with paths relative to the root.
+        summary = String(take!(io))
+        @test occursin(r"\n +1  incomplete  analysis stopped \[syntax/parse-error\]\n +unparsable\.jl\n", summary)
+        @test occursin("silenced/stop.jl", summary) && !occursin(realpath(root) * "/silenced", summary)
     end
 end
 

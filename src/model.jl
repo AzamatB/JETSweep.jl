@@ -47,7 +47,7 @@ end
 Base.:(==)(a::Context, b::Context) =
     a.project == b.project && a.owner == b.owner && a.test == b.test && a.triggers == b.triggers
 Base.hash(context::Context, h::UInt) =
-    hash((context.project, context.owner, context.test, sort!(collect(context.triggers))), h)
+    hash((context.project, context.owner, context.test, context.triggers), h)
 
 "Configured additions to a unit's runtime context, from `.JETSweep.toml`."
 Base.@kwdef struct Overrides

@@ -3,6 +3,12 @@
 # preferences are never written, and package sources stay in place, so diagnostics name the
 # original files. Preparation runs in its own process; see `scripts/prepare.jl`.
 
+function _write_toml(path::String, data)
+    mkpath(dirname(path))
+    open(io -> TOML.print(io, data; sorted=true), path, "w")
+    return path
+end
+
 "A prepared scratch environment, or the reason it could not be prepared."
 struct Environment
     status::Symbol
@@ -67,8 +73,7 @@ end
 function _source(declaration, directory::String)
     source = Dict{String,String}(string(k) => string(v) for (k, v) in declaration)
     if haskey(source, "path")
-        # Normalize away the trailing separator `abspath("test", "..")` keeps.
-        source["path"] = joinpath(splitpath(abspath(directory, source["path"]))...)
+        source["path"] = _absolute(directory, source["path"])
     elseif haskey(source, "url") && !occursin(r"^[a-zA-Z][a-zA-Z0-9+.-]*://|^[^/@:]+@[^/:]+:", source["url"])
         source["url"] = abspath(directory, source["url"])   # a local Git repository
     end
@@ -252,7 +257,7 @@ end
 Resolve and download with Pkg's own stages, stopping before the build step that
 `Pkg.resolve` would run. `exact` keeps the seed manifest's versions.
 """
-function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool=true)
+function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool)
     ops = Pkg.Operations
     ops.prune_manifest(ctx.env)
     packages = Pkg.Types.PackageSpec[]
@@ -350,7 +355,7 @@ with the analyzer, resolved from their existing manifests where possible. With
 `instantiate`, missing packages are downloaded; with `precompile`, the environment is
 precompiled once for all the units that share it. Dependency build scripts never run.
 """
-function prepare(context::Context, directory::String; instantiate::Bool=true, precompile::Bool=true)
+function prepare(context::Context, directory::String; instantiate::Bool=true)
     directory = abspath(directory)
     try
         isdir(directory) && !isempty(readdir(directory)) && error("preparation directory is not empty: $directory")
@@ -359,44 +364,61 @@ function prepare(context::Context, directory::String; instantiate::Bool=true, pr
         project, preferences = _scratch_project(context, envs)
         manifest = _refresh_paths!(_seed_manifest(envs), project, envs)
         deferred = _add_tool!(project, preferences, manifest)
-        project_file = joinpath(directory, "Project.toml")
-        open(io -> TOML.print(io, project; sorted=true), project_file, "w")
-        open(io -> TOML.print(io, preferences; sorted=true), joinpath(directory, "LocalPreferences.toml"), "w")
+        project_file = _write_toml(joinpath(directory, "Project.toml"), project)
+        _write_toml(joinpath(directory, "LocalPreferences.toml"), preferences)
         env = Pkg.Types.EnvCache(project_file)
         # Supply the partial seed in memory: Pkg rejects an incomplete manifest on disk
         # before it can resolve the missing entries.
         env.manifest = manifest
         notes = String[]
-        if instantiate
+        # Offline, Pkg resolves among the installed versions only.
+        offline = Pkg.OFFLINE_MODE[]
+        Pkg.offline(offline || !instantiate)
+        try
             ctx = Pkg.Types.Context(; env)
             seed = deepcopy(env)
             try
-                _resolve!(ctx; exact=true)
+                _resolve!(ctx; exact=true, download=instantiate)
             catch err
                 err isa Pkg.Resolve.ResolverError || rethrow()
                 ctx.env = deepcopy(seed)
-                _resolve!(ctx; exact=false)
+                _resolve!(ctx; exact=false, download=instantiate)
                 changed = sort!(["$(entry.name) $(entry.version) → $(ctx.env.manifest[uuid].version)"
                                  for (uuid, entry) in seed.manifest if haskey(ctx.env.manifest, uuid) &&
                                  entry.version !== nothing && entry.version != ctx.env.manifest[uuid].version])
                 push!(notes, "The locked versions are incompatible with this context, so it was re-resolved" *
                     (isempty(changed) ? "." : ": " * join(changed, ", ") * "."))
             end
-            env = Pkg.Types.EnvCache(project_file)
+        catch err
+            instantiate || err isa InterruptException ||
+                error("downloads are disabled, and the installed packages do not satisfy this context: ",
+                      sprint(showerror, err))
+            rethrow()
+        finally
+            Pkg.offline(offline)
         end
+        env = Pkg.Types.EnvCache(project_file)
         unavailable = _unavailable(env)
         isempty(unavailable) || error(instantiate ? unavailable : "$unavailable (downloads are disabled)")
-        instantiate || Pkg.Types.write_manifest(env.manifest, joinpath(directory, "Manifest.toml"))
         _check_deferred(env, deferred)
-        precompile && try
-            Pkg.precompile(Pkg.Types.Context(; env), Pkg.Types.PackageSpec[]; already_instantiated=true, warn_loaded=false)
-        catch err
-            err isa InterruptException && rethrow()
-            push!(notes, "Some packages failed to precompile and load from source: " * first(split(sprint(showerror, err), '\n')))
-        end
         return Environment(:ready, directory, join(notes, " "))
     catch err
         err isa InterruptException && rethrow()
         return Environment(:failed, directory, sprint(showerror, err))
+    end
+end
+
+"""
+Precompile the packages of a prepared environment for its workers, and return a note on
+what failed, if anything. Workers load packages without package images from source.
+"""
+function precompile_environment(directory::String)
+    try
+        env = Pkg.Types.EnvCache(joinpath(directory, "Project.toml"))
+        Pkg.precompile(Pkg.Types.Context(; env), Pkg.Types.PackageSpec[]; already_instantiated=true, warn_loaded=false)
+        return ""
+    catch err
+        err isa InterruptException && rethrow()
+        return "Some packages failed to precompile and load from source: " * first(split(sprint(showerror, err), '\n'))
     end
 end
