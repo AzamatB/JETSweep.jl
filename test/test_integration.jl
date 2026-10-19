@@ -29,7 +29,8 @@ integration_status(result, entry) = only(r.status for (u, r) in zip(result.units
         @test all(r -> r.status in (:clean, :findings), result.results)
         @test integration_status(result, file("Witness/test/runtests.jl")) === :clean
         @test integration_status(result, file("scripts/clean.jl")) === :clean
-        messages = Dict((relpath(f.file, root), f.line, f.code) => f.message for f in JETSweep.unique_findings(result.results))
+        findings = JETSweep.unique_findings(result.results)
+        messages = Dict((relpath(f.file, root), f.line, f.code) => f.message for f in findings)
         found = Set(keys(messages))
         @test found == Set([
             ("Witness/src/Witness.jl", 6, "inference/method-error"),
@@ -48,6 +49,7 @@ integration_status(result, entry) = only(r.status for (u, r) in zip(result.units
             ("scripts/main.jl", 9, "inference/field-error"),
             ("scripts/main.jl", 11, "inference/undef-global-var"),
             ("scripts/main.jl", 11, "lowering/undef-global-var"),
+            ("scripts/main.jl", 13, "inference/method-error"),
             ("tools/report.jl", 3, "inference/method-error")])
         # Messages name what scripts and orphans define as JETLS names what `Main` defines,
         # without the module they are analyzed in, and without mangling `MyMain`.
@@ -57,6 +59,11 @@ integration_status(result, entry) = only(r.status for (u, r) in zip(result.units
               messages["scripts/main.jl", 11, "lowering/undef-global-var"] == "`MyMain.not_defined_in_mymain` is not defined"
         @test messages["Witness/src/disconnected.jl", 2, "inference/undef-global-var"] ==
               "`not_defined_anywhere` is not defined"
+        # Columns count UTF-16 code units, as LSP positions do, and a whole-line diagnostic
+        # ends where its line does.
+        wide = only(f for f in findings if relpath(f.file, root) == "scripts/main.jl" && f.line == 13)
+        @test (wide.column, wide.end_line, wide.end_column) == (1, 13, 28)
+        @test all(f -> f.end_column <= length(transcode(UInt16, readlines(f.file)[f.end_line])) + 1, findings)
         package = only(r for (u, r) in zip(result.units, result.results) if u.kind === :package)
         @test any(note -> occursin("inactive.jl", note), package.notes)
         @test result.exit_code == 1

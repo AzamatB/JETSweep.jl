@@ -10,3 +10,4 @@ point_failure(p::Point) = p.y
 module MyMain
 mymain_failure() = not_defined_in_mymain
 end
+wide_failure() = sin("é😀")

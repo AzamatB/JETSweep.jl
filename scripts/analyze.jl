@@ -343,19 +343,30 @@ function abstract_fields(target::Module, files::Vector{String})
     return reports
 end
 
-"Diagnostics of original files. Skipped includes are reported as missing coverage instead."
-function findings(uri2diagnostics, generated::String)
+"""
+Diagnostics of original files, with positions in `encoding`. Skipped includes are reported
+as missing coverage instead.
+"""
+function findings(uri2diagnostics, generated::String, encoding)
     rows = Dict{String,Any}[]
-    for (uri, diagnostics) in uri2diagnostics, diagnostic in diagnostics
+    for (uri, diagnostics) in uri2diagnostics
         file = LS.uri2filepath(uri)
         (file === nothing || canonical(file) == generated) && continue
-        diagnostic.code == "toplevel/analysis-skipped" && continue
-        range = diagnostic.range
-        push!(rows, Dict{String,Any}("file" => file,
-            "line" => range.start.line + 1, "column" => range.start.character + 1,
-            "end_line" => range.var"end".line + 1, "end_column" => range.var"end".character + 1,
-            "severity" => Int(something(diagnostic.severity, LS.DiagnosticSeverity.Error)),
-            "code" => string(something(diagnostic.code, "")), "message" => LS.get_raw_message(diagnostic)))
+        text = isfile(file) ? read(file) : UInt8[]
+        starts = LS.build_line_starts(text)
+        for diagnostic in diagnostics
+            diagnostic.code == "toplevel/analysis-skipped" && continue
+            (; start, var"end") = diagnostic.range
+            # JETLS ends a whole-line range at character typemax(Int32), which LSP reads as the
+            # end of the line; so does the report, where it can read the file.
+            stop = isempty(text) ? var"end" :
+                LS._offset_to_xy(text, LS._xy_to_offset(text, var"end", encoding, starts), encoding, starts)
+            push!(rows, Dict{String,Any}("file" => file,
+                "line" => start.line + 1, "column" => start.character + 1,
+                "end_line" => stop.line + 1, "end_column" => stop.character + 1,
+                "severity" => Int(something(diagnostic.severity, LS.DiagnosticSeverity.Error)),
+                "code" => string(something(diagnostic.code, "")), "message" => LS.get_raw_message(diagnostic)))
+        end
     end
     sort!(unique!(rows); by=row -> (row["file"], row["line"], row["column"], row["code"], row["message"]))
     return rows
@@ -436,7 +447,8 @@ function analyze(request, log::ErrorLog)
         end
         timings["lowering"] = time() - mark
         return Dict{String,Any}("analyzed" => sort!(filter(!=(generated), files)),
-                                "findings" => findings(diagnostics, generated), "reasons" => unique!(reasons),
+                                "findings" => findings(diagnostics, generated, server.state.encoding),
+                                "reasons" => unique!(reasons),
                                 "timings" => timings)
     finally
         LS.cleanup_cli_tasks(server)
