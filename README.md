@@ -28,7 +28,8 @@ Pkg.Apps.add(url="https://github.com/AzamatB/JETSweep.jl")
 ```
 
 This installs the `jetsweep` command into `~/.julia/bin`; add that directory to `PATH`.
-From a checkout, `julia --project -m JETSweep DIRECTORY` runs the same command.
+From a checkout, instantiated once with `julia --project -e 'using Pkg; Pkg.instantiate()'`,
+`julia --project -m JETSweep DIRECTORY` runs the same command.
 
 ## Usage
 

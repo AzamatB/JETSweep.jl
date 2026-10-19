@@ -351,6 +351,19 @@ function _entry_source(entry::Pkg.Types.PackageEntry, manifest_file::String)
 end
 
 """
+Fail unless the project JETSweep was loaded from has the analyzer installed, which a
+checkout lacks until it is instantiated.
+"""
+function _require_tool()
+    tool = Pkg.Types.EnvCache(tool_project())
+    all(uuid -> haskey(tool.manifest, uuid), (_JETLS, _TESTRUNNER, _REVISE)) && Pkg.Operations.is_instantiated(tool) &&
+        return nothing
+    directory = Base.shell_escape(dirname(tool.project_file))
+    error("JETSweep's project $directory is not instantiated; run ",
+          "`julia --project=$directory -e 'using Pkg; Pkg.instantiate()'` first")
+end
+
+"""
 Add the analyzer to a scratch environment: JETLS with its Revise-based package analysis
 enabled, TestRunner, which JETLS requires as a direct dependency, and Revise, which that
 analysis needs (see `_supply_revise!`). Resolving tool and target together gives packages

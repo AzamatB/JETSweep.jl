@@ -371,6 +371,27 @@ end
         @test occursin("jobs must be positive", err)
         @test isempty(readdir(directory))
     end
+    # A checkout that was never instantiated lacks the analyzer: a run fails before writing
+    # anything, saying how to instantiate it. A plan needs no analyzer.
+    mktempdir() do tool
+        cp(joinpath(pkgdir(JETSweep), "Project.toml"), joinpath(tool, "Project.toml"))
+        loaded = JETSweep._LOADED_PROJECT[]
+        JETSweep._LOADED_PROJECT[] = joinpath(tool, "Project.toml")
+        try
+            mktempdir() do directory
+                write(joinpath(directory, "script.jl"), "f() = 1\n")
+                code, out, err = execution_capture(() -> JETSweep.main([directory]))
+                @test code == 2
+                @test err == "jetsweep: JETSweep's project $tool is not instantiated; run " *
+                             "`julia --project=$tool -e 'using Pkg; Pkg.instantiate()'` first\n"
+                @test readdir(directory) == ["script.jl"]
+                @test first(execution_capture(() -> JETSweep.main(["--plan", "--output", joinpath(directory, "plan"),
+                                                                   directory]))) == 0
+            end
+        finally
+            JETSweep._LOADED_PROJECT[] = loaded
+        end
+    end
 end
 
 @testset "GPU assignment" begin

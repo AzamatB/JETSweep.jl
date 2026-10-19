@@ -385,6 +385,8 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     0 <= options.timeout < Inf || throw(ArgumentError("timeout must be finite and nonnegative"))
     options.fail_on in (SEVERITIES..., :none) || throw(ArgumentError("invalid failure severity $(options.fail_on)"))
     isdir(root) || throw(ArgumentError("not a directory: $root"))
+    # Every environment needs the analyzer; a plan needs none.
+    options.plan_only || _require_tool()
     started = time()
     root = realpath(root)
     config = read_config(root, options.config)
