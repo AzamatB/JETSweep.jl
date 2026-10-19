@@ -571,6 +571,38 @@ end
     end
 end
 
+@testset "setup applies to tests and scripts, and package analyses note it does not" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        setup = planning_file(root, "setup.jl")
+        package = planning_package(root, "Pkg", "Pkg"; weakdeps=Dict("Dates" => PLANNING_DATES),
+                                   extensions=Dict("PkgDatesExt" => "Dates"))
+        entry = planning_file(package, "src/Pkg.jl", "module Pkg\nend\n")
+        extension = planning_file(package, "ext/PkgDatesExt.jl")
+        orphan = planning_file(package, "ext/Stray.jl")
+        driver = planning_file(package, "test/runtests.jl")
+        script = planning_file(package, "scripts/run.jl")
+        config = planning_file(root, ".JETSweep.toml", """
+            [[context]]
+            match = "Pkg/**"
+            setup = ["setup.jl"]
+            args = ["--fast"]
+            """)
+        inventory, units = planning_plan(root)
+        for file in (driver, script)
+            @test planning_overrides(planning_unit(units, file).overrides) == ([setup], ["--fast"], Dict{String,String}(), "")
+            @test isempty(planning_unit(units, file).notes)
+        end
+        for (file, kind) in ((entry, :package), (extension, :extension), (orphan, :orphan))
+            unit = planning_unit(units, file)
+            @test unit.kind === kind
+            @test planning_overrides(unit.overrides) == (String[], ["--fast"], Dict{String,String}(), "")
+            @test unit.notes == ["$config: setup does not apply to $kind analysis, which loads the package itself"]
+        end
+        planning_invariants(inventory, units)
+    end
+end
+
 @testset "scripts and tests get the packages they import without declaring them" begin
     mktempdir() do directory
         root = realpath(directory)

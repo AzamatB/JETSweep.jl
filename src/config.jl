@@ -34,9 +34,10 @@ _absolute(base::String, path::String) = (path = normpath(abspath(base, path)); l
 
 Read `file`, or `root/.JETSweep.toml` when it exists. `exclude` patterns follow the
 `--exclude` rules; each `match` is a glob a unit's entry path, relative to `root`, must
-match whole. `project`, `setup` and `jetls_config` are paths relative to the file. When
-several `[[context]]` tables match a unit, each key a later table sets overrides it, except
-`env`, whose variables merge.
+match whole. `project`, `setup` and `jetls_config` are paths relative to the file; `setup`
+applies to tests and scripts, not to package, extension and orphan analyses, which load the
+package itself. When several `[[context]]` tables match a unit, each key a later table sets
+overrides it, except `env`, whose variables merge.
 
 ```toml
 exclude = ["vendor", "**/generated/*.jl"]

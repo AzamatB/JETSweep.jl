@@ -251,10 +251,15 @@ function _configure(units::Vector{Unit}, config::Config, root::String)
             context = unit.context
             "project" in rule.keys && (context = Context(rule.project, context.owner, context.test, context.triggers))
             current = unit.overrides
-            overrides = Overrides(set("setup", rule.setup, current.setup), set("args", rule.args, current.args),
-                                  merge(current.env, rule.env), set("jetls_config", rule.jetls_config, current.jetls_config))
+            # Only the generated entries of tests and scripts include setup files.
+            loaded = unit.kind in (:package, :extension, :orphan)
+            ignored = "$(config.file): setup does not apply to $(unit.kind) analysis, which loads the package itself"
+            notes = loaded && !isempty(rule.setup) ? sort!(union(unit.notes, [ignored])) : unit.notes
+            overrides = Overrides(loaded ? current.setup : set("setup", rule.setup, current.setup),
+                                  set("args", rule.args, current.args), merge(current.env, rule.env),
+                                  set("jetls_config", rule.jetls_config, current.jetls_config))
             units[i] = Unit(unit.id, unit.kind, unit.entry, context, unit.expected, unit.driver,
-                            unit.extension, overrides, unit.notes)
+                            unit.extension, overrides, notes)
         end
         matched || throw(ArgumentError("$(config.file): [[context]] match $(repr(rule.match)) selects no unit"))
     end

@@ -171,10 +171,11 @@ An optional `.JETSweep.toml` at the root adds exclusions and context for units t
 such as scripts that expect arguments or a different environment. `exclude` patterns follow
 the `--exclude` rules. Each `match` is a glob that a unit's entry path, relative to the root,
 must match whole, and must select at least one planned unit; `project`, `setup` and
-`jetls_config` are paths relative to the configuration file. When several tables match a
-unit, each key a later table sets overrides earlier ones, except `env`, whose variables
-merge. Follow-up units inherit the context and settings of the unit they follow, without
-`setup` for orphans.
+`jetls_config` are paths relative to the configuration file. `setup` files are included
+before the entry of a test or script; package, extension and orphan analyses load the
+package itself, so their units do not apply `setup`, and note so. When several tables match
+a unit, each key a later table sets overrides earlier ones, except `env`, whose variables
+merge. Follow-up units inherit the context and settings of the unit they follow.
 
 ```toml
 exclude = ["vendor", "**/generated/*.jl"]
