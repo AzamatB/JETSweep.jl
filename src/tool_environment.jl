@@ -1,7 +1,12 @@
 function _tool_package_identity(env, entry)
     path = Pkg.Operations.source_path(env.manifest_file, entry)
     source = path === nothing ? "" : ispath(path) ? realpath(path) : abspath(path)
-    return (name=something(entry.name, ""), version=entry.version === nothing ? "" : string(entry.version), source=source)
+    version = entry.version
+    return (name=something(entry.name, ""), version=version === nothing ? "" : string(version), source=source)
+end
+
+function _tool_identity_mismatches(actual, target, shared)
+    return Set(uuid for uuid in shared if !_tool_matches_target(actual, actual.manifest[uuid], target, target.manifest[uuid]))
 end
 
 function _tool_matches_target(tool_env, tool_entry, target_env, target_entry)
@@ -67,10 +72,7 @@ end
 function _tool_source_manifest(env, package_file::String)
     manifest = deepcopy(env.manifest)
     for entry in values(manifest)
-        entry.path === nothing || (entry.path = abspath(dirname(env.manifest_file), entry.path))
-        if entry.repo.source !== nothing && !Pkg.Types.isurl(entry.repo.source)
-            entry.repo.source = abspath(dirname(env.manifest_file), entry.repo.source)
-        end
+        _environment_absolutize_entry!(entry, env.manifest_file)
     end
     package, entry = _environment_local_entry(package_file)
     manifest[package.uuid] = entry
@@ -149,7 +151,7 @@ function prepare_tool_environment(target::EnvironmentResult, directory::String; 
             entry.repo.source !== nothing && entry.repo.source == jetls.repo.source && push!(fixed, uuid)
         end
         shared = intersect(Set(keys(seed)), Set(keys(desired.manifest)))
-        mismatches = Set(uuid for uuid in shared if !_tool_matches_target(baseline, seed[uuid], desired, desired.manifest[uuid]))
+        mismatches = _tool_identity_mismatches(baseline, desired, shared)
         preference_mismatches = _tool_preference_mismatches(baseline, desired, shared)
         if isempty(mismatches) && isempty(preference_mismatches)
             return EnvironmentResult(status=:ready, project=target.project, load_paths=target.load_paths,
@@ -211,7 +213,7 @@ function prepare_tool_environment(target::EnvironmentResult, directory::String; 
                     error("Resolver changed fixed tool dependency $(before.name) ($uuid)")
             end
             shared = intersect(Set(keys(resolved.manifest)), Set(keys(desired.manifest)))
-            mismatches = Set(uuid for uuid in shared if !_tool_matches_target(resolved, resolved.manifest[uuid], desired, desired.manifest[uuid]))
+            mismatches = _tool_identity_mismatches(resolved, desired, shared)
             preference_mismatches = _tool_preference_mismatches(resolved, desired, shared)
             if isempty(mismatches) && isempty(preference_mismatches)
                 unavailable = _environment_unavailable(resolved)

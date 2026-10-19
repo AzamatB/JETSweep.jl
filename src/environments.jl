@@ -66,7 +66,7 @@ function _environment_source_inputs!(fingerprints, project_file::String, seen::S
     return
 end
 
-function _environment_fingerprints(job::AnalysisJob, contexts)
+function _environment_fingerprints(contexts)
     fingerprints = Dict{String,String}()
     seen = Set{String}()
     for env in contexts
@@ -76,8 +76,9 @@ function _environment_fingerprints(job::AnalysisJob, contexts)
             _environment_source_inputs!(fingerprints, file, seen)
         end
         for entry in values(env.manifest)
-            entry.path === nothing && continue
-            file = _environment_project_file(abspath(dirname(env.manifest_file), entry.path))
+            path = entry.path
+            path === nothing && continue
+            file = _environment_project_file(abspath(dirname(env.manifest_file), path))
             file !== nothing && _environment_source_inputs!(fingerprints, file, seen)
         end
     end
@@ -97,7 +98,7 @@ function environment_key(job::AnalysisJob)::String
         print(io, name, '=', uuid, '\0')
     end
     try
-        fingerprints = _environment_fingerprints(job, _environment_contexts(job))
+        fingerprints = _environment_fingerprints(_environment_contexts(job))
         for (path, digest) in sort!(collect(fingerprints); by=first)
             print(io, path, '=', digest, '\0')
         end
@@ -115,6 +116,15 @@ function _environment_merge_dep!(deps, name::String, uuid)
         error("Conflicting UUIDs for dependency $name: $(deps[name]) and $uuid")
     deps[name] = uuid
     return
+end
+
+function _environment_package_identity(package, description::String)
+    # Pkg metadata is mutable and permits incomplete identities. Read each field
+    # once, validate it at this boundary, and pass an immutable identity onward.
+    name, uuid = package.name, package.uuid
+    name isa String || error("$description has no name")
+    uuid isa UUID || error("$description ($name) has no UUID")
+    return (; name, uuid)
 end
 
 function _environment_merge_compat!(compat, name::String, value::String)
@@ -180,9 +190,11 @@ function _environment_project(job::AnalysisJob, contexts)
                 _environment_merge_dep!(deps, name, uuid)
             end
         end
-        if env.pkg !== nothing
-            _environment_merge_dep!(deps, env.pkg.name, env.pkg.uuid)
-            sources[env.pkg.name] = Dict("path" => directory)
+        package = env.pkg
+        if package !== nothing
+            identity = _environment_package_identity(package, "Package at $directory")
+            _environment_merge_dep!(deps, identity.name, identity.uuid)
+            sources[identity.name] = Dict("path" => directory)
         end
         # Includes declarations for extras and extension triggers. They are filtered
         # after all contexts have been merged, rather than discarded prematurely.
@@ -215,6 +227,18 @@ function _environment_project(job::AnalysisJob, contexts)
     return project, preferences
 end
 
+function _environment_absolutize_entry!(entry::Pkg.Types.PackageEntry, manifest_file::String)
+    directory = dirname(manifest_file)
+    path = entry.path
+    path === nothing || (entry.path = abspath(directory, path))
+    repo = entry.repo
+    source = repo.source
+    if source !== nothing && !Pkg.Types.isurl(source)
+        repo.source = abspath(directory, source)
+    end
+    return entry
+end
+
 function _environment_seed_manifest(contexts)
     manifest = Pkg.Types.Manifest()
     manifest.manifest_format = v"2.0"
@@ -225,12 +249,7 @@ function _environment_seed_manifest(contexts)
         merge!(manifest.registries, deepcopy(env.manifest.registries))
         for (uuid, original) in env.manifest
             haskey(manifest, uuid) && continue
-            entry = deepcopy(original)
-            entry.path === nothing || (entry.path = abspath(dirname(env.manifest_file), entry.path))
-            if entry.repo.source !== nothing && !Pkg.Types.isurl(entry.repo.source)
-                entry.repo.source = abspath(dirname(env.manifest_file), entry.repo.source)
-            end
-            manifest[uuid] = entry
+            manifest[uuid] = _environment_absolutize_entry!(deepcopy(original), env.manifest_file)
         end
     end
     return manifest
@@ -238,13 +257,16 @@ end
 
 function _environment_local_entry(file::String)
     project = Pkg.Types.read_project(file)
-    project.name === nothing && error("Path dependency at $(dirname(file)) has no name")
-    project.uuid === nothing && error("Path dependency $(project.name) has no UUID")
-    entry = Pkg.Types.PackageEntry(name=project.name, uuid=project.uuid,
-        version=something(project.version, v"0.0.0"), path=dirname(file),
+    identity = _environment_package_identity(project, "Path dependency at $(dirname(file))")
+    version = something(project.version, v"0.0.0")
+    version isa VersionNumber || error("Path dependency $(identity.name) has no concrete version")
+    package = (; identity.name, identity.uuid, version,
+        deps=copy(project.deps), sources=deepcopy(project.sources))
+    entry = Pkg.Types.PackageEntry(name=package.name, uuid=package.uuid,
+        version=package.version, path=dirname(file),
         entryfile=project.entryfile, deps=copy(project.deps),
         weakdeps=copy(project.weakdeps), exts=copy(project.exts))
-    return project, entry
+    return package, entry
 end
 
 function _environment_refresh_paths!(manifest, project::Dict, contexts, fingerprints)
@@ -261,13 +283,14 @@ function _environment_refresh_paths!(manifest, project::Dict, contexts, fingerpr
     end
     for env in contexts, (file, member) in env.workspace
         append!(pending, ((name, uuid) for (name, uuid) in member.deps))
-        if member.uuid !== nothing && member.name !== nothing
+        member_uuid, member_name = member.uuid, member.name
+        if member_uuid !== nothing && member_name !== nothing
             source = Dict("path" => dirname(file))
-            haskey(declared, member.uuid) && declared[member.uuid] != source &&
-                error("Conflicting explicit workspace source for $(member.name)")
-            declared[member.uuid] = source
-            push!(root_sources, member.uuid)
-            push!(pending, (member.name, member.uuid))
+            haskey(declared, member_uuid) && declared[member_uuid] != source &&
+                error("Conflicting explicit workspace source for $member_name")
+            declared[member_uuid] = source
+            push!(root_sources, member_uuid)
+            push!(pending, (member_name, member_uuid))
         end
         for (name, source) in member.sources
             haskey(member.deps, name) || continue
@@ -345,7 +368,7 @@ function _environment_unavailable(env)
     return ""
 end
 
-function _environment_resolve_without_builds!(ctx; preserve_exact::Bool=true, download::Bool=true)
+function _environment_resolve_without_builds!(ctx::Pkg.Types.Context; preserve_exact::Bool=true, download::Bool=true)
     # Pkg.resolve/update eventually call Operations.up, whose last operation runs
     # package build scripts even when a later instantiate disables builds. Use
     # Pkg's native resolution/download stages directly and stop before that step.
@@ -358,9 +381,10 @@ function _environment_resolve_without_builds!(ctx; preserve_exact::Bool=true, do
     Pkg.API.append_all_pkgs!(packages, ctx, mode; workspace=true)
     for package in packages
         Pkg.API.update_source_if_set(ctx.env, package)
+        identity = _environment_package_identity(package, "Resolved dependency")
         path, repo = Pkg.Types.get_path_repo(ctx.env.project, ctx.env.project_file,
-            ctx.env.manifest_file, package.name)
-        entry = get(ctx.env.manifest, package.uuid, nothing)
+            ctx.env.manifest_file, identity.name)
+        entry = get(ctx.env.manifest, identity.uuid, nothing)
         operations.up_load_versions!(ctx, package, entry, path, repo, level)
     end
     for package in packages
@@ -384,7 +408,7 @@ function prepare_environment(job::AnalysisJob, directory::String; instantiate::B
     fingerprints = Dict{String,String}()
     try
         contexts = _environment_contexts(job)
-        merge!(fingerprints, _environment_fingerprints(job, contexts))
+        merge!(fingerprints, _environment_fingerprints(contexts))
         # Accidental use of an existing target directory must never overwrite it.
         isdir(directory) && !isempty(readdir(directory)) &&
             error("Preparation directory must be empty: $directory")

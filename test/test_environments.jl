@@ -18,6 +18,32 @@ function _envtest_load(result, expression)
     return read(addenv(command, "JULIA_LOAD_PATH" => join(result.load_paths, separator)), String)
 end
 
+@testset "local package metadata has validated immutable identities" begin
+    mktempdir() do root
+        package, uuid = _envtest_package(root, "MetadataIdentity")
+        file = joinpath(package, "Project.toml")
+        original = read(file)
+        metadata, entry = @inferred JETSweep._environment_local_entry(file)
+        @test metadata.name == "MetadataIdentity"
+        @test metadata.uuid == UUID(uuid)
+        @test metadata.version == v"1.0.0"
+        @test entry.uuid == metadata.uuid
+        @test read(file) == original
+
+        project = TOML.parsefile(file)
+        delete!(project, "version")
+        open(io -> TOML.print(io, project), file, "w")
+        unversioned, _ = @inferred JETSweep._environment_local_entry(file)
+        @test unversioned.version == v"0.0.0"
+        delete!(project, "uuid")
+        open(io -> TOML.print(io, project), file, "w")
+        @test_throws r"has no UUID" JETSweep._environment_local_entry(file)
+        delete!(project, "name")
+        open(io -> TOML.print(io, project), file, "w")
+        @test_throws r"has no name" JETSweep._environment_local_entry(file)
+    end
+end
+
 @testset "URL sources resolve in scratch and preserve exact commits" begin
     mktempdir() do root
         repository = joinpath(root, "UrlRepository")

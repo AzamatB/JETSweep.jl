@@ -66,8 +66,9 @@ hides CUDA devices. Neither CUDA.jl nor NVIDIA tooling is required for CPU works
 
 ## Discovery and environments
 
-- Git repositories include tracked and nonignored untracked files by default.
-  `--tracked-only` excludes untracked files; `--include-ignored` includes ignored files.
+- Git repositories include tracked and nonignored untracked files in discovery by default.
+  `--tracked-only` omits untracked files from the inventory; `--include-ignored`
+  includes ignored files in discovery.
   Nested repositories and packages are discovered independently. Duplicate package
   names are distinguished by their source locations and UUIDs.
 - Ordinary directories work without Git. VCS internals, dependency caches, and
@@ -91,6 +92,18 @@ hides CUDA devices. Neither CUDA.jl nor NVIDIA tooling is required for CPU works
   report identifies this context and does not invent a historical inclusion site.
   Files missed by a package or extension's actual analysis also receive supplemental
   source jobs. Their results do not erase an incomplete original package context.
+
+Exclusions and Git tracking rules filter discovery. Package projects that remain
+discovered still create package and declared extension jobs, even when an entry file
+matches an exclusion. Those jobs can load and analyze excluded files through imports
+and includes, and their diagnostics remain in the report. To omit a package's direct
+jobs, exclude its entire directory, for example:
+
+```sh
+jetsweep --exclude Example.jl /path/to/workspace
+```
+
+Other analyzed packages can still load that package as a dependency.
 
 Only explicit dependency declarations select sibling packages. An unrelated checkout
 with a matching name is never silently substituted for a missing dependency.
@@ -136,7 +149,9 @@ test runner; a completed test-file analysis does not mean its tests passed.
 Each run writes a new directory, normally `.jetsweep/RUN/` beneath the analyzed root:
 
 - `inventory.toml`: discovered projects, owned files, exclusions, and discovery issues.
-- `plan.toml`: every job and its selected context.
+- `plan.toml`: the initial jobs and their selected contexts.
+- `supplemental-plan.toml`: fallback source jobs and their parent jobs, when analysis
+  reveals missing package or extension coverage.
 - `environments/`: dependency-preparation requests, results, and raw logs.
 - `jobs/`: per-job requests, original-file coverage, diagnostics, tool provenance, and logs.
 - `inputs-before.toml` and `inputs-after.toml`: source, metadata, configuration, and tool hashes.

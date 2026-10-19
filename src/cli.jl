@@ -9,9 +9,9 @@ Usage: jetsweep [OPTIONS] DIRECTORY
   --timeout SECONDS         Time limit per environment or analysis job; 0 disables (default: 1200)
   --output DIRECTORY        New or empty report directory (default: DIRECTORY/.jetsweep/RUN)
   --config FILE             Context overrides (default: DIRECTORY/.JETSweep.toml if present)
-  --exclude GLOB            Exclude a root-relative path pattern; repeatable
-  --include-ignored         Include Git-ignored files
-  --tracked-only            Exclude untracked files inside Git repositories
+  --exclude GLOB            Exclude a root-relative pattern from discovery; repeatable
+  --include-ignored         Include Git-ignored files in discovery
+  --tracked-only            Exclude untracked files from discovery inside Git repositories
   --no-instantiate          Use locally available dependencies only
   --plan                    Discover files and write a job plan without starting analysis
   --fail-on LEVEL           error, warning, info, hint, or none (default: hint)
@@ -21,6 +21,8 @@ Usage: jetsweep [OPTIONS] DIRECTORY
 Packages, nested packages, tests, extensions and standalone Julia scripts are
 included. Dependencies resolve in isolated metadata environments. Reports retain
 all diagnostic severities and explicitly record unavailable or incomplete contexts.
+Exclusions filter discovery. To omit a package's direct jobs, exclude its directory;
+other analyzed packages may still load it as a dependency.
 
 Exit codes: 0 completed below the selected severity; 1 findings; 2 incomplete/error;
 130 interrupted. Analysis can execute Julia imports, macros and generated code;

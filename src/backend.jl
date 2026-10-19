@@ -149,7 +149,8 @@ function validate_backend()
     for name in (:start_cli_server, :start_signature_analysis_workers!, :start_analysis_worker!,
         :schedule_analysis!, :get_analysis_info, :AnalysisResult, :NewAnalysisEntry,
         :ScriptInEnvAnalysisEntry, :collect_workspace_uris, :get_full_diagnostics,
-        :run_per_file_diagnostics!, :cleanup_cli_tasks, :Revise, :FULL_ANALYSIS_CONTEXT)
+        :run_per_file_diagnostics!, :cleanup_cli_tasks, :Revise, :FULL_ANALYSIS_CONTEXT,
+        :cache_file_info!, :cache_saved_file_info!)
         isdefined(LS, name) || throw(UnsupportedBackend("Pinned JETLS API missing $name"))
     end
     LS.Revise === nothing && throw(UnsupportedBackend("Pinned JETLS requires its Revise backend"))
@@ -186,20 +187,22 @@ function expected_dependencies(project::String)
     # Inspect every manifest UUID, including entries that Pkg.dependencies may
     # omit because they are not reachable from this Project's current deps.
     for (uuid, entry) in env.manifest
+        name = entry.name
+        name isa String && !isempty(name) || error("Manifest package $uuid has no valid name")
         source = JETSweep.Pkg.Operations.source_path(env.manifest_file,entry)
-        source === nothing && error("Manifest source identity is unresolved for $(entry.name) ($uuid)")
+        source === nothing && error("Manifest source identity is unresolved for $name ($uuid)")
         version = entry.version === nothing ? "" : string(entry.version)
         if entry.version == v"0.0.0"
             metadata = JETSweep.Pkg.Types.projectfile_path(source;strict=true)
             if metadata !== nothing
                 data = TOML.parsefile(metadata)
-                if !haskey(data,"version") && get(data,"name","") == entry.name && get(data,"uuid","") == string(uuid)
+                if !haskey(data,"version") && get(data,"name","") == name && get(data,"uuid","") == string(uuid)
                     # Pkg synthesizes 0.0.0 for a valid unversioned path package.
                     version = ""
                 end
             end
         end
-        identities[uuid] = DependencyIdentity(uuid,entry.name,
+        identities[uuid] = DependencyIdentity(uuid,name,
             version,canonical(source),
             entry.tree_hash === nothing ? "" : string(entry.tree_hash))
     end
@@ -291,21 +294,118 @@ function bind_loaded_module(mod::Module)
     return nothing
 end
 
-function register_observed_entry!(mod::Module, entry::String)
+function context_value(ex, context::Module)
+    ex isa Symbol && return Base.invokelatest(isdefined,context,ex) ? Base.invokelatest(getglobal,context,ex) : nothing
+    ex isa Expr || return nothing
+    ex.head === :macrocall && macro_name(first(ex.args)) == "@__MODULE__" && return context
+    if ex.head === :. && length(ex.args) == 2 && last(ex.args) isa QuoteNode
+        parent = context_value(first(ex.args),context)
+        name = last(ex.args).value
+        parent isa Module && name isa Symbol && Base.invokelatest(isdefined,parent,name) &&
+            return Base.invokelatest(getglobal,parent,name)
+    end
+    return nothing
+end
+
+loader_binding(ex::Symbol) = ex in (:include,:Base)
+loader_binding(ex) = false
+function loader_binding(ex::Expr)
+    ex.head in (:(::),:kw,:(=),:...) && return loader_binding(first(ex.args))
+    ex.head in (:tuple,:parameters) && return any(loader_binding,ex.args)
+    ex.head === :call && return any(loader_binding,ex.args[2:end])
+    ex.head === :where && return loader_binding(first(ex.args))
+    return false
+end
+function shadows_loader(ex)
+    ex isa Expr || return false
+    ex.head in (:(=),:local,:global) && any(loader_binding,ex.args[1:1]) && return true
+    return any(shadows_loader,ex.args)
+end
+
+# Julia 1.13 records the actual include module/file, but not mapexpr. Establish
+# identity only from an unchanged source edge calling Julia's native include
+# form. Macros, quotes, shadowed loaders, aliases and mapped includes supply no
+# such proof. Their observed sources remain explicitly unsupported.
+function identity_include_edges!(proofs::Dict{Tuple{Module,String},Bool},
+        seen::Set{Tuple{Module,String}}, context::Module, file::String,
+        expected::Set{String})
+    key = (context,canonical(file))
+    key in seen && return
+    push!(seen,key)
+    tree = Meta.parseall(read(file,String);filename=file)
+    identity_include_nodes!(proofs,seen,context,file,expected,tree)
+    return nothing
+end
+
+function identity_include_nodes!(proofs,seen,context::Module,file::String,expected,ex)
+    ex isa Expr || return
+    ex.head in (:quote,:inert,:macrocall) && return
+    if ex.head === :module
+        name = ex.args[2]
+        name isa Symbol || return
+        child = context_value(name,context)
+        child isa Module || return
+        identity_include_nodes!(proofs,seen,child,file,expected,last(ex.args))
+        return
+    end
+    if ex.head in (:function,:->,:let,:for)
+        (loader_binding(first(ex.args)) || shadows_loader(ex)) && return
+    end
+    if ex.head === :call && length(ex.args) >= 2 &&
+            JETSweep._syntax_name(first(ex.args)) in ("include","Base.include")
+        callee = context_value(first(ex.args),context)
+        include_context = nothing
+        plain = false
+        if callee isa Base.IncludeInto
+            include_context = callee.m
+            plain = length(ex.args) == 2 && which(callee,Tuple{String}).module === Base
+        elseif callee === Base.include && length(ex.args) >= 3
+            include_context = context_value(ex.args[end-1],context)
+            plain = length(ex.args) == 3 && which(Base.include,Tuple{Module,String}).module === Base
+        end
+        if include_context isa Module
+            path = literal_path(last(ex.args),file)
+            if path !== nothing
+                target = canonical(joinpath(dirname(file),path))
+                if target in expected
+                    key = (include_context,target)
+                    proofs[key] = get(proofs,key,true) && plain
+                    plain && identity_include_edges!(proofs,seen,include_context,target,expected)
+                end
+            end
+        end
+    end
+    for child in ex.args
+        identity_include_nodes!(proofs,seen,context,file,expected,child)
+    end
+    return nothing
+end
+
+function register_observed_sources!(mod::Module, entry::String, expected_files::Vector{String})
     data = LS.Revise.getpkgdata(Base.PkgId(mod))
     data === nothing && (data = LS.Revise.watch_package(Base.PkgId(mod)))
     data === nothing && error("Revise cannot track the requested module")
     covered = Set(canonical(joinpath(LS.Revise.basedir(data),file)) for file in LS.Revise.srcfiles(data))
-    canonical(entry) in covered && return String[]
-    # The pinned Revise's source-load callback recognizes loader-root files by a
-    # conventional basename. Use its actual include observations for custom
-    # entryfiles; this registers unchanged, already-loaded source without eval.
+    expected = Set(canonical.(expected_files))
     observations = lock(LS.Revise.revise_lock) do
-        [(context,identity,file) for (context,file) in LS.Revise.included_files if canonical(file) == canonical(entry)]
+        [(context,canonical(file)) for (context,file) in LS.Revise.included_files
+            if canonical(file) in expected && canonical(file) ∉ covered &&
+               (Base.moduleroot(context) === mod || (context === Base.__toplevel__ && canonical(file) == canonical(entry)))]
     end
-    isempty(observations) && error("No observed include establishes the original package entry $entry")
-    LS.Revise.maybe_add_includes_to_pkgdata!(data,"",observations;eval_now=false)
-    return [entry]
+    canonical(entry) ∈ covered || any(item -> last(item) == canonical(entry),observations) ||
+        error("No observed include establishes the original package entry $entry")
+    isempty(observations) && return Dict{String,Any}[]
+    proofs = Dict{Tuple{Module,String},Bool}((Base.__toplevel__,canonical(entry))=>true)
+    identity_include_edges!(proofs,Set{Tuple{Module,String}}(),Base.__toplevel__,entry,expected)
+    registrations = Dict{String,Any}[]
+    for (context,file) in unique(observations)
+        get(proofs,(context,file),false) || throw(UnsupportedBackend(
+            "Observed source $file in $context has no proven identity include edge; Julia 1.13 does not retain its mapexpr"))
+        LS.Revise.maybe_add_includes_to_pkgdata!(data,"",[(context,identity,file)];eval_now=false)
+        push!(registrations,Dict("file"=>file,"module"=>string(context),"mapexpr"=>"Base.identity",
+            "basis"=>"Actual Revise include observation and verified native identity include source edge; no source reevaluation"))
+    end
+    return registrations
 end
 
 function load_target(job::WorkerJob)
@@ -393,15 +493,20 @@ function included_path(ex, source::String, bindings::Dict{Symbol,String}=Dict{Sy
     return canonical(joinpath(dirname(source), value))
 end
 
-function relocate_context(ex, source::String)
+function relocate_context_child(ex, source::String)
     ex isa Expr || return ex
     if ex.head === :macrocall
         name = macro_name(first(ex.args))
         name == "@__DIR__" && return dirname(source)
         name == "@__FILE__" && return source
     end
-    return Expr(ex.head, (relocate_context(x,source) for x in ex.args)...)
+    return relocate_context_statement(ex,source)
 end
+
+# A retained declaration always remains a statement. Only its children may be
+# replaced by original-location strings for @__DIR__ and @__FILE__.
+relocate_context_statement(ex::Expr, source::String) =
+    Expr(ex.head, (relocate_context_child(x,source) for x in ex.args)...)
 
 struct ContextFragment
     source::String
@@ -464,7 +569,7 @@ function collect_context!(fragments::Vector{ContextFragment}, omissions::Vector{
                 push!(omissions, ContextOmission(source,line,"include","Included context file is missing: $path"))
             end
         elseif declaration(ex) || path_assignment
-            push!(fragments, ContextFragment(source,line,relocate_context(ex,source)))
+            push!(fragments, ContextFragment(source,line,relocate_context_statement(ex,source)))
         elseif ex isa Expr
             push!(omissions, ContextOmission(source,line,string(ex.head),
                 "Only top-level declarations and literal include ancestry are reconstructed; this expression is omitted"))
@@ -703,9 +808,11 @@ function analyze(spec::WorkerSpec, output::String, startup_errors::Vector{String
             result["requested_triggers"] = triggers
             result["module_context_alias"] = true
             result["module_context_aliases"] = unique!(["Base.__toplevel__." * String(nameof(mod)) for mod in (parent,target_module)])
-            result["observed_entry_registrations"] = with_logger(logger) do
-                register_observed_entry!(target_module,job.entry)
+            registrations = with_logger(logger) do
+                register_observed_sources!(target_module,job.entry,job.expected)
             end
+            result["observed_source_registrations"] = registrations
+            result["observed_entry_registrations"] = [row["file"] for row in registrations if canonical(row["file"]) == canonical(job.entry)]
         elseif job.kind === :source
             parent, _, _ = with_logger(logger) do
                 load_target(job)
@@ -727,10 +834,26 @@ function analyze(spec::WorkerSpec, output::String, startup_errors::Vector{String
             LS.start_signature_analysis_workers!(server)
             LS.start_analysis_worker!(server)
         end
-        uri = LS.filepath2uri(entryfile)
+        # File-backed LSP documents may have cached text without a physical file.
+        # Keep the generated artifact in the report directory, but analyze its
+        # exact text at a reserved in-workspace URI so root-relative config globs
+        # retain their normal meaning even when the report lives outside root.
+        document = target_module === nothing ?
+            joinpath(spec.root,"jetsweep-virtual",bytes2hex(sha256(job.id)),"context-entry.jl") : entryfile
+        if target_module === nothing
+            ispath(document) && error("Generated analysis document would shadow an existing path: $document")
+            result["generated_documents"] = [Dict("uri"=>string(LS.filepath2uri(document)),
+                "virtual_file"=>document,"artifact"=>entryfile,"source_sha256"=>digest(entryfile),
+                "basis"=>"JETLS cached file document; no file or directory is created at the virtual path")]
+        end
+        result["configuration_root"] = spec.root
+        uri = LS.filepath2uri(document)
+        result["analysis_entry_uri"] = string(uri)
         entry = target_module === nothing ? LS.ScriptInEnvAnalysisEntry(spec.environment,uri) :
             LS.NewAnalysisEntry(Base.PkgId(target_module),spec.environment)
-        LS.cache_file_info!(server,uri,1,read(entryfile,String))
+        text = read(entryfile,String)
+        LS.cache_file_info!(server,uri,1,text)
+        LS.cache_saved_file_info!(server.state,uri,text)
         completion = Base.Event()
         with_logger(logger) do
             LS.schedule_analysis!(server,uri,entry,false; completion,notify_diagnostics=false,debounce=0.0)
