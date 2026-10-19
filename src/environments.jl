@@ -1,305 +1,192 @@
-# Environment preparation is deliberately separate from analysis. Only the anonymous
-# project and manifest below are writable; package source locations stay original so
-# diagnostics continue to identify the user's files.
+# Environment preparation. Each context gets a scratch project and manifest under the report
+# directory, combining the projects the context names. The analyzed projects, manifests and
+# preferences are never written, and package sources stay in place, so diagnostics name the
+# original files. Preparation runs in its own process; see `scripts/prepare.jl`.
 
-function _environment_project_file(path::String)
+"A prepared scratch environment, or the reason it could not be prepared."
+struct Environment
+    status::Symbol
+    dir::String
+    message::String
+end
+
+ready(environment::Environment) = environment.status === :ready
+
+function _project_file(path::String)
     isempty(path) && return nothing
     isfile(path) && return abspath(path)
     return Pkg.Types.projectfile_path(abspath(path); strict=true)
 end
 
-function _environment_contexts(job::AnalysisJob)
-    selected = isempty(job.context.project) ? job.project : job.context.project
-    selected_file = _environment_project_file(selected)
-    !isempty(selected) && selected_file === nothing &&
-        error("No Julia project exists at $(repr(selected))")
-    owner_file = _environment_project_file(job.owner)
+"The projects whose dependencies a context combines, the owning package first."
+function _context_envs(context::Context)
     files = String[]
-    # A nested script environment owns its dependency context. Tests and extensions
-    # additionally need their parent package, even when they have their own project.
-    parent_context = job.kind in (:package, :extension, :test, :source) || owner_file == selected_file
-    parent_context && owner_file !== nothing && push!(files, owner_file)
-    selected_file !== nothing && push!(files, selected_file)
-    if job.kind === :test && owner_file !== nothing
-        test_file = _environment_project_file(joinpath(dirname(owner_file), "test"))
-        test_file !== nothing && push!(files, test_file)
+    owner = _project_file(context.owner)
+    owner === nothing || push!(files, owner)
+    selected = _project_file(context.project)
+    isempty(context.project) || selected !== nothing || error("no Julia project at $(context.project)")
+    selected === nothing || push!(files, selected)
+    if context.test && owner !== nothing
+        tests = _project_file(joinpath(dirname(owner), "test"))
+        tests === nothing || push!(files, tests)
     end
-    return [Pkg.Types.EnvCache(file) for file in unique(files)]
+    return [Pkg.Types.EnvCache(file) for file in unique!(files)]
 end
 
-function _environment_fingerprint!(fingerprints::Dict{String,String}, path::String)
-    isfile(path) || return
-    fingerprints[abspath(path)] = bytes2hex(open(SHA.sha256, path))
-    return
-end
-
-function _environment_source_inputs!(fingerprints, project_file::String, seen::Set{String})
-    project_file = abspath(project_file)
-    project_file in seen && return
-    push!(seen, project_file)
-    _environment_fingerprint!(fingerprints, project_file)
-    directory = dirname(project_file)
-    for name in Base.preferences_names
-        _environment_fingerprint!(fingerprints, joinpath(directory, name))
-    end
-    project = TOML.parsefile(project_file)
-    entryfile = get(project, "path", get(project, "entryfile", nothing))
-    entryfile === nothing || _environment_fingerprint!(fingerprints, abspath(directory, entryfile))
-    local_manifest = get(project, "manifest", nothing)
-    local_manifest = local_manifest === nothing ?
-        Pkg.Types.manifestfile_path(directory; strict=true) : abspath(directory, local_manifest)
-    local_manifest === nothing || _environment_fingerprint!(fingerprints, local_manifest)
-    for source_directory in ("src", "ext", "deps")
-        root = joinpath(directory, source_directory)
-        isdir(root) || continue
-        for (base, _, files) in walkdir(root), file in files
-            endswith(file, ".jl") && _environment_fingerprint!(fingerprints, joinpath(base, file))
-        end
-    end
-    # Following a dependency is authorized only by an explicit source path. Never
-    # choose a sibling checkout by package name, even when its name looks familiar.
-    for source in values(get(project, "sources", Dict()))
-        haskey(source, "path") || continue
-        child = _environment_project_file(abspath(directory, source["path"]))
-        child !== nothing && _environment_source_inputs!(fingerprints, child, seen)
-    end
-    return
-end
-
-function _environment_fingerprints(contexts)
-    fingerprints = Dict{String,String}()
-    seen = Set{String}()
-    for env in contexts
-        _environment_source_inputs!(fingerprints, env.project_file, seen)
-        _environment_fingerprint!(fingerprints, env.manifest_file)
-        for file in keys(env.workspace)
-            _environment_source_inputs!(fingerprints, file, seen)
-        end
-        for entry in values(env.manifest)
-            path = entry.path
-            path === nothing && continue
-            file = _environment_project_file(abspath(dirname(env.manifest_file), path))
-            file !== nothing && _environment_source_inputs!(fingerprints, file, seen)
-        end
-    end
-    return fingerprints
-end
-
-"Content identity of the dependency context, shared by jobs using the same environment."
-function environment_key(job::AnalysisJob)::String
-    io = IOBuffer()
-    print(io, "JETSweep environment v1\0", VERSION, '\0', Sys.MACHINE, '\0')
-    # Test augmentation and trigger sets affect the dependency graph; individual
-    # entry points, arguments and setup scripts do not.
-    print(io, job.kind === :test ? "test" : "normal", '\0')
-    print(io, abspath(isempty(job.context.project) ? job.project : job.context.project), '\0')
-    print(io, job.kind in (:test, :extension, :package, :source) ? job.owner : "", '\0')
-    for (name, uuid) in sort!(collect(job.triggers); by=first)
-        print(io, name, '=', uuid, '\0')
-    end
-    try
-        fingerprints = _environment_fingerprints(_environment_contexts(job))
-        for (path, digest) in sort!(collect(fingerprints); by=first)
-            print(io, path, '=', digest, '\0')
-        end
-    catch err
-        # Planning a broken project must still yield an identity. Preparation will
-        # return the actual failure instead of silently omitting the job.
-        print(io, "invalid:", sprint(showerror, err))
-    end
-    return bytes2hex(SHA.sha256(take!(io)))
-end
-
-function _environment_merge_dep!(deps, name::String, uuid)
+function _merge_dep!(deps::Dict{String,String}, name::String, uuid)
     uuid = string(uuid)
-    haskey(deps, name) && deps[name] != uuid &&
-        error("Conflicting UUIDs for dependency $name: $(deps[name]) and $uuid")
+    get(deps, name, uuid) == uuid || error("conflicting UUIDs for $name: $(deps[name]) and $uuid")
     deps[name] = uuid
-    return
+    return deps
 end
 
-function _environment_package_identity(package, description::String)
-    # Pkg metadata is mutable and permits incomplete identities. Read each field
-    # once, validate it at this boundary, and pass an immutable identity onward.
+function _merge_compat!(compat::Dict{String,String}, name::String, value::String)
+    if haskey(compat, name)
+        both = intersect(Pkg.Types.semver_spec(compat[name]), Pkg.Types.semver_spec(value))
+        isempty(both) && error("incompatible compat bounds for $name: $(compat[name]) and $value")
+        # A VersionSpec prints disjoint ranges in brackets, which Project.toml rejects.
+        compat[name] = join(string.(both.ranges), ", ")
+    else
+        compat[name] = value
+    end
+    return compat
+end
+
+"Pkg metadata permits missing names and UUIDs; validate them once, at this boundary."
+function _identity(package, description::String)
     name, uuid = package.name, package.uuid
     name isa String || error("$description has no name")
     uuid isa UUID || error("$description ($name) has no UUID")
     return (; name, uuid)
 end
 
-function _environment_merge_compat!(compat, name::String, value::String)
-    if haskey(compat, name)
-        intersection = intersect(Pkg.Types.semver_spec(compat[name]), Pkg.Types.semver_spec(value))
-        isempty(intersection) && error("Incompatible constraints for $name: $(compat[name]) and $value")
-        # VersionSpec's display encloses disjoint ranges in brackets, which is not
-        # valid Project.toml compat syntax. A comma-separated union is valid.
-        compat[name] = join(string.(intersection.ranges), ", ")
-    else
-        compat[name] = value
+"A `[sources]` declaration with paths made absolute relative to its project."
+function _source(declaration, directory::String)
+    source = Dict{String,String}(string(k) => string(v) for (k, v) in declaration)
+    if haskey(source, "path")
+        # Normalize away the trailing separator `abspath("test", "..")` keeps.
+        source["path"] = joinpath(splitpath(abspath(directory, source["path"]))...)
+    elseif haskey(source, "url") && !occursin(r"^[a-zA-Z][a-zA-Z0-9+.-]*://|^[^/@:]+@[^/:]+:", source["url"])
+        source["url"] = abspath(directory, source["url"])   # a local Git repository
     end
-    return
+    return source
 end
 
-function _environment_source(source, directory::String)
-    result = Dict{String,String}(string(k) => string(v) for (k, v) in source)
-    if haskey(result, "path")
-        # abspath("test", "..") retains a trailing separator on Julia. Drop
-        # that lexical difference so a test project's parent source agrees with
-        # the same package's own directory, while retaining symlink spellings.
-        result["path"] = joinpath(splitpath(abspath(directory, result["path"]))...)
-    elseif haskey(result, "url")
-        url = result["url"]
-        # Pkg accepts local git repositories in url; their relative interpretation
-        # must remain tied to the source project after copying the declaration.
-        !occursin(r"^[a-zA-Z][a-zA-Z0-9+.-]*://|^[^/@:]+@[^/:]+:", url) &&
-            (result["url"] = abspath(directory, url))
-    end
-    return result
-end
-
-function _environment_project(job::AnalysisJob, contexts)
-    deps = Dict{String,String}()
-    preference_bindings = Dict{String,String}()
-    compat = Dict{String,String}()
+"The scratch Project.toml for a context, and the effective preferences of its projects."
+function _scratch_project(context::Context, envs)
+    deps, bindings, compat = Dict{String,String}(), Dict{String,String}(), Dict{String,String}()
     sources = Dict{String,Dict{String,String}}()
-    preferences = Dict{String,Any}()
     workspace = Set{String}()
-    preference_files = String[]
-    for env in contexts
-        append!(preference_files, reverse(Base.get_projects_workspace_to_root(env.project_file)))
-    end
-    for file in unique(preference_files)
-        # Julia implements __clear__, workspace inheritance, exported preferences,
-        # and JuliaLocalPreferences precedence here without consulting tool LOAD_PATH.
+    preferences = Dict{String,Any}()
+    # Julia's own merge implements workspace inheritance, `__clear__` and the precedence
+    # of JuliaLocalPreferences.toml over LocalPreferences.toml.
+    for file in unique!(reduce(vcat, (reverse(Base.get_projects_workspace_to_root(env.project_file)) for env in envs);
+                               init=String[]))
         preferences = Base.recursive_prefs_merge(preferences, Base.collect_preferences(file, nothing))
     end
-    for env in contexts
+    for env in envs
         raw = TOML.parsefile(env.project_file)
         directory = dirname(env.project_file)
-        for (name, uuid) in get(raw, "deps", Dict())
-            _environment_merge_dep!(deps, name, uuid)
-        end
+        foreach(((name, uuid),) -> _merge_dep!(deps, name, uuid), get(raw, "deps", Dict()))
         for section in ("extras", "weakdeps"), (name, uuid) in get(raw, section, Dict())
-            _environment_merge_dep!(preference_bindings, name, uuid)
+            _merge_dep!(bindings, name, uuid)
         end
-        if job.kind === :test
+        if context.test
             for name in get(get(raw, "targets", Dict()), "test", String[])
-                uuid = get(get(raw, "extras", Dict()), name,
-                    get(get(raw, "weakdeps", Dict()), name, get(deps, name, nothing)))
-                uuid === nothing && error("Test target dependency $name has no declared UUID")
-                _environment_merge_dep!(deps, name, uuid)
+                uuid = get(get(raw, "extras", Dict()), name, get(get(raw, "weakdeps", Dict()), name, get(deps, name, nothing)))
+                uuid === nothing && error("test target dependency $name has no declared UUID")
+                _merge_dep!(deps, name, uuid)
             end
         end
-        package = env.pkg
-        if package !== nothing
-            identity = _environment_package_identity(package, "Package at $directory")
-            _environment_merge_dep!(deps, identity.name, identity.uuid)
-            sources[identity.name] = Dict("path" => directory)
+        if env.pkg !== nothing
+            package = _identity(env.pkg, "package at $directory")
+            _merge_dep!(deps, package.name, package.uuid)
+            sources[package.name] = Dict("path" => directory)
         end
-        # Includes declarations for extras and extension triggers. They are filtered
-        # after all contexts have been merged, rather than discarded prematurely.
-        for (name, source) in get(raw, "sources", Dict())
-            value = _environment_source(source, directory)
-            haskey(sources, name) && sources[name] != value &&
-                error("Conflicting explicit sources for dependency $name")
-            sources[name] = value
+        for (name, declaration) in get(raw, "sources", Dict())
+            source = _source(declaration, directory)
+            get(sources, name, source) == source || error("conflicting [sources] for $name")
+            sources[name] = source
         end
-        for (name, value) in get(raw, "compat", Dict())
-            _environment_merge_compat!(compat, name, value)
-        end
+        foreach(((name, value),) -> _merge_compat!(compat, name, value), get(raw, "compat", Dict()))
         union!(workspace, dirname.(keys(env.workspace)))
     end
-    for (name, uuid) in job.triggers
-        _environment_merge_dep!(deps, name, uuid)
-    end
-    filter!(pair -> haskey(deps, first(pair)), sources)
-    filter!(pair -> first(pair) == "julia" || haskey(deps, first(pair)), compat)
+    foreach(((name, uuid),) -> _merge_dep!(deps, name, uuid), context.triggers)
+    filter!(((name, _),) -> haskey(deps, name), sources)
+    filter!(((name, _),) -> name == "julia" || haskey(deps, name), compat)
+    # Preferences may name packages through [extras]/[weakdeps]; keep those bindings
+    # without promoting the packages to dependencies.
+    filter!(((name, _),) -> !haskey(deps, name), bindings)
     project = Dict{String,Any}("deps" => deps)
-    # Preferences may name a transitive dependency through extras/weakdeps.
-    # Preserve that UUID binding without promoting it to an active dependency.
-    filter!(pair -> !haskey(deps, first(pair)), preference_bindings)
-    isempty(preference_bindings) || (project["extras"] = preference_bindings)
+    isempty(bindings) || (project["extras"] = bindings)
     isempty(compat) || (project["compat"] = compat)
     isempty(sources) || (project["sources"] = sources)
-    # Let Pkg retain native workspace constraints and explicit member identities.
-    # Pkg writes only the active scratch Project and its scratch Manifest.
+    # Pkg retains native workspace constraints and member identities this way.
     isempty(workspace) || (project["workspace"] = Dict("projects" => sort!(collect(workspace))))
     return project, preferences
 end
 
-function _environment_absolutize_entry!(entry::Pkg.Types.PackageEntry, manifest_file::String)
+function _absolute!(entry::Pkg.Types.PackageEntry, manifest_file::String)
     directory = dirname(manifest_file)
-    path = entry.path
-    path === nothing || (entry.path = abspath(directory, path))
-    repo = entry.repo
-    source = repo.source
-    if source !== nothing && !Pkg.Types.isurl(source)
-        repo.source = abspath(directory, source)
-    end
+    entry.path === nothing || (entry.path = abspath(directory, entry.path))
+    source = entry.repo.source
+    source === nothing || Pkg.Types.isurl(source) || (entry.repo.source = abspath(directory, source))
     return entry
 end
 
-function _environment_seed_manifest(contexts)
+"The existing manifests of a context's projects, merged, as the resolution seed."
+function _seed_manifest(envs)
     manifest = Pkg.Types.Manifest()
     manifest.manifest_format = v"2.0"
     manifest.julia_version = VERSION
-    for env in contexts
-        # Julia 1.13 records registry provenance separately from package entries.
-        # Keep those records when preserving entries from an existing manifest.
+    for env in envs
         merge!(manifest.registries, deepcopy(env.manifest.registries))
-        for (uuid, original) in env.manifest
-            haskey(manifest, uuid) && continue
-            manifest[uuid] = _environment_absolutize_entry!(deepcopy(original), env.manifest_file)
+        for (uuid, entry) in env.manifest
+            haskey(manifest, uuid) || (manifest[uuid] = _absolute!(deepcopy(entry), env.manifest_file))
         end
     end
     return manifest
 end
 
-function _environment_local_entry(file::String)
+function _local_entry(file::String)
     project = Pkg.Types.read_project(file)
-    identity = _environment_package_identity(project, "Path dependency at $(dirname(file))")
+    package = _identity(project, "path dependency at $(dirname(file))")
     version = something(project.version, v"0.0.0")
-    version isa VersionNumber || error("Path dependency $(identity.name) has no concrete version")
-    package = (; identity.name, identity.uuid, version,
-        deps=copy(project.deps), sources=deepcopy(project.sources))
-    entry = Pkg.Types.PackageEntry(name=package.name, uuid=package.uuid,
-        version=package.version, path=dirname(file),
-        entryfile=project.entryfile, deps=copy(project.deps),
-        weakdeps=copy(project.weakdeps), exts=copy(project.exts))
-    return package, entry
+    entry = Pkg.Types.PackageEntry(; package.name, package.uuid, version, path=dirname(file),
+        project.entryfile, deps=copy(project.deps), weakdeps=copy(project.weakdeps), exts=copy(project.exts))
+    return (; package..., deps=project.deps, sources=project.sources), entry
 end
 
-function _environment_refresh_paths!(manifest, project::Dict, contexts, fingerprints)
-    pending = Tuple{String,UUID}[]
+"""
+Point every path dependency at its declared location and refresh its metadata from its
+current Project.toml, since a manifest's copy of it can be stale. Entries nothing reaches
+any more are dropped, so an obsolete developed checkout cannot fail preparation.
+"""
+function _refresh_paths!(manifest, project::Dict, envs)
     declared = Dict{UUID,Dict{String,String}}()
-    root_sources = Set{UUID}()
+    explicit = Set{UUID}()
+    pending = Tuple{String,UUID}[(name, UUID(uuid)) for (name, uuid) in project["deps"]]
     for (name, source) in get(project, "sources", Dict())
         uuid = UUID(project["deps"][name])
         declared[uuid] = source
-        push!(root_sources, uuid)
+        push!(explicit, uuid)
     end
-    for (name, uuid) in project["deps"]
-        push!(pending, (name, UUID(uuid)))
+    function declare!(uuid, source, name)
+        get(declared, uuid, source) == source || error("conflicting sources for $name ($uuid)")
+        declared[uuid] = source
     end
-    for env in contexts, (file, member) in env.workspace
-        append!(pending, ((name, uuid) for (name, uuid) in member.deps))
-        member_uuid, member_name = member.uuid, member.name
-        if member_uuid !== nothing && member_name !== nothing
-            source = Dict("path" => dirname(file))
-            haskey(declared, member_uuid) && declared[member_uuid] != source &&
-                error("Conflicting explicit workspace source for $member_name")
-            declared[member_uuid] = source
-            push!(root_sources, member_uuid)
-            push!(pending, (member_name, member_uuid))
+    edges(deps) = ((name, uuid) for (name, uuid) in deps)
+    for env in envs, (file, member) in env.workspace
+        append!(pending, edges(member.deps))
+        if member.uuid !== nothing && member.name !== nothing
+            declare!(member.uuid, Dict("path" => dirname(file)), member.name)
+            push!(explicit, member.uuid)
+            push!(pending, (member.name, member.uuid))
         end
         for (name, source) in member.sources
             haskey(member.deps, name) || continue
-            uuid = member.deps[name]
-            value = _environment_source(source, dirname(file))
-            haskey(declared, uuid) && declared[uuid] != value &&
-                error("Conflicting explicit workspace source for $name")
-            declared[uuid] = value
-            push!(root_sources, uuid)
+            declare!(member.deps[name], _source(source, dirname(file)), name)
+            push!(explicit, member.deps[name])
         end
     end
     seen = Set{UUID}()
@@ -312,145 +199,191 @@ function _environment_refresh_paths!(manifest, project::Dict, contexts, fingerpr
         path = source === nothing ? (old === nothing ? nothing : old.path) : get(source, "path", nothing)
         if path === nothing
             if old === nothing && Pkg.Types.is_stdlib(uuid)
-                file = _environment_project_file(Pkg.Types.stdlib_path(name))
+                file = _project_file(Pkg.Types.stdlib_path(name))
                 if file !== nothing
-                    _, entry = _environment_local_entry(file)
+                    _, entry = _local_entry(file)
                     entry.path = nothing
-                    manifest[uuid] = entry
-                    old = entry
+                    manifest[uuid] = old = entry
                 end
             elseif source !== nothing && haskey(source, "url") && old !== nothing && old.path !== nothing
-                # An explicit URL replaces a stale developed checkout. Pkg will
-                # populate the new exact repository entry during resolution.
+                # An explicit URL replaces a stale developed checkout; resolution fills it in.
                 delete!(manifest.deps, uuid)
                 old = nothing
             end
-            old === nothing || append!(pending, ((name, uuid) for (name, uuid) in old.deps))
+            old === nothing || append!(pending, edges(old.deps))
             continue
         end
-        path = abspath(path)
-        file = _environment_project_file(path)
-        file === nothing && error("Explicit path dependency $name ($uuid) is unavailable at $path")
-        local_project, entry = _environment_local_entry(file)
-        local_project.uuid == uuid || error("UUID mismatch for $name at $path: expected $uuid, found $(local_project.uuid)")
-        local_project.name == name || error("Package name mismatch at $path: expected $name, found $(local_project.name)")
-        manifest[local_project.uuid] = entry
-        _environment_fingerprint!(fingerprints, file)
-        for (child, source) in local_project.sources
-            haskey(local_project.deps, child) || continue
-            child_uuid = local_project.deps[child]
-            child_uuid in root_sources && continue
-            value = _environment_source(source, dirname(file))
-            haskey(declared, child_uuid) && declared[child_uuid] != value &&
-                error("Conflicting explicit sources for $child ($child_uuid)")
-            declared[child_uuid] = value
+        file = _project_file(abspath(path))
+        file === nothing && error("path dependency $name ($uuid) is missing at $path")
+        package, entry = _local_entry(file)
+        package.uuid == uuid || error("UUID mismatch for $name at $path: expected $uuid, found $(package.uuid)")
+        package.name == name || error("package name mismatch at $path: expected $name, found $(package.name)")
+        manifest[uuid] = entry
+        for (child, child_source) in package.sources
+            haskey(package.deps, child) && !(package.deps[child] in explicit) &&
+                declare!(package.deps[child], _source(child_source, dirname(file)), child)
         end
-        append!(pending, ((name, uuid) for (name, uuid) in local_project.deps))
+        append!(pending, edges(package.deps))
     end
-    # A source manifest can contain obsolete or unrelated developed packages.
-    # They must not make an otherwise loadable selected context fail preparation.
-    filter!(pair -> first(pair) in seen, manifest.deps)
+    filter!(((uuid, _),) -> uuid in seen, manifest.deps)
     return manifest
 end
 
-function _environment_unavailable(env)
+function _unavailable(env)
     missing = String[]
     for (name, uuid) in env.project.deps
-        Pkg.Types.is_stdlib(uuid) && continue
-        haskey(env.manifest, uuid) || push!(missing, "$name ($uuid): absent from the prepared manifest")
+        Pkg.Types.is_stdlib(uuid) || haskey(env.manifest, uuid) || push!(missing, "$name ($uuid)")
     end
     for entry in values(env.manifest), (name, uuid) in entry.deps
-        Pkg.Types.is_stdlib(uuid) && continue
-        haskey(env.manifest, uuid) || push!(missing, "$name ($uuid): dependency of $(entry.name) is unresolved")
+        Pkg.Types.is_stdlib(uuid) || haskey(env.manifest, uuid) || push!(missing, "$name ($uuid), needed by $(entry.name)")
     end
-    isempty(missing) || return join(sort!(unique!(missing)), "; ")
-    Pkg.Operations.is_instantiated(env, true) || return "Required package sources or artifacts are not installed"
+    isempty(missing) || return "unresolved dependencies: " * join(sort!(unique!(missing)), "; ")
+    Pkg.Operations.is_instantiated(env, true) || return "package sources or artifacts are not installed"
     return ""
 end
 
-function _environment_resolve_without_builds!(ctx::Pkg.Types.Context; preserve_exact::Bool=true, download::Bool=true)
-    # Pkg.resolve/update eventually call Operations.up, whose last operation runs
-    # package build scripts even when a later instantiate disables builds. Use
-    # Pkg's native resolution/download stages directly and stop before that step.
-    # This uses Pkg 1.13's native stages, not a custom resolver.
-    operations = Pkg.Operations
-    operations.prune_manifest(ctx.env)
+"""
+Resolve and download with Pkg's own stages, stopping before the build step that
+`Pkg.resolve` would run. `exact` keeps the seed manifest's versions.
+"""
+function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool=true)
+    ops = Pkg.Operations
+    ops.prune_manifest(ctx.env)
     packages = Pkg.Types.PackageSpec[]
-    mode = preserve_exact ? Pkg.PKGMODE_MANIFEST : Pkg.PKGMODE_PROJECT
-    level = preserve_exact ? Pkg.UPLEVEL_FIXED : Pkg.UPLEVEL_MAJOR
-    Pkg.API.append_all_pkgs!(packages, ctx, mode; workspace=true)
+    Pkg.API.append_all_pkgs!(packages, ctx, exact ? Pkg.PKGMODE_MANIFEST : Pkg.PKGMODE_PROJECT; workspace=true)
     for package in packages
         Pkg.API.update_source_if_set(ctx.env, package)
-        identity = _environment_package_identity(package, "Resolved dependency")
-        path, repo = Pkg.Types.get_path_repo(ctx.env.project, ctx.env.project_file,
-            ctx.env.manifest_file, identity.name)
-        entry = get(ctx.env.manifest, identity.uuid, nothing)
-        operations.up_load_versions!(ctx, package, entry, path, repo, level)
+        identity = _identity(package, "dependency")
+        path, repo = Pkg.Types.get_path_repo(ctx.env.project, ctx.env.project_file, ctx.env.manifest_file, identity.name)
+        ops.up_load_versions!(ctx, package, get(ctx.env.manifest, identity.uuid, nothing), path, repo,
+                              exact ? Pkg.UPLEVEL_FIXED : Pkg.UPLEVEL_MAJOR)
     end
     for package in packages
-        operations.up_load_manifest_info!(package, get(ctx.env.manifest, package.uuid, nothing))
+        ops.up_load_manifest_info!(package, get(ctx.env.manifest, package.uuid, nothing))
     end
-    preserve = preserve_exact ? Pkg.PRESERVE_NONE : Pkg.PRESERVE_DIRECT
-    packages = operations.load_direct_deps(ctx.env, packages; preserve)
-    operations.check_registered(ctx.registries, packages)
-    dependency_map = operations.resolve_versions!(ctx.env, ctx.registries, packages, ctx.julia_version, false)
-    operations.update_manifest!(ctx.env, packages, dependency_map, ctx.julia_version, ctx.registries)
-    download && operations.download_source(ctx)
-    operations.fixups_from_projectfile!(ctx)
-    download && operations.download_artifacts(ctx; julia_version=ctx.julia_version)
+    packages = ops.load_direct_deps(ctx.env, packages; preserve=exact ? Pkg.PRESERVE_NONE : Pkg.PRESERVE_DIRECT)
+    ops.check_registered(ctx.registries, packages)
+    dependencies = ops.resolve_versions!(ctx.env, ctx.registries, packages, ctx.julia_version, false)
+    ops.update_manifest!(ctx.env, packages, dependencies, ctx.julia_version, ctx.registries)
+    download && ops.download_source(ctx)
+    ops.fixups_from_projectfile!(ctx)
+    download && ops.download_artifacts(ctx; julia_version=ctx.julia_version)
     Pkg.Types.write_env(ctx.env; update_undo=false)
     return nothing
 end
 
-"Prepare an isolated target environment without modifying source projects or manifests."
-function prepare_environment(job::AnalysisJob, directory::String; instantiate::Bool=true)::EnvironmentResult
+const _JETLS = UUID("a3b70258-0602-4ee2-b5a6-54c2470400db")
+const _JETLSCORE = UUID("8d6afe4c-923b-5912-b63d-b990009c9e74")
+const _TESTRUNNER = UUID("65a77010-ae58-5cc9-8243-71cff1cf0f92")
+
+function _entry_source(entry::Pkg.Types.PackageEntry, manifest_file::String)
+    entry.path === nothing || return Dict("path" => abspath(dirname(manifest_file), entry.path))
+    repo = entry.repo
+    repo.source === nothing && return nothing
+    source = Dict("url" => repo.source, "rev" => something(repo.rev, string(entry.tree_hash)))
+    repo.subdir === nothing || (source["subdir"] = repo.subdir)
+    return source
+end
+
+"""
+Add the analyzer to a scratch environment: JETLS with its Revise-based package analysis
+enabled, and TestRunner, which JETLS requires as a direct dependency. Resolving tool and
+target together gives packages they share, such as Revise, one version for both.
+"""
+function _add_tool!(project::Dict, preferences::Dict, manifest)
+    tool = Pkg.Types.EnvCache(tool_project())
+    for (uuid, entry) in tool.manifest
+        haskey(manifest, uuid) || (manifest[uuid] = _absolute!(deepcopy(entry), tool.manifest_file))
+    end
+    mergewith!((a, _) -> a, manifest.registries, deepcopy(tool.manifest.registries))
+    sources = get!(project, "sources", Dict{String,Dict{String,String}}())
+    for uuid in (_JETLS, _TESTRUNNER)
+        entry = tool.manifest[uuid]
+        _merge_dep!(project["deps"], entry.name, uuid)
+        source = _entry_source(entry, tool.manifest_file)
+        source === nothing || haskey(sources, entry.name) || (sources[entry.name] = source)
+    end
+    get!(project, "extras", Dict{String,String}())["JETLSCore"] = string(_JETLSCORE)
+    preferences["JETLSCore"] = merge(get(preferences, "JETLSCore", Dict{String,Any}()), Dict("JETLS_DEV_MODE" => true))
+    # Pkg applies root compat bounds by name, which would also constrain JETLS's privately
+    # vendored namesakes, such as its own JET. Check those bounds after resolution instead.
+    named = merge(project["deps"], get(project, "extras", Dict{String,String}()))
+    compat = get(project, "compat", Dict{String,String}())
+    deferred = Dict{String,String}()
+    for (name, bound) in collect(compat)
+        name == "julia" && continue
+        any(entry -> entry.name == name && string(entry.uuid) != get(named, name, ""), values(manifest)) &&
+            (deferred[name] = pop!(compat, name))
+    end
+    return deferred
+end
+
+function _check_deferred(env, deferred::Dict{String,String})
+    for (name, bound) in deferred
+        uuid = get(env.project.deps, name, nothing)
+        uuid === nothing && continue
+        version = env.manifest[uuid].version
+        version === nothing || version in Pkg.Types.semver_spec(bound) ||
+            error("$name $version does not satisfy its compat bound $(repr(bound))")
+    end
+end
+
+"""
+    prepare(context, directory; instantiate=true) -> Environment
+
+Write the analysis environment for `context` into the empty `directory`: the combined
+dependencies, sources, compat bounds and effective preferences of its projects, together
+with the analyzer, resolved from their existing manifests where possible. With
+`instantiate`, missing packages are downloaded. The environment is then precompiled;
+dependency build scripts never run.
+"""
+function prepare(context::Context, directory::String; instantiate::Bool=true)
     directory = abspath(directory)
-    fingerprints = Dict{String,String}()
     try
-        contexts = _environment_contexts(job)
-        merge!(fingerprints, _environment_fingerprints(contexts))
-        # Accidental use of an existing target directory must never overwrite it.
-        isdir(directory) && !isempty(readdir(directory)) &&
-            error("Preparation directory must be empty: $directory")
+        isdir(directory) && !isempty(readdir(directory)) && error("preparation directory is not empty: $directory")
         mkpath(directory)
-        project, preferences = _environment_project(job, contexts)
-        manifest = _environment_seed_manifest(contexts)
-        _environment_refresh_paths!(manifest, project, contexts, fingerprints)
+        envs = _context_envs(context)
+        project, preferences = _scratch_project(context, envs)
+        manifest = _refresh_paths!(_seed_manifest(envs), project, envs)
+        deferred = _add_tool!(project, preferences, manifest)
         project_file = joinpath(directory, "Project.toml")
         open(io -> TOML.print(io, project; sorted=true), project_file, "w")
-        isempty(preferences) || open(io -> TOML.print(io, preferences; sorted=true),
-            joinpath(directory, "LocalPreferences.toml"), "w")
+        open(io -> TOML.print(io, preferences; sorted=true), joinpath(directory, "LocalPreferences.toml"), "w")
         env = Pkg.Types.EnvCache(project_file)
-        # Newly promoted dependencies may not have manifest entries yet. Supply the
-        # partial seed in memory: reading an incomplete manifest from disk would
-        # reject it before Pkg gets an opportunity to resolve the missing nodes.
+        # Supply the partial seed in memory: Pkg rejects an incomplete manifest on disk
+        # before it can resolve the missing entries.
         env.manifest = manifest
-        message = ""
+        notes = String[]
         if instantiate
-            ctx = Pkg.Types.Context(env=env)
-            resolution_seed = deepcopy(env)
-            withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
-                # Fixed-level resolve retains available manifest versions and also
-                # refreshes stale deps/weakdeps/extensions for developed packages.
-                try
-                    _environment_resolve_without_builds!(ctx)
-                catch err
-                    err isa Pkg.Resolve.ResolverError || rethrow()
-                    message = "Exact manifest versions were incompatible; Pkg re-resolved the isolated environment."
-                    ctx.env = deepcopy(resolution_seed)
-                    _environment_resolve_without_builds!(ctx; preserve_exact=false)
-                end
+            ctx = Pkg.Types.Context(; env)
+            seed = deepcopy(env)
+            try
+                _resolve!(ctx; exact=true)
+            catch err
+                err isa Pkg.Resolve.ResolverError || rethrow()
+                ctx.env = deepcopy(seed)
+                _resolve!(ctx; exact=false)
+                changed = sort!(["$(entry.name) $(entry.version) → $(ctx.env.manifest[uuid].version)"
+                                 for (uuid, entry) in seed.manifest if haskey(ctx.env.manifest, uuid) &&
+                                 entry.version !== nothing && entry.version != ctx.env.manifest[uuid].version])
+                push!(notes, "The locked versions are incompatible with this context, so it was re-resolved" *
+                    (isempty(changed) ? "." : ": " * join(changed, ", ") * "."))
             end
             env = Pkg.Types.EnvCache(project_file)
         end
-        unavailable = _environment_unavailable(env)
-        isempty(unavailable) || error("Environment unavailable$(instantiate ? "" : " with instantiate=false"): $unavailable")
+        unavailable = _unavailable(env)
+        isempty(unavailable) || error(instantiate ? unavailable : "$unavailable (downloads are disabled)")
         instantiate || Pkg.Types.write_manifest(env.manifest, joinpath(directory, "Manifest.toml"))
-        return EnvironmentResult(status=:ready, project=directory,
-            load_paths=[directory, "@stdlib"], message=message, fingerprints=fingerprints)
+        _check_deferred(env, deferred)
+        try
+            Pkg.precompile(Pkg.Types.Context(; env), Pkg.Types.PackageSpec[]; already_instantiated=true, warn_loaded=false)
+        catch err
+            err isa InterruptException && rethrow()
+            push!(notes, "Some packages failed to precompile and load from source: " * first(split(sprint(showerror, err), '\n')))
+        end
+        return Environment(:ready, directory, join(notes, " "))
     catch err
         err isa InterruptException && rethrow()
-        return EnvironmentResult(status=:failed, project=directory,
-            message=sprint(showerror, err), fingerprints=fingerprints)
+        return Environment(:failed, directory, sprint(showerror, err))
     end
 end

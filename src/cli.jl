@@ -1,115 +1,90 @@
-const CLI_HELP = """
-JETSweep — recursive Julia workspace analysis with JETLS
+const HELP = """
+    jetsweep — analyze every Julia package, extension, test and script below a directory with JETLS
 
-Usage: jetsweep [OPTIONS] DIRECTORY
+    Usage: jetsweep [OPTIONS] DIRECTORY
 
-  --jobs N                  Concurrent isolated workers (default: CPU/RAM-based, up to 12)
-  --threads N               Julia threads per worker (default: 2)
-  --gpus auto|none|LIST      GPU indices or UUIDs assigned round-robin (default: auto)
-  --timeout SECONDS         Time limit per environment or analysis job; 0 disables (default: 1200)
-  --output DIRECTORY        New or empty report directory (default: DIRECTORY/.jetsweep/RUN)
-  --config FILE             Context overrides (default: DIRECTORY/.JETSweep.toml if present)
-  --exclude GLOB            Exclude a root-relative pattern from discovery; repeatable
-  --include-ignored         Include Git-ignored files in discovery
-  --tracked-only            Exclude untracked files from discovery inside Git repositories
-  --no-instantiate          Use locally available dependencies only
-  --plan                    Discover files and write a job plan without starting analysis
-  --fail-on LEVEL           error, warning, info, hint, or none (default: hint)
-  --help                    Show this help
-  --version                 Show the JETSweep version
+    Options:
+      --jobs N            CPU slots for parallel analyses (default: CPU threads, capped by memory)
+      --threads N         Threads for package and extension analyses (default: 4)
+      --timeout SECONDS   Time limit for each analysis or environment; 0 disables (default: 1800)
+      --gpus auto|none|LIST
+                          GPUs (indices or UUIDs) assigned round-robin through CUDA_VISIBLE_DEVICES
+                          (default: auto)
+      --output DIRECTORY  New or empty report directory (default: DIRECTORY/.jetsweep/TIMESTAMP)
+      --config FILE       Configuration file (default: DIRECTORY/.JETSweep.toml, if present)
+      --exclude GLOB      Skip matching paths, relative to DIRECTORY; repeatable
+      --include-ignored   Include files Git ignores
+      --tracked-only      Include only files Git tracks
+      --offline           Use only packages already installed
+      --plan              Write the inventory and analysis plan without analyzing
+      --fail-on LEVEL     Lowest severity that fails: error, warning, info, hint or none
+                          (default: hint)
+      --version           Show the version
+      --help              Show this help
 
-Packages, nested packages, tests, extensions and standalone Julia scripts are
-included. Dependencies resolve in isolated metadata environments. Reports retain
-all diagnostic severities and explicitly record unavailable or incomplete contexts.
-Exclusions filter discovery. To omit a package's direct jobs, exclude its directory;
-other analyzed packages may still load it as a dependency.
+    Exit status: 0 when every analysis completed without diagnostics at or above the
+    --fail-on level, 1 when some did, 2 when an analysis is incomplete or failed or an input
+    changed during the run, and 130 when interrupted.
 
-Exit codes: 0 completed below the selected severity; 1 findings; 2 incomplete/error;
-130 interrupted. Analysis can execute Julia imports, macros and generated code;
-use it on workspaces you trust. It does not run the functional test suites.
-"""
+    Analysis loads packages and runs their top-level code, macros and generated functions;
+    use JETSweep only on code you trust.
+    """
 
-function _parse_cli(arguments::Vector{String})
+function parse_arguments(arguments::Vector{String})
     values = Dict{Symbol,Any}()
-    excludes = String[]
-    roots = String[]
-    index = 1
-    options_done = false
-    while index <= length(arguments)
-        argument = arguments[index]
-        if argument == "--" && !options_done
-            options_done = true
-        elseif !options_done && startswith(argument, "--")
-            option, inline = if occursin('=', argument)
-                parts = split(argument, '='; limit=2)
-                String(parts[1]), String(parts[2])
-            else
-                argument, nothing
+    exclude = String[]
+    directories = String[]
+    flags = Dict("--include-ignored" => :include_ignored, "--tracked-only" => :tracked_only,
+                 "--offline" => :instantiate, "--plan" => :plan_only)
+    options = ("--jobs", "--threads", "--timeout", "--gpus", "--output", "--config", "--exclude", "--fail-on")
+    i = 1
+    while i <= length(arguments)
+        argument = arguments[i]
+        if argument == "--"
+            append!(directories, arguments[i+1:end])
+            break
+        elseif haskey(flags, argument)
+            values[flags[argument]] = argument != "--offline"
+        elseif startswith(argument, "--")
+            name, value = occursin('=', argument) ? split(argument, '='; limit=2) :
+                (argument, i < length(arguments) ? arguments[i += 1] : nothing)
+            name in options || throw(ArgumentError("unknown option $name"))
+            (value === nothing || isempty(value)) && throw(ArgumentError("$name needs a value"))
+            value = String(value)
+            if name == "--exclude"
+                push!(exclude, value)
+                i += 1
+                continue
             end
-            booleans = Dict("--plan" => :plan_only, "--include-ignored" => :include_ignored,
-                            "--tracked-only" => :include_untracked, "--no-instantiate" => :instantiate)
-            if haskey(booleans, option)
-                inline === nothing || throw(ArgumentError("$option takes no value"))
-                values[booleans[option]] = option in ("--plan", "--include-ignored")
-            else
-                option in ("--jobs", "--threads", "--gpus", "--timeout", "--output", "--config", "--exclude", "--fail-on") ||
-                    throw(ArgumentError("unknown option: $option"))
-                if inline === nothing
-                    index += 1
-                    index <= length(arguments) || throw(ArgumentError("$option requires a value"))
-                    inline = arguments[index]
-                end
-                isempty(inline) && throw(ArgumentError("$option requires a nonempty value"))
-                if option == "--exclude"
-                    push!(excludes, inline)
-                else
-                    key, value = if option == "--jobs"
-                        :jobs, parse(Int, inline)
-                    elseif option == "--threads"
-                        :threads, parse(Int, inline)
-                    elseif option == "--timeout"
-                        :timeout, parse(Float64, inline)
-                    elseif option == "--gpus"
-                        :gpu_devices, String.(strip.(split(inline, ',')))
-                    elseif option == "--fail-on"
-                        :fail_severity, Symbol(inline)
-                    elseif option == "--output"
-                        :output, abspath(inline)
-                    else
-                        :config, abspath(inline)
-                    end
-                    haskey(values, key) && throw(ArgumentError("$option was specified more than once"))
-                    values[key] = value
-                end
-            end
-        elseif !options_done && startswith(argument, '-')
-            throw(ArgumentError("unknown option: $argument"))
+            key, parsed = name == "--jobs" ? (:jobs, parse(Int, value)) :
+                name == "--threads" ? (:threads, parse(Int, value)) :
+                name == "--timeout" ? (:timeout, parse(Float64, value)) :
+                name == "--gpus" ? (:gpus, String.(strip.(split(value, ',')))) :
+                name == "--output" ? (:output, abspath(value)) :
+                name == "--config" ? (:config, abspath(value)) : (:fail_on, Symbol(value))
+            haskey(values, key) && throw(ArgumentError("$name given more than once"))
+            values[key] = parsed
+        elseif startswith(argument, "-")
+            throw(ArgumentError("unknown option $argument"))
         else
-            push!(roots, argument)
+            push!(directories, argument)
         end
-        index += 1
+        i += 1
     end
-    length(roots) == 1 || throw(ArgumentError("supply exactly one directory; use --help for usage"))
-    options = SweepOptions(; values..., excludes)
-    isfinite(options.timeout) || throw(ArgumentError("timeout must be finite"))
-    return only(roots), options
+    length(directories) == 1 || throw(ArgumentError("give exactly one directory; see `jetsweep --help`"))
+    return only(directories), SweepOptions(; values..., exclude)
 end
 
 function (@main)(arguments::Vector{String})::Cint
-    if arguments == ["--help"] || arguments == ["-h"]
-        print(stdout, CLI_HELP)
-        return 0
-    elseif arguments == ["--version"]
-        println("JETSweep ", pkgversion(@__MODULE__))
-        return 0
-    end
+    arguments in (["--help"], ["-h"]) && (print(stdout, HELP); return 0)
+    arguments == ["--version"] && (println(stdout, "JETSweep ", pkgversion(@__MODULE__)); return 0)
     try
-        root, options = _parse_cli(arguments)
-        return Cint(sweep(root; options).exit_code)
-    catch error
-        error isa InterruptException && return 130
-        print(stderr, "JETSweep: ")
-        showerror(stderr, error)
+        directory, options = parse_arguments(arguments)
+        return sweep(directory; options).exit_code
+    catch err
+        err isa InterruptException && return 130
+        print(stderr, "jetsweep: ")
+        showerror(stderr, err)
         println(stderr)
         return 2
     end

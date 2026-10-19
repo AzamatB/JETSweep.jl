@@ -1,86 +1,119 @@
-function _file_coverage(report::SweepResult)
-    covered = Set{String}()
-    attempted = Set{String}()
-    for result in report.results
-        union!(attempted, _canonical_file.(get(result, "expected_files", String[])))
-        get(result, "full_analysis_complete", false) &&
-            union!(covered, _canonical_file.(get(result, "analyzed_files", String[])))
-    end
-    return [Dict("path" => file.path, "kind" => String(file.kind),
-        "status" => _canonical_file(file.path) in covered ? "covered" :
-                    _canonical_file(file.path) in attempted ? "incomplete" : "not_analyzed")
-            for file in report.inventory.files]
+_display(path::String, root::String) = _within(path, root) ? relpath(path, root) : path
+
+function write_inventory(file::String, inventory::Inventory)
+    _write_toml(file, Dict(
+        "root" => inventory.root,
+        "projects" => [Dict("dir" => p.dir, "file" => p.file, "name" => p.name, "uuid" => p.uuid,
+                            "entry" => p.entry, "extensions" => p.extensions) for p in inventory.projects],
+        "sources" => [Dict("path" => s.path, "kind" => String(s.kind), "project" => s.project, "owner" => s.owner)
+                      for s in inventory.sources],
+        "excluded" => inventory.excluded, "issues" => inventory.issues))
 end
 
-function write_report(report::SweepResult; io::IO=stderr)
+function _unit_dict(unit::Unit)
+    return Dict("id" => unit.id, "kind" => String(unit.kind), "entry" => unit.entry,
+        "expected" => unit.expected, "driver" => unit.driver, "extension" => unit.extension,
+        "context" => Dict("project" => unit.context.project, "owner" => unit.context.owner,
+                          "test" => unit.context.test, "triggers" => unit.context.triggers),
+        "setup" => unit.overrides.setup, "args" => unit.overrides.args, "env" => unit.overrides.env,
+        "jetls_config" => unit.overrides.jetls_config, "notes" => unit.notes)
+end
+
+write_plan(file::String, units::Vector{Unit}, root::String) =
+    _write_toml(file, Dict("root" => root, "units" => _unit_dict.(units)))
+
+function report_progress(io::IO, unit::Unit, result::UnitResult, done::Int, total::Int, root::String)
+    width = ndigits(total)
+    detail = if !complete(result)
+        isempty(result.reasons) ? "" : first(split(first(result.reasons), '\n'))
+    else
+        isempty(result.findings) ? "" : "$(length(result.findings)) diagnostics"
+    end
+    println(io, "[", lpad(done, width), "/", total, "] ", rpad(String(result.status), 11),
+            lpad(string(round(result.seconds; digits=1), "s"), 7), "  ", _display(unit.entry, root),
+            isempty(unit.extension) ? "" : " ($(unit.extension))", isempty(detail) ? "" : " — $detail")
+    flush(io)
+end
+
+"Findings deduplicated across units, which can analyze the same file."
+function unique_findings(results::Vector{UnitResult})
+    findings = unique!(reduce(vcat, (result.findings for result in results); init=Finding[]))
+    return sort!(findings; by=f -> (f.file, f.line, f.column, f.code, f.message))
+end
+
+function exit_code(inventory::Inventory, results::Vector{UnitResult}, changed::Vector{String}, fail_on::Symbol)
+    (!isempty(inventory.issues) || !isempty(changed) || !all(complete, results)) && return 2
+    threshold = fail_on === :none ? 0 : findfirst(==(fail_on), SEVERITIES)
+    return any(f -> f.severity <= threshold, unique_findings(results)) ? 1 : 0
+end
+
+const _SEVERITY_NAMES = ("error", "warning", "info", "hint")
+
+function write_report(result::SweepResult; io::IO=stderr)
+    root = result.root
+    findings = unique_findings(result.results)
     statuses = Dict{String,Int}()
-    diagnostics = Dict{Tuple{String,Int,Int,String,Int,String},Dict{String,Any}}()
-    for result in report.results
-        status = get(result, "status", "analysis_incomplete")
-        statuses[status] = get(statuses, status, 0) + 1
-        for diagnostic in get(result, "diagnostics", [])
-            key = (String(get(diagnostic, "file", "")), Int(get(diagnostic, "line", 0)),
-                Int(get(diagnostic, "column", 0)), String(get(diagnostic, "code", "")),
-                Int(get(diagnostic, "severity", 1)), String(get(diagnostic, "message", "")))
-            diagnostics[key] = diagnostic
-        end
-    end
-    unique_diagnostics = [diagnostics[key] for key in sort!(collect(keys(diagnostics)))]
-    coverage = _file_coverage(report)
-    record = Dict{String,Any}(
-        "schema_version" => 1, "root" => report.root, "output" => report.output,
-        "started" => report.started, "finished" => report.finished,
-        "exit_code" => report.exit_code,
-        "status" => report.exit_code == 2 ? "incomplete" :
-                    isempty(unique_diagnostics) ? "clean" : "findings",
-        "julia_version" => string(VERSION), "jetsweep_version" => string(pkgversion(@__MODULE__)),
-        "files" => length(report.inventory.files),
-        "packages" => count(project -> !isempty(project.entry), report.inventory.projects),
-        "jobs" => length(report.jobs), "job_statuses" => statuses,
-        "discovery_issues" => report.inventory.issues,
-        "excluded" => report.inventory.excluded, "input_changes" => report.input_changes,
-        "coverage" => coverage, "diagnostics" => unique_diagnostics, "results" => report.results,
-        "scope" => "JETLS full and live diagnostics in the recorded environments. Source coverage does not prove inference for every possible concrete method specialization. Tests and scripts are analyzed, not a substitute for running their functional or numerical suites.")
-    write_toml(joinpath(report.output, "report.toml"), record)
-    open(joinpath(report.output, "summary.txt"), "w") do summary
-        println(summary, "JETSweep $(record["status"]): $(record["files"]) files, $(record["packages"]) packages, $(record["jobs"]) jobs")
-        println(summary, "Root: ", report.root)
-        println(summary, "Exit code: ", report.exit_code)
-        for status in sort!(collect(keys(statuses)))
-            println(summary, "  $status: $(statuses[status])")
-        end
-        println(summary, "Unique diagnostics: ", length(unique_diagnostics))
-        println(summary, "Excluded paths: ", length(report.inventory.excluded))
-        for issue in report.inventory.issues
-            println(summary, "Discovery: ", issue)
-        end
-        for path in report.input_changes
-            println(summary, "Changed input: ", path)
-        end
-        for result in report.results
-            get(result, "full_analysis_complete", false) && continue
-            println(summary, '\n', get(result, "entry", "Unknown entry"), " [",
-                get(result, "status", "analysis_incomplete"), "]")
-            error = string(get(result, "error", ""))
-            isempty(error) || println(summary, "  ", first(split(error, '\n')))
-            for key in ("protocol_errors", "blocking_issues", "internal_errors")
-                for reason in get(result, key, String[])
-                    println(summary, "  ", reason)
-                end
+    foreach(r -> statuses[String(r.status)] = get(statuses, String(r.status), 0) + 1, result.results)
+    severities = [count(f -> f.severity == s, findings) for s in 1:4]
+    codes = Dict{String,Int}()
+    foreach(f -> codes[f.code] = get(codes, f.code, 0) + 1, findings)
+    analyzed = Set(file for r in result.results if complete(r) for file in r.analyzed)
+    unanalyzed = sort!([s.path for s in result.inventory.sources if !(realpath(s.path) in analyzed)])
+    byid = Dict(unit.id => unit for unit in result.units)
+    _write_toml(joinpath(result.output, "report.toml"), Dict(
+        "root" => root, "julia" => string(VERSION), "jetsweep" => string(pkgversion(@__MODULE__)),
+        "seconds" => result.seconds, "exit_code" => result.exit_code,
+        "files" => length(result.inventory.sources), "units" => length(result.units), "statuses" => statuses,
+        "discovery_issues" => result.inventory.issues, "changed_during_run" => result.changed,
+        "unanalyzed" => unanalyzed,
+        "results" => [Dict("unit" => r.unit, "kind" => String(byid[r.unit].kind), "entry" => byid[r.unit].entry,
+                           "status" => String(r.status), "seconds" => r.seconds, "findings" => length(r.findings),
+                           "reasons" => r.reasons, "notes" => r.notes, "log" => r.log) for r in result.results],
+        "findings" => [Dict("file" => f.file, "line" => f.line, "column" => f.column, "end_line" => f.end_line,
+                            "end_column" => f.end_column, "severity" => _SEVERITY_NAMES[f.severity],
+                            "code" => f.code, "message" => f.message) for f in findings]))
+    open(joinpath(result.output, "summary.txt"), "w") do summary
+        for finding in findings
+            println(summary, _display(finding.file, root), ':', finding.line, ':', finding.column, ": ",
+                    _SEVERITY_NAMES[finding.severity], " [", finding.code, "]")
+            for line in eachsplit(finding.message, '\n')
+                println(summary, "    ", line)
             end
-            for file in get(result, "missing_files", String[])
-                println(summary, "  Missing source coverage: ", file)
-            end
-            log = get(result, "log", "")
-            isempty(log) || println(summary, "  Log: ", log)
         end
-        println(summary, '\n', record["scope"])
-        for diagnostic in unique_diagnostics
-            println(summary, '\n', get(diagnostic, "file", ""), ':', get(diagnostic, "line", 0),
-                ':', get(diagnostic, "column", 0), " [", get(diagnostic, "code", ""), "]")
-            println(summary, get(diagnostic, "message", ""))
-        end
+        isempty(findings) || println(summary)
+        _summarize(summary, result, findings, statuses, severities, codes, unanalyzed, byid)
     end
-    println(io, "$(length(unique_diagnostics)) unique diagnostics; report: $(joinpath(report.output, "report.toml"))")
-    return record
+    _summarize(io, result, findings, statuses, severities, codes, unanalyzed, byid)
+    return nothing
+end
+
+function _summarize(io::IO, result::SweepResult, findings, statuses, severities, codes, unanalyzed, byid)
+    root = result.root
+    println(io)
+    println(io, "JETSweep analyzed $(length(result.units)) units in $(round(result.seconds; digits=1)) s: ",
+            join(("$n $status" for (status, n) in sort!(collect(statuses))), ", "))
+    println(io, length(findings), " unique diagnostics",
+            isempty(findings) ? "" : ": " * join(("$n $(_SEVERITY_NAMES[s])" for (s, n) in pairs(severities) if n > 0), ", "))
+    for (code, n) in first(sort!(collect(codes); by=last, rev=true), 10)
+        println(io, "  ", lpad(n, 6), "  ", code)
+    end
+    for issue in result.inventory.issues
+        println(io, "Discovery issue: ", issue)
+    end
+    for file in result.changed
+        println(io, "Changed during the run: ", _display(file, root))
+    end
+    for r in result.results
+        complete(r) && continue
+        unit = byid[r.unit]
+        println(io, "Incomplete ($(r.status)): ", _display(unit.entry, root), isempty(unit.extension) ? "" : " ($(unit.extension))")
+        for reason in first(r.reasons, 3)
+            println(io, "    ", first(split(reason, '\n')))
+        end
+        isempty(r.log) || println(io, "    log: ", r.log)
+    end
+    isempty(unanalyzed) || println(io, length(unanalyzed), " files were not covered by a complete analysis")
+    println(io, "Report: ", joinpath(result.output, "report.toml"))
+    println(io, "Summary: ", joinpath(result.output, "summary.txt"))
+    return nothing
 end

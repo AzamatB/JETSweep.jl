@@ -1,432 +1,319 @@
-_timestamp() = string(Dates.now(Dates.UTC)) * "Z"
+const _LOADED_PROJECT = Ref("")
 
-function _stop_process(process::Base.Process, process_id::Union{Nothing,Integer}=nothing)
-    if process_id === nothing
-        process_exited(process) && return
-        process_id = getpid(process)
-    end
-    if Sys.isunix()
-        # Every worker owns a process group, including its compiler/analysis children.
-        # The leader can exit before its descendants, so retain its PID at spawn
-        # and test the group itself throughout the grace period.
-        group_alive() = ccall(:kill, Cint, (Cint, Cint), -process_id, 0) == 0
-        if group_alive()
-            ccall(:kill, Cint, (Cint, Cint), -process_id, Base.SIGTERM)
-            timedwait(() -> !group_alive(), 3.0; pollint=0.05)
-            group_alive() && ccall(:kill, Cint, (Cint, Cint), -process_id, Base.SIGKILL)
-        end
-    else
-        kill(process, Base.SIGTERM)
-        timedwait(() -> process_exited(process), 3.0; pollint=0.05)
-        process_exited(process) || kill(process, Base.SIGKILL)
-    end
-    wait(process)
-    return
+"The project JETSweep was loaded from, which also provides JETLS to analysis environments."
+tool_project() = _LOADED_PROJECT[]
+
+_timestamp() = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS") * "Z"
+
+function _write_toml(path::String, data)
+    mkpath(dirname(path))
+    open(io -> TOML.print(io, data; sorted=true), path, "w")
+    return path
 end
 
-function _run_process(command::Cmd, log_path::String, timeout::Float64,
-                      active::Set{Base.Process})
-    started = time_ns()
-    return open(log_path, "w") do log
-        process = run(pipeline(Cmd(command; detach=true); stdout=log, stderr=log); wait=false)
-        process_id = getpid(process)
-        push!(active, process)
-        timed_out = false
-        stopped = false
-        try
-            if timeout > 0
-                timed_out = timedwait(() -> process_exited(process), timeout; pollint=0.1) === :timed_out
-                if timed_out
-                    _stop_process(process, process_id)
-                    stopped = true
-                end
-            end
-            wait(process)
-        finally
-            try
-                stopped || _stop_process(process, process_id)
-            finally
-                delete!(active, process)
-            end
-        end
-        # Julia can report exitcode == 0 for a signal-terminated process.
-        exit_code = process.termsignal == 0 ? process.exitcode : 128 + process.termsignal
-        return (; exit_code, timed_out, signal=process.termsignal,
-                seconds=(time_ns() - started) / 1.0e9)
-    end
+# Scheduling
+# ==========
+
+"Work for the dispatcher: preparing the environment of a context, or analyzing a unit."
+struct _Task
+    weight::Int
+    priority::Tuple{Int,Int}
+    work::Union{Context,Unit}
 end
 
-function _parallel_map(function_, items::Vector, width::Int, active::Set{Base.Process})
-    isempty(items) && return Any[]
-    queue = Channel{Int}(length(items))
-    foreach(index -> put!(queue, index), eachindex(items))
-    close(queue)
-    results = Vector{Any}(undef, length(items))
-    completions = Channel{Union{Nothing,CapturedException}}(min(width, length(items)))
-    tasks = Task[]
-    for _ in 1:min(width, length(items))
-        push!(tasks, @async begin
-            outcome = nothing
-            try
-                for index in queue
-                    results[index] = function_(items[index], index)
-                end
-            catch error
-                outcome = CapturedException(error, catch_backtrace())
-            end
-            put!(completions, outcome)
-        end)
-    end
+"""
+Run `step(task)` for every task on `capacity` CPU slots, in priority order. A task that
+does not fit waits for slots rather than letting later tasks pass it, so heavy tasks
+cannot starve. `step` returns follow-up tasks.
+"""
+function _dispatch(step, tasks::Vector{_Task}, capacity::Int)
+    queue = sort(tasks; by=task -> task.priority)
+    condition = Threads.Condition()
+    used, running = 0, 0
+    failure = Ref{Any}(nothing)
     try
-        for _ in tasks
-            outcome = take!(completions)
-            outcome === nothing || throw(outcome)
+        @lock condition while true
+            while !isempty(queue) && failure[] === nothing && used + min(first(queue).weight, capacity) <= capacity
+                task = popfirst!(queue)
+                weight = min(task.weight, capacity)
+                used += weight
+                running += 1
+                @async begin
+                    followups = _Task[]
+                    try
+                        followups = step(task)
+                    catch err
+                        failure[] = CapturedException(err, catch_backtrace())
+                    end
+                    @lock condition begin
+                        used -= weight
+                        running -= 1
+                        for followup in followups
+                            index = searchsortedfirst(queue, followup; by=task -> task.priority)
+                            insert!(queue, index, followup)
+                        end
+                        notify(condition)
+                    end
+                end
+            end
+            running == 0 && (isempty(queue) || failure[] !== nothing) && break
+            wait(condition)
         end
     catch
-        foreach(_stop_process, collect(active))
-        for task in tasks
-            istaskdone(task) || schedule(task, InterruptException(); error=true)
-        end
+        _terminate_all()
         rethrow()
     end
-    return results
+    failure[] === nothing || throw(failure[])
+    return nothing
 end
 
-_canonical_file(path::AbstractString) = ispath(path) ? realpath(path) : abspath(path)
+# Environments
+# ============
 
-function _validate_worker_result!(result::Dict{String,Any}, job::AnalysisJob)
-    errors = String[]
-    get(result, "schema_version", 0) == 1 || push!(errors, "Unsupported or missing worker result schema")
-    original = get(result, "original_file", "")
-    original isa AbstractString && _canonical_file(original) == _canonical_file(job.entry) ||
-        push!(errors, "Worker result does not identify the requested original source")
-    files = get(result, "analyzed_files", Any[])
-    valid_files = files isa AbstractVector && all(path -> path isa AbstractString, files)
-    valid_files || push!(errors, "Malformed analyzed-file list")
-    rows = get(result, "diagnostics", Any[])
-    valid_rows = rows isa AbstractVector && all(row -> row isa AbstractDict &&
-        get(row, "severity", 0) in 1:4 && get(row, "file", nothing) isa AbstractString &&
-        get(row, "message", nothing) isa AbstractString &&
-        get(row, "line", 0) isa Integer && get(row, "column", 0) isa Integer, rows)
-    valid_rows || push!(errors, "Malformed diagnostic records")
-    if get(result, "full_analysis_complete", false)
-        get(result, "status", "") in ("clean", "findings") ||
-            push!(errors, "Worker completion flag contradicts its status")
-        covered = valid_files ? Set(_canonical_file.(files)) : Set{String}()
-        missing = filter(path -> _canonical_file(path) ∉ covered, job.expected_files)
-        isempty(missing) || push!(errors, "Worker omitted expected original files: " * join(missing, ", "))
+_context_key(context::Context) = bytes2hex(sha256(string(context.project, '\0', context.owner, '\0', context.test,
+    '\0', join(sort!(["$k=$v" for (k, v) in context.triggers]), '\0'))))[1:12]
+
+function _prepare(context::Context, directory::String, options::SweepOptions)
+    request = _write_toml(joinpath(directory, "request.toml"), Dict(
+        "project" => context.project, "owner" => context.owner, "test" => context.test,
+        "triggers" => context.triggers, "directory" => joinpath(directory, "env"),
+        "instantiate" => options.instantiate))
+    result = joinpath(directory, "result.toml")
+    log = joinpath(directory, "log.txt")
+    command = julia_command(joinpath(_SCRIPTS, "prepare.jl"), [request, result];
+        project=dirname(tool_project()), threads=1, env=Dict("JULIA_NUM_PRECOMPILE_TASKS" => "2"))
+    process = run_worker(command, log, options.timeout)
+    if process.timed_out
+        return Environment(:failed, joinpath(directory, "env"), "environment preparation timed out; see $log")
+    elseif !isfile(result)
+        return Environment(:failed, joinpath(directory, "env"), "environment preparation exited with code $(process.code); see $log")
     end
-    if !isempty(errors)
-        result["protocol_errors"] = errors
-        result["status"] = "analysis_incomplete"
-        result["full_analysis_complete"] = false
-    end
-    if !valid_files
-        result["malformed_analyzed_files"] = repr(files)
-        result["analyzed_files"] = String[]
-    end
-    if !valid_rows
-        result["malformed_diagnostics"] = repr(rows)
-        result["diagnostics"] = Dict{String,Any}[]
-    end
-    # Metadata identifying the job belongs to the coordinator.
-    result["job_id"] = job.id
-    result["kind"] = String(job.kind)
-    result["entry"] = job.entry
-    result["expected_files"] = job.expected_files
-    return result
+    data = TOML.parsefile(result)
+    return Environment(Symbol(data["status"]), data["dir"], data["message"])
 end
 
-function _gpu_devices(requested::Vector{String})
+# Units
+# =====
+
+const _SCRIPTS = joinpath(dirname(@__DIR__), "scripts")
+
+"The `.JETLSConfig.toml` that applies to a unit: configured, or the nearest above its entry."
+function _jetls_config(unit::Unit, root::String)
+    isempty(unit.overrides.jetls_config) || return unit.overrides.jetls_config
+    directory = dirname(unit.entry)
+    while true
+        file = joinpath(directory, ".JETLSConfig.toml")
+        isfile(file) && return file
+        (directory == root || !_within(directory, root)) && return ""
+        directory = dirname(directory)
+    end
+end
+
+"""
+Write the unit's JETLS configuration: the user's, with the settings a sweep requires, and
+return the directory its paths are relative to. A test driver whose run-time includes are
+analyzed as their own units evaluates its constants, so that analysis gets past its
+selection logic, and skips those includes.
+"""
+function _write_jetls_config(unit::Unit, directory::String, root::String, separate::Vector{String})
+    source = _jetls_config(unit, root)
+    base = isempty(source) ? root : dirname(source)
+    data = isempty(source) ? Dict{String,Any}() : TOML.parsefile(source)
+    full = get!(data, "full_analysis", Dict{String,Any}())
+    full["auto_instantiate"] = "never"   # JETSweep prepares every environment itself
+    diagnostic = get!(data, "diagnostic", Dict{String,Any}())
+    diagnostic["enabled"] = true
+    diagnostic["all_files"] = true
+    if !isempty(separate)
+        push!(get!(full, "concretization_patterns", Any[]),
+              Dict("pattern" => "const x_ = y_", "path" => _slash(relpath(unit.entry, base))))
+        overrides = get!(get!(data, "initialization_options", Dict{String,Any}()), "analysis_overrides", Any[])
+        for file in separate
+            push!(overrides, Dict("path" => _slash(relpath(file, base)), "on_include" => "skip"))
+        end
+    end
+    _write_toml(joinpath(directory, "config", ".JETLSConfig.toml"), data)
+    return base
+end
+
+"The entry file analyzed for a test or script unit: its context, then the original file."
+function _generated_entry(unit::Unit)
+    io = IOBuffer()
+    println(io, "# Generated by JETSweep for ", unit.entry)
+    println(io, "const Main = @__MODULE__")
+    isempty(unit.driver) || print(io, prelude(unit.driver, unit.entry))
+    for file in unit.overrides.setup
+        println(io, "include(", repr(file), ")")
+    end
+    println(io, "include(", repr(unit.entry), ")")
+    return String(take!(io))
+end
+
+function _package(unit::Unit, inventory::Inventory)
+    index = findfirst(project -> project.dir == unit.context.owner, inventory.projects)
+    index === nothing && return ("", "")
+    return (inventory.projects[index].name, inventory.projects[index].uuid)
+end
+
+function _analyze(unit::Unit, environment::Environment, inventory::Inventory, output::String,
+                  options::SweepOptions, gpu::Union{Nothing,String}, separate::Vector{String})
+    directory = joinpath(output, "units", unit.id)
+    mkpath(directory)
+    log = joinpath(directory, "log.txt")
+    started = time()
+    failure(status, reason, seconds=time() - started) =
+        UnitResult(unit.id, status, Finding[], String[], [reason], String[], seconds, log)
+    ready(environment) || return failure(:unavailable, "environment unavailable: " * environment.message, 0.0)
+    generated = joinpath(directory, "entry.jl")
+    unit.kind in (:test, :script) && write(generated, _generated_entry(unit))
+    name, uuid = _package(unit, inventory)
+    request = _write_toml(joinpath(directory, "request.toml"), Dict(
+        "kind" => String(unit.kind), "entry" => unit.entry, "expected" => unit.expected,
+        "environment" => environment.dir, "generated" => generated,
+        "config" => joinpath(directory, "config"), "root" => _write_jetls_config(unit, directory, inventory.root, separate),
+        "package" => name, "uuid" => uuid, "extension" => unit.extension, "triggers" => unit.context.triggers,
+        "args" => unit.overrides.args, "env" => unit.overrides.env))
+    result = joinpath(directory, "result.toml")
+    threads = unit.kind in (:package, :extension) ? options.threads : 1
+    command = julia_command(joinpath(_SCRIPTS, "analyze.jl"), [request, result]; project=environment.dir,
+        threads, env=gpu === nothing ? Dict{String,String}() : Dict("CUDA_VISIBLE_DEVICES" => gpu))
+    process = run_worker(Cmd(command; dir=dirname(unit.entry)), log, options.timeout)
+    process.timed_out && return failure(:timeout, "time limit of $(options.timeout) s exceeded")
+    isfile(result) || return failure(:failed, "worker exited with code $(process.code) without a result")
+    data = TOML.parsefile(result)
+    haskey(data, "error") && return failure(:failed, first(split(data["error"], '\n')))
+    reasons = String[data["reasons"]..., ("logged error: " * error for error in data["errors"])...]
+    notes = String[]
+    if !isempty(data["missing"])
+        # A package's conditionally included files are analyzed as orphan units instead.
+        unit.kind in (:package, :extension) ?
+            push!(notes, "loading did not include: " * join(data["missing"], ", ")) :
+            push!(reasons, "not analyzed: " * join(data["missing"], ", "))
+    end
+    found = [Finding(row["file"], row["line"], row["column"], row["end_line"], row["end_column"],
+                     row["severity"], row["code"], row["message"]) for row in data["findings"]]
+    status = !isempty(reasons) ? :incomplete : isempty(found) ? :clean : :findings
+    return UnitResult(unit.id, status, found, data["analyzed"], reasons, notes, time() - started, log)
+end
+
+"""
+Orphan units for the files a package or extension unit expected to cover but its loaded
+module did not include, such as conditionally included code.
+"""
+function _missed_sources(unit::Unit, result::UnitResult, inventory::Inventory, planned::Set{String})
+    unit.kind in (:package, :extension) && !isempty(result.analyzed) || return Unit[]
+    analyzed = Set(result.analyzed)
+    missed = filter(file -> !(realpath(file) in analyzed) && !(file in planned), unit.expected)
+    return [Unit(_unit_id(:orphan, file, inventory.root), :orphan, file,
+                 Context(unit.context.owner, unit.context.owner, false, Dict{String,String}()), [file], "", "",
+                 Overrides(), ["loading the package did not include this file"]) for file in missed]
+end
+
+"Source bytes a unit analyzes, the scheduler's estimate of its cost."
+_cost(unit::Unit) = sum(file -> isfile(file) ? filesize(file) : 0, unit.expected; init=0)
+
+# Environments first, since units wait for them; then the longest analyses, packages first.
+_task(context::Context, units) = _Task(2, (0, -sum(_cost, units; init=0)), context)
+_task(unit::Unit, options::SweepOptions) = unit.kind in (:package, :extension) ?
+    _Task(options.threads, (1, -_cost(unit)), unit) : _Task(1, (2, -_cost(unit)), unit)
+
+"Values for each worker's `CUDA_VISIBLE_DEVICES`; `\"\"` hides all devices, none leaves it unset."
+function _gpus(requested::Vector{String})::Vector{String}
     requested == ["none"] && return [""]
-    !isempty(requested) && requested != ["auto"] && return requested
-    if haskey(ENV, "CUDA_VISIBLE_DEVICES")
-        visible = strip(ENV["CUDA_VISIBLE_DEVICES"])
-        return isempty(visible) || visible == "-1" ? [""] : strip.(split(visible, ','))
-    end
-    tool = Sys.which("nvidia-smi")
-    tool === nothing && return String[]
+    requested == ["auto"] || return requested
+    visible = get(ENV, "CUDA_VISIBLE_DEVICES", nothing)
+    visible === nothing || return isempty(strip(visible)) ? [""] : String.(strip.(split(visible, ',')))
+    smi = Sys.which("nvidia-smi")
+    smi === nothing && return String[]
     try
-        return filter(!isempty, strip.(readlines(`$tool --query-gpu=uuid --format=csv,noheader`)))
+        return String.(filter(!isempty, strip.(readlines(`$smi --query-gpu=uuid --format=csv,noheader`))))
     catch
         return String[]
     end
 end
 
-function _worker_command(script::String, arguments::Vector{String}, options::SweepOptions;
-                         variables::Dict{String,String}=Dict{String,String}(), gpu::Union{Nothing,String}=nothing,
-                         project::String=_tool_project())
-    isempty(project) && error("JETSweep could not locate its resolved tool environment")
-    project_directory = isdir(project) ? project : dirname(project)
-    julia = Base.julia_cmd()
-    command = `$julia --startup-file=no --history-file=no --compiled-modules=existing --threads=$(options.threads),1 --project=$project_directory $script $arguments`
-    environment = merge(copy(ENV), Dict(
-        "JULIA_PKG_PRECOMPILE_AUTO" => "0", "JULIA_LOAD_PATH" => "@:@stdlib",
-        "OPENBLAS_NUM_THREADS" => "1", "OMP_NUM_THREADS" => "1"), variables)
-    gpu === nothing || (environment["CUDA_VISIBLE_DEVICES"] = gpu)
-    return setenv(Cmd(command; detach=true), environment)
-end
-
-function _prepare(job::AnalysisJob, key::String, output::String, options::SweepOptions, active)
-    directory = joinpath(output, "environments", key)
-    mkpath(directory)
-    request = joinpath(directory, "request.toml")
-    result_path = joinpath(directory, "result.toml")
-    write_toml(request, Dict("job" => job_dict(job), "instantiate" => options.instantiate))
-    command = _worker_command(joinpath(dirname(@__DIR__), "scripts", "prepare_environment.jl"),
-        [request, joinpath(directory, "project"), result_path], options)
-    write_toml(joinpath(directory, "execution.toml"), Dict(
-        "command" => copy(command.exec), "timeout" => options.timeout))
-    log = joinpath(directory, "raw.log")
-    try
-        process = _run_process(command, log, options.timeout, active)
-        result = isfile(result_path) ? environment_from_dict(TOML.parsefile(result_path)) :
-            EnvironmentResult(status=:failed, message="Environment worker did not write a result; see $log")
-        if process.timed_out || process.exit_code != 0
-            reason = process.timed_out ? "Environment preparation timed out" : "Environment worker exited $(process.exit_code)"
-            return EnvironmentResult(status=:failed, message="$reason: $(result.message); see $log")
-        end
-        return result
-    catch error
-        error isa InterruptException && rethrow()
-        return EnvironmentResult(status=:failed, message=sprint(showerror, error))
-    end
-end
-
-function _merge_configuration!(destination::Dict{String,Any}, source::AbstractDict)
-    for (key, value) in source
-        if value isa AbstractDict && get(destination, key, nothing) isa AbstractDict
-            _merge_configuration!(destination[key], value)
-        else
-            destination[key] = deepcopy(value)
+"Hashes of every inventoried source and project metadata file, to detect edits during a run."
+function _snapshot(inventory::Inventory, config::Config)
+    files = Set(source.path for source in inventory.sources)
+    isempty(config.file) || push!(files, config.file)
+    for project in inventory.projects
+        for name in readdir(project.dir)
+            (name in _PROJECT_FILES || occursin(r"^(Julia)?(Manifest|LocalPreferences)(-v[\d.]+)?\.toml$", name) ||
+             name == ".JETLSConfig.toml") && push!(files, joinpath(project.dir, name))
         end
     end
-    return destination
+    return Dict(file => bytes2hex(open(sha256, file)) for file in files if isfile(file))
 end
 
-function _write_analysis_configuration(job::AnalysisJob, directory::String)
-    configuration = Dict{String,Any}(
-        "full_analysis" => Dict{String,Any}("auto_instantiate" => "never", "concretization_timeout" => 120.0),
-        "diagnostic" => Dict{String,Any}("enabled" => true, "all_files" => true, "patterns" => String[]),
-        "initialization_options" => Dict{String,Any}("reuse_native_inference" => false))
-    isempty(job.context.configuration) ||
-        _merge_configuration!(configuration, TOML.parsefile(job.context.configuration))
-    full = configuration["full_analysis"]
-    diagnostic = configuration["diagnostic"]
-    initialization = configuration["initialization_options"]
-    all(section -> section isa AbstractDict, (full, diagnostic, initialization)) ||
-        throw(ArgumentError("JETLS configuration sections must be tables"))
-    get(full, "auto_instantiate", "never") == "never" ||
-        throw(ArgumentError("JETSweep manages dependency preparation; JETLS auto_instantiate must be never"))
-    get(diagnostic, "enabled", true) === true && get(diagnostic, "all_files", true) === true &&
-        get(diagnostic, "patterns", []) isa AbstractVector && isempty(get(diagnostic, "patterns", [])) ||
-        throw(ArgumentError("JETSweep retains unfiltered diagnostics; enabled/all_files must be true and patterns empty"))
-    get(initialization, "reuse_native_inference", false) === false ||
-        throw(ArgumentError("JETSweep requires fresh analysis; reuse_native_inference must be false"))
-    return write_toml(joinpath(directory, ".JETLSConfig.toml"), configuration)
-end
+"""
+    sweep(root; options=SweepOptions(), io=stderr) -> SweepResult
 
-function _source_fallbacks(jobs::Vector{AnalysisJob}, results, inventory::Inventory)
-    direct = Set(job.entry for job in jobs)
-    covered = Set{String}()
-    for result in results
-        get(result, "full_analysis_complete", false) &&
-            union!(covered, _canonical_file.(get(result, "analyzed_files", String[])))
-    end
-    owned = Dict(file.path => file for file in inventory.files)
-    fallbacks = Pair{String,AnalysisJob}[]
-    for (job, result) in zip(jobs, results)
-        job.kind in (:package, :extension) || continue
-        for file in job.expected_files
-            file in direct && continue
-            _canonical_file(file) in covered && continue
-            haskey(owned, file) || continue
-            isfile(file) || continue
-            context = job.context
-            fallback = AnalysisJob(id=_job_id(:source, file, inventory.root), kind=:source,
-                entry=file, project=job.project, owner=job.owner, expected_files=[file],
-                context=ContextSpec(project=context.project, setup=context.setup,
-                    arguments=context.arguments, variables=context.variables,
-                    configuration=context.configuration),
-                issues=["The package or extension run did not establish coverage for this file; this supplemental source context imports its owner exports and does not reconstruct an inactive internal include site."])
-            push!(fallbacks, job.id => fallback)
-            push!(direct, file)
-        end
-    end
-    return fallbacks
-end
-
-function _analyze(job::AnalysisJob, environment::EnvironmentResult, root::String,
-                  output::String, options::SweepOptions, active, gpu, io::IO)
-    directory = joinpath(output, "jobs", job.id)
-    mkpath(directory)
-    result_path = joinpath(directory, "result.toml")
-    result = Dict{String,Any}("job_id" => job.id, "kind" => String(job.kind),
-        "entry" => job.entry, "expected_files" => job.expected_files,
-        "started" => _timestamp(), "full_analysis_complete" => false,
-        "diagnostics" => Dict{String,Any}[], "analyzed_files" => String[])
-    configuration_ok = true
-    try
-        _write_analysis_configuration(job, joinpath(directory, "config"))
-    catch error
-        error isa InterruptException && rethrow()
-        configuration_ok = false
-        merge!(result, Dict("status" => "invalid_configuration", "error" => sprint(showerror, error)))
-    end
-    raw_log = joinpath(directory, "raw.log")
-    if !configuration_ok
-        write(raw_log, result["error"], '\n')
-    elseif environment.status !== :ready
-        merge!(result, Dict("status" => "environment_unavailable", "error" => environment.message))
-        write(raw_log, environment.message, '\n')
-    else
-        request = joinpath(directory, "job.toml")
-        write_toml(request, Dict("schema_version" => 1, "root" => root,
-            "config_directory" => joinpath(directory, "config"),
-            "environment_project" => environment.project, "load_paths" => environment.load_paths,
-            "job" => job_dict(job)))
-        command = _worker_command(joinpath(dirname(@__DIR__), "scripts", "analyze.jl"),
-            [request, result_path], options; variables=job.context.variables, gpu,
-            project=isempty(environment.tool_project) ? _tool_project() : environment.tool_project)
-        result["command"] = copy(command.exec)
-        result["timeout"] = options.timeout
-        try
-            process = _run_process(command, joinpath(directory, "raw.log"), options.timeout, active)
-            if isfile(result_path)
-                merge!(result, TOML.parsefile(result_path))
-                _validate_worker_result!(result, job)
-            else
-                merge!(result, Dict("status" => "analysis_incomplete", "error" => "Worker did not write an analysis result"))
-            end
-            result["seconds"] = process.seconds
-            result["exit_code"] = process.exit_code
-            if process.timed_out
-                result["status"] = "timeout"
-                result["full_analysis_complete"] = false
-            elseif process.exit_code != 0
-                result["full_analysis_complete"] = false
-                get(result, "status", "") in ("clean", "findings") && (result["status"] = "analysis_incomplete")
-            end
-        catch error
-            error isa InterruptException && rethrow()
-            merge!(result, Dict("status" => "worker_error", "error" => sprint(showerror, error),
-                                "full_analysis_complete" => false))
-        end
-    end
-    result["finished"] = _timestamp()
-    result["log"] = joinpath(directory, "raw.log")
-    result["environment"] = environment.project
-    result["tool_environment"] = environment.tool_project
-    gpu === nothing || (result["gpu"] = gpu)
-    write_toml(result_path, result)
-    println(io, "[", result["status"], "] ", relpath(job.entry, root),
-            isempty(job.extension) ? "" : " ($(job.extension))")
-    flush(io)
-    return result
-end
-
-const _SEVERITY = Dict(:error => 1, :warning => 2, :warn => 2, :info => 3, :hint => 4, :none => 0)
-
-function _exit_code(results, inventory::Inventory, changes, severity::Symbol)
-    (!isempty(inventory.issues) || !isempty(changes) ||
-     any(result -> !get(result, "full_analysis_complete", false), results)) && return 2
-    covered = Set{String}()
-    for result in results
-        union!(covered, _canonical_file.(get(result, "analyzed_files", String[])))
-    end
-    any(file -> _canonical_file(file.path) ∉ covered, inventory.files) && return 2
-    threshold = _SEVERITY[severity]
-    any(result -> any(d -> 0 < get(d, "severity", 1) <= threshold,
-                      get(result, "diagnostics", [])), results) && return 1
-    return 0
-end
-
-"Recursively analyze a directory, retaining every job result and incomplete context."
+Discover, plan and analyze everything below `root`, writing a report directory. Every
+unit runs JETLS in its own process, in a prepared environment shared by units with the
+same dependency context.
+"""
 function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::IO=stderr)
     options.jobs > 0 || throw(ArgumentError("jobs must be positive"))
     options.threads > 0 || throw(ArgumentError("threads must be positive"))
-    options.timeout >= 0 || throw(ArgumentError("timeout must be nonnegative"))
-    haskey(_SEVERITY, options.fail_severity) || throw(ArgumentError("invalid failure severity"))
-    root = abspath(root)
-    isdir(root) || throw(ArgumentError("directory does not exist: $root"))
-    run_id = Dates.format(Dates.now(Dates.UTC), "yyyymmdd-HHMMSS") * "-" * string(uuid4())[1:8]
-    output = isempty(options.output) ? joinpath(root, ".jetsweep", run_id) : abspath(options.output)
-    ispath(output) && (!isdir(output) || !isempty(readdir(output))) &&
-        throw(ArgumentError("output must be a new or empty directory: $output"))
-    inventory = discover(root; excludes=options.excludes, output,
-        include_ignored=options.include_ignored, include_untracked=options.include_untracked)
-    jobs = plan(inventory; config=options.config)
-    started = _timestamp()
-    before = input_snapshot(inventory, jobs; config=options.config)
+    0 <= options.timeout < Inf || throw(ArgumentError("timeout must be finite and nonnegative"))
+    options.fail_on in (SEVERITIES..., :none) || throw(ArgumentError("invalid failure severity $(options.fail_on)"))
+    isdir(root) || throw(ArgumentError("not a directory: $root"))
+    started = time()
+    root = realpath(root)
+    config = read_config(root, options.config)
+    output = isempty(options.output) ?
+        joinpath(root, ".jetsweep", Dates.format(Dates.now(Dates.UTC), "yyyymmdd-HHMMSS")) : abspath(options.output)
+    ispath(output) && !(isdir(output) && isempty(readdir(output))) &&
+        throw(ArgumentError("report directory must be new or empty: $output"))
+    inventory = discover(root; exclude=[config.exclude; options.exclude], output,
+                         include_ignored=options.include_ignored, tracked_only=options.tracked_only)
+    units = plan(inventory, config)
     mkpath(output)
-    write_toml(joinpath(output, "inventory.toml"), inventory_dict(inventory))
-    write_toml(joinpath(output, "plan.toml"), Dict("schema_version" => 1,
-        "jobs" => job_dict.(jobs), "execution" => Dict(
-            "workers" => options.jobs, "threads_per_worker" => options.threads,
-            "timeout_seconds" => options.timeout, "requested_gpus" => options.gpu_devices,
-            "instantiate" => options.instantiate, "fail_severity" => String(options.fail_severity),
-            "include_ignored" => options.include_ignored, "include_untracked" => options.include_untracked,
-            "excludes" => options.excludes, "context_config" => options.config,
-            "julia_version" => string(VERSION), "tool_project" => _tool_project())))
-    write_toml(joinpath(output, "inputs-before.toml"), Dict("files" => before))
-    println(io, "JETSweep: $(length(inventory.files)) files, $(count(p -> !isempty(p.entry), inventory.projects)) packages, $(length(jobs)) jobs")
+    write_inventory(joinpath(output, "inventory.toml"), inventory)
+    write_plan(joinpath(output, "plan.toml"), units, inventory.root)
+    contexts = unique(unit.context for unit in units)
+    packages = count(ispackage, inventory.projects)
+    println(io, "JETSweep: $(length(inventory.sources)) files, $packages packages, $(length(units)) units, ",
+            "$(length(contexts)) environments")
     if options.plan_only
-        println(io, "Plan written to $output; no analysis processes started")
-        return SweepResult(root, output, inventory, jobs, Dict{String,Any}[], started,
-            _timestamp(), String[], isempty(inventory.issues) ? 0 : 2)
+        println(io, "Plan written to $output")
+        return SweepResult(root, output, inventory, units, UnitResult[], String[], time() - started,
+                           isempty(inventory.issues) ? 0 : 2)
     end
-    active = Set{Base.Process}()
-    representatives = Dict{String,AnalysisJob}()
-    keys_by_identity = Dict{Tuple{Symbol,String,String,String,Tuple},String}()
-    keys_by_job = Dict{String,String}()
-    for job in jobs
-        identity = (job.kind, job.project, job.owner, job.context.project,
-                    Tuple(sort!(collect(job.triggers); by=first)))
-        key = get!(keys_by_identity, identity) do
-            environment_key(job)
+    before = _snapshot(inventory, config)
+    gpus = _gpus(options.gpus)
+    members = Dict(context => filter(unit -> unit.context == context, units) for context in contexts)
+    separate = Dict{String,Vector{String}}()
+    foreach(unit -> isempty(unit.driver) || push!(get!(separate, unit.driver, String[]), unit.entry), units)
+    environments = Dict{Context,Environment}()
+    results = Dict{String,UnitResult}()
+    planned = Set(unit.entry for unit in units)
+    started_units = Ref(0)
+    function step(task::_Task)
+        work = task.work
+        if work isa Context
+            environments[work] = _prepare(work, joinpath(output, "environments", _context_key(work)), options)
+            return [_task(unit, options) for unit in members[work]]
         end
-        keys_by_job[job.id] = key
-        get!(representatives, key, job)
-    end
-    requests = sort!(collect(representatives); by=first)
-    println(io, "Preparing $(length(requests)) isolated environments with $(options.jobs) parallel workers")
-    prepared = _parallel_map(requests, options.jobs, active) do request, _
-        _prepare(last(request), first(request), output, options, active)
-    end
-    environments = Dict(first(request) => environment for (request, environment) in zip(requests, prepared))
-    devices = _gpu_devices(options.gpu_devices)
-    results = _parallel_map(jobs, options.jobs, active) do job, index
-        gpu = isempty(devices) ? nothing : devices[mod1(index, length(devices))]
-        _analyze(job, environments[keys_by_job[job.id]], inventory.root, output, options, active, gpu, io)
-    end
-    fallbacks = _source_fallbacks(jobs, results, inventory)
-    if !isempty(fallbacks)
-        println(io, "Analyzing $(length(fallbacks)) sources not covered by their package/extension context")
-        write_toml(joinpath(output, "supplemental-plan.toml"), Dict("jobs" => [
-            merge(job_dict(last(fallback)), Dict("parent_job" => first(fallback))) for fallback in fallbacks]))
-        supplemental = _parallel_map(fallbacks, options.jobs, active) do fallback, index
-            parent_id, job = fallback
-            gpu = isempty(devices) ? nothing : devices[mod1(index, length(devices))]
-            result = _analyze(job, environments[keys_by_job[parent_id]], inventory.root, output, options, active, gpu, io)
-            result["supplemental_parent_job"] = parent_id
-            write_toml(joinpath(output, "jobs", job.id, "result.toml"), result)
-            result
+        gpu = isempty(gpus) ? nothing : gpus[mod1(started_units[] += 1, length(gpus))]
+        result = _analyze(work, environments[work.context], inventory, output, options, gpu,
+                          work.kind === :test ? get(separate, work.entry, String[]) : String[])
+        results[work.id] = result
+        report_progress(io, work, result, length(results), length(units), root)
+        orphans = _missed_sources(work, result, inventory, planned)
+        for orphan in orphans
+            push!(planned, orphan.entry)
+            push!(units, orphan)
         end
-        append!(jobs, last.(fallbacks))
-        append!(results, supplemental)
+        return [_task(orphan, options) for orphan in orphans]
     end
-    after_inventory = discover(root; excludes=options.excludes, output,
-        include_ignored=options.include_ignored, include_untracked=options.include_untracked)
-    after = input_snapshot(after_inventory, jobs; config=options.config)
-    changes = changed_inputs(before, after)
-    for environment in values(environments), (path, digest) in environment.fingerprints
-        (!isfile(path) || file_digest(path) != digest) && push!(changes, path)
-    end
-    sort!(unique!(changes))
-    write_toml(joinpath(output, "inputs-after.toml"), Dict("files" => after))
-    completed = Dict{String,Any}[result for result in results]
-    report = SweepResult(inventory.root, output, inventory, jobs, completed, started,
-        _timestamp(), changes, _exit_code(completed, inventory, changes, options.fail_severity))
-    write_report(report; io)
-    return report
+    _dispatch(step, [_task(context, members[context]) for context in contexts], options.jobs)
+    after = _snapshot(discover(root; exclude=[config.exclude; options.exclude], output,
+                               include_ignored=options.include_ignored, tracked_only=options.tracked_only), config)
+    changed = sort!([file for file in union(keys(before), keys(after)) if get(before, file, "") != get(after, file, "")])
+    ordered = [results[unit.id] for unit in units]
+    code = exit_code(inventory, ordered, changed, options.fail_on)
+    result = SweepResult(root, output, inventory, units, ordered, changed, time() - started, code)
+    write_report(result; io)
+    return result
 end

@@ -1,70 +1,224 @@
-#!/usr/bin/env julia
-# Keep JETLS out of normal package loading and planning processes.
+# JETSweep analysis worker: analyzes one unit and writes its result.
+#
+#     julia --project=ENVIRONMENT analyze.jl REQUEST.toml RESULT.toml
+#
+# ENVIRONMENT is the unit's prepared analysis environment. It provides JETLS with its
+# Revise-based package analysis enabled, and the unit's own dependencies, resolved together
+# so that both use the same version of every shared package. The worker loads nothing else.
 module JETSweepWorker
 
-using JETSweep
-using Logging
+using JETLS, TOML
 
-struct WorkerBootstrapLogger{L<:AbstractLogger} <: AbstractLogger
-    delegate::L
+const LS = Base.require(JETLS, :JETLSCore)
+
+# Codes after which JETLS analyzes no further code of the unit.
+const STOPS = ("toplevel/error", "toplevel/missing-concretization", "toplevel/concretization-timeout",
+               "toplevel/analysis-stopped")
+
+"Collects error-level log records, which signal analysis problems JETLS does not raise."
+struct ErrorLog{L<:Base.CoreLogging.AbstractLogger} <: Base.CoreLogging.AbstractLogger
+    parent::L
     errors::Vector{String}
     lock::ReentrantLock
 end
-Logging.min_enabled_level(logger::WorkerBootstrapLogger) = min(Logging.Error,Logging.min_enabled_level(logger.delegate))
-Logging.shouldlog(logger::WorkerBootstrapLogger,level,args...) = level >= Logging.Error || Logging.shouldlog(logger.delegate,level,args...)
-Logging.catch_exceptions(::WorkerBootstrapLogger) = false
-function Logging.handle_message(logger::WorkerBootstrapLogger,level,message,args...;kwargs...)
-    if level >= Logging.Error
-        lock(logger.lock) do
-            push!(logger.errors,string(message," ",kwargs))
-        end
-    end
-    Logging.handle_message(logger.delegate,level,message,args...;kwargs...)
+Base.CoreLogging.min_enabled_level(log::ErrorLog) = Base.CoreLogging.min_enabled_level(log.parent)
+Base.CoreLogging.shouldlog(log::ErrorLog, args...) = Base.CoreLogging.shouldlog(log.parent, args...)
+Base.CoreLogging.catch_exceptions(::ErrorLog) = false
+function Base.CoreLogging.handle_message(log::ErrorLog, level, message, args...; kwargs...)
+    level >= Base.CoreLogging.Error && @lock log.lock push!(log.errors, string(message))
+    return Base.CoreLogging.handle_message(log.parent, level, message, args...; kwargs...)
 end
 
-function bootstrap(arguments)
-    length(arguments) == 2 || error("usage: analyze.jl JOB.toml RESULT.toml")
-    output = abspath(arguments[2])
-    logger = WorkerBootstrapLogger(current_logger(),String[],ReentrantLock())
-    try
-        # The pinned release gates its Revise signature backend behind a
-        # compile-time preference and requires TestRunner in the root environment.
-        # Copy its resolved dependency graph into a worker-local overlay. Neither
-        # the analyzed project nor the installed tool's preferences are modified.
-        directory = joinpath(dirname(output),"backend-preferences")
-        mkpath(directory)
-        _, environment = lock(Base.require_lock) do
-            Base.locate_package_env(Base.PkgId(JETSweep))
-        end
-        manifest = something(Base.project_file_manifest_path(environment))
-        data = JETSweep.TOML.parsefile(manifest)
-        for entries in values(get(data,"deps",Dict()))
-            for entry in entries
-                haskey(entry,"path") || continue
-                entry["path"] = abspath(dirname(manifest),entry["path"])
+canonical(path::AbstractString) = ispath(path) ? realpath(path) : abspath(path)
+
+"Load a package, an extension's parent and triggers, and return the module to analyze."
+function load(request)
+    package = Base.PkgId(Base.UUID(request["uuid"]), request["package"])
+    parent = Base.require(package)
+    # Revise resolves a file's outer `module` block by name; bind the loaded module so a
+    # single-file package is not attributed to `Base.__toplevel__`.
+    bind(parent)
+    request["kind"] == "extension" || return parent
+    for (name, uuid) in sort!(collect(request["triggers"]); by=first)
+        Base.require(Base.PkgId(Base.UUID(uuid), name))
+    end
+    extension = Base.get_extension(parent, Symbol(request["extension"]))
+    extension isa Module || error("extension $(request["extension"]) did not load with its triggers")
+    canonical(something(pathof(extension), "")) == canonical(request["entry"]) ||
+        error("extension $(request["extension"]) loaded from $(pathof(extension)), not $(request["entry"])")
+    bind(extension)
+    return extension
+end
+
+function bind(mod::Module)
+    name = nameof(mod)
+    if !isdefined(Base.__toplevel__, name)
+        Core.eval(Base.__toplevel__, Expr(:const, Expr(:(=), name, mod)))
+    end
+    return nothing
+end
+
+"An entry file that brings every binding of `parent` into scope before including `file`."
+function orphan_entry(parent::Module, file::String)
+    bindings = filter(names(parent; all=true, imported=true)) do name
+        Base.isidentifier(name) && !startswith(String(name), '#') && !(name in (:eval, :include)) &&
+            isdefined(parent, name)
+    end
+    return string("const Main = @__MODULE__\nimport ", nameof(parent), "\n",
+                  isempty(bindings) ? "" : "import $(nameof(parent)): " * join(bindings, ", ") * "\n",
+                  "include(", repr(file), ")\n")
+end
+
+"`target` and the modules defined inside it."
+function modules(target::Module, found=Module[target])
+    for name in names(target; all=true)
+        isdefined(target, name) || continue
+        value = getglobal(target, name)
+        value isa Module && value !== target && parentmodule(value) === target && !(value in found) &&
+            (push!(found, value); modules(value, found))
+    end
+    return found
+end
+
+"""
+`toplevel/abstract-field` reports for the structs of a loaded package. JETLS reports these
+while interpreting top-level code, which its package analysis loads instead.
+"""
+function abstract_fields(target::Module, files::Vector{String})
+    trees = Dict(file => LS.JS.parseall(LS.JS.SyntaxNode, read(file, String); filename=file, ignore_errors=true)
+                 for file in files)
+    reports = LS.ToplevelWarningReport[]
+    for mod in modules(target), name in names(mod; all=true)
+        isdefined(mod, name) || continue
+        value = getglobal(mod, name)
+        value isa Type || continue
+        type = Base.unwrap_unionall(value)
+        type isa DataType && isstructtype(type) && parentmodule(type) === mod && nameof(type) === name &&
+            !LS.is_closure_type(type) || continue
+        for (fname, ftype) in zip(fieldnames(type), type.types)
+            LS.is_abstract_fieldtype(ftype) || continue
+            for (file, tree) in trees
+                field = LS.try_extract_field_line(tree, name, fname)
+                field === nothing && continue
+                push!(reports, LS.AbstractFieldReport(file, field, value, fname, ftype))
+                break
             end
         end
-        JETSweep.write_toml(joinpath(directory,"Manifest.toml"),data)
-        JETSweep.write_toml(joinpath(directory,"Project.toml"),Dict(
-            "deps"=>Dict("JETLSCore"=>"8d6afe4c-923b-5912-b63d-b990009c9e74",
-                "TestRunner"=>"65a77010-ae58-5cc9-8243-71cff1cf0f92"),
-            "preferences"=>Dict("JETLSCore"=>Dict("JETLS_DEV_MODE"=>true))))
-        pushfirst!(LOAD_PATH,directory)
-        with_logger(logger) do
-            Base.include(JETSweep,joinpath(pkgdir(JETSweep),"src","backend.jl"))
-        end
-        return Base.invokelatest(() -> JETSweep.JETSweepBackend.main(arguments,logger.errors))
-    catch exception
-        result = Dict("schema_version"=>1,"status"=>"analysis_incomplete",
-            "full_analysis_complete"=>false,"stage"=>"backend_bootstrap",
-            "internal_errors"=>logger.errors,"error"=>sprint(showerror,exception,catch_backtrace()))
-        JETSweep.write_toml(output,result)
-        return 1
     end
+    return reports
+end
+
+"Diagnostics of original files. Skipped includes are reported as missing coverage instead."
+function findings(uri2diagnostics, generated::String)
+    rows = Dict{String,Any}[]
+    for (uri, diagnostics) in uri2diagnostics, diagnostic in diagnostics
+        file = LS.uri2filepath(uri)
+        (file === nothing || canonical(file) == generated) && continue
+        diagnostic.code == "toplevel/analysis-skipped" && continue
+        range = diagnostic.range
+        push!(rows, Dict{String,Any}("file" => file,
+            "line" => range.start.line + 1, "column" => range.start.character + 1,
+            "end_line" => range.var"end".line + 1, "end_column" => range.var"end".character + 1,
+            "severity" => Int(something(diagnostic.severity, LS.DiagnosticSeverity.Error)),
+            "code" => string(something(diagnostic.code, "")), "message" => LS.get_raw_message(diagnostic)))
+    end
+    sort!(unique!(rows); by=row -> (row["file"], row["line"], row["column"], row["code"], row["message"]))
+    return rows
+end
+
+function analyze(request, log::ErrorLog)
+    timings = Dict{String,Float64}()
+    started = time()
+    environment = request["environment"]
+    kind = request["kind"]
+    LS.JETLS_VERSION[] = JETLS.JETLS_VERSION
+    LS.JETLS_MODULE[] = JETLS
+    LS.Revise === nothing && error("JETLS was loaded without its Revise backend (JETLS_DEV_MODE)")
+    Base.ACTIVE_PROJECT[] = joinpath(environment, "Project.toml")
+    empty!(LOAD_PATH)
+    push!(LOAD_PATH, "@", "@stdlib")
+    empty!(ARGS)
+    append!(ARGS, request["args"])
+    merge!(ENV, request["env"])
+    # An empty module keeps worker globals out of reach of analyzed code. JET finds the
+    # context by its path from `Main`.
+    LS.FULL_ANALYSIS_CONTEXT[] = Core.eval(Main, :(module JETSweepAnalysis end))
+    target = nothing
+    generated = canonical(request["generated"])
+    if kind in ("package", "extension", "orphan")
+        target = load(request)
+        timings["load"] = time() - started
+        kind == "orphan" && (write(generated, orphan_entry(target, request["entry"])); target = nothing)
+    end
+    cd(dirname(request["entry"]))
+    server = LS.start_cli_server(request["config"])
+    server.state.root_path = request["root"]
+    server.state.workspaceFolders = [LS.filepath2uri(request["root"])]
+    try
+        LS.start_signature_analysis_workers!(server)
+        LS.start_analysis_worker!(server)
+        if target === nothing
+            uri = LS.filepath2uri(generated)
+            entry = LS.ScriptInEnvAnalysisEntry(environment, uri)
+        else
+            uri = LS.filepath2uri(request["entry"])
+            entry = LS.NewAnalysisEntry(Base.PkgId(target), environment)
+        end
+        LS.cache_file_info!(server, uri, 1, read(LS.uri2filepath(uri), String))
+        done = Base.Event()
+        LS.schedule_analysis!(server, uri, entry, false; completion=done, notify_diagnostics=false, debounce=0.0)
+        wait(done)
+        mark = time()
+        timings["analysis"] = mark - started - get(timings, "load", 0.0)
+        info = LS.get_analysis_info(server.state.analysis_manager, uri)
+        info isa LS.AnalysisResult || error("JETLS produced no analysis result: $(typeof(info))")
+        uris = LS.collect_workspace_uris(server)
+        diagnostics = LS.get_full_diagnostics(server)
+        if target !== nothing
+            files = [file for file in (LS.uri2filepath(uri) for uri in keys(info.analyzed_file_infos)) if file !== nothing]
+            LS.toplevel_warning_reports_to_diagnostics!(diagnostics, abstract_fields(target, files), server,
+                                                        LS.JET.PostProcessor())
+        end
+        progress = LS.ProgressContext(LS.PROGRESS_NONE, stderr)
+        LS.run_per_file_diagnostics!(diagnostics, uris, server, request["root"], progress; skip_analysis=false)
+        for (uri, list) in diagnostics
+            LS.apply_diagnostic_config!(list, server.state.config_manager, uri, request["root"])
+        end
+        timings["lowering"] = time() - mark
+        analyzed = sort!([canonical(file) for file in (LS.uri2filepath(uri) for uri in keys(info.analyzed_file_infos))
+                          if file !== nothing && canonical(file) != generated])
+        rows = findings(diagnostics, generated)
+        reasons = String[]
+        for (uri, list) in diagnostics, diagnostic in list
+            code = string(something(diagnostic.code, ""))
+            code in STOPS || continue
+            file = something(LS.uri2filepath(uri), string(uri))
+            location = canonical(file) == generated ? "the generated context" : "$file:$(diagnostic.range.start.line + 1)"
+            push!(reasons, "analysis stopped at $location [$code]: " *
+                first(split(LS.get_raw_message(diagnostic), '\n')))
+        end
+        missing = filter(file -> !(canonical(file) in analyzed), request["expected"])
+        return Dict{String,Any}("analyzed" => analyzed, "findings" => rows, "reasons" => unique!(reasons),
+                                "missing" => missing, "timings" => timings)
+    finally
+        LS.cleanup_cli_tasks(server)
+    end
+end
+
+function main(request_file::String, result_file::String)
+    request = TOML.parsefile(request_file)
+    log = ErrorLog(Base.CoreLogging.current_logger(), String[], ReentrantLock())
+    result = try
+        Base.CoreLogging.with_logger(() -> analyze(request, log), log)
+    catch err
+        Dict{String,Any}("error" => sprint(showerror, err, catch_backtrace()))
+    end
+    result["errors"] = log.errors
+    open(io -> TOML.print(io, result; sorted=true), result_file, "w")
+    return 0
 end
 
 end # module JETSweepWorker
 
-if abspath(PROGRAM_FILE) == @__FILE__
-    exit(JETSweepWorker.bootstrap(copy(ARGS)))
-end
+length(ARGS) == 2 || error("usage: analyze.jl REQUEST.toml RESULT.toml")
+exit(JETSweepWorker.main(ARGS[1], ARGS[2]))
