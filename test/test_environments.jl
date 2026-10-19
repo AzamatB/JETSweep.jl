@@ -657,7 +657,8 @@ end
         added = _environments_prepare(context(Dict("Sibling" => sibling, "NotRegisteredAnywhere" => "")),
                                       joinpath(envs, "added"))
         @test added.status === :ready
-        @test added.message == "It adds packages imported without being declared: Sibling."
+        @test added.message == "It adds packages imported without being declared: Sibling. " *
+            "Packages imported without being declared that could not be added: NotRegisteredAnywhere."
         @test _environments_project(added)["deps"]["Sibling"] == sibling_uuid
         @test _environments_run(added, "using Sibling; print(Sibling.value())") == "7"
 
@@ -665,7 +666,23 @@ end
         broken, _ = _environments_package(root, "Broken"; deps=Dict("Ghost" => string(uuid4())))
         fallback = _environments_prepare(context(Dict("Broken" => broken)), joinpath(envs, "fallback"))
         @test fallback.status === :ready
-        @test startswith(fallback.message, "Packages imported without being declared could not be added (")
+        @test startswith(fallback.message, "Packages imported without being declared that could not be added: Broken (")
+        @test occursin("Ghost", fallback.message)
         @test !haskey(_environments_project(fallback)["deps"], "Broken")
+
+        # Registered packages that cannot be installed leave those of the workspace. Without
+        # downloads, a registered package that is not installed cannot be.
+        graded = _environments_prepare(context(Dict("Sibling" => sibling, "Oxygen" => "")), joinpath(envs, "graded"))
+        @test graded.status === :ready
+        @test startswith(graded.message, "It adds packages imported without being declared: Sibling. " *
+            "Packages imported without being declared that could not be added: Oxygen")
+        @test haskey(_environments_project(graded)["deps"], "Sibling") && !haskey(_environments_project(graded)["deps"], "Oxygen")
+
+        # Preparation needs an empty directory, and leaves one that is not as it is.
+        occupied = mkpath(joinpath(envs, "occupied"))
+        write(joinpath(occupied, "keep"), "")
+        refused = _environments_prepare(context(Dict("Sibling" => sibling)), occupied)
+        @test refused.status === :failed && occursin("not empty", refused.message)
+        @test readdir(occupied) == ["keep"]
     end
 end

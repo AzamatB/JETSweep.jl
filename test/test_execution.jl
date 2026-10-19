@@ -175,9 +175,15 @@ end
 
 @testset "Workers get a virtual display when there is none" begin
     if Sys.islinux() && Sys.which("Xvfb") !== nothing
-        display = withenv(() -> JETSweep.with_display(() -> ENV["DISPLAY"]), "DISPLAY" => nothing)
-        @test occursin(r"^:\d+$", display)
-        @test withenv(() -> JETSweep.with_display(() -> ENV["DISPLAY"]), "DISPLAY" => ":7") == ":7"
+        withenv("DISPLAY" => nothing) do
+            # Workers get the display; this process's environment stays as it was.
+            command, environment = JETSweep.with_display() do
+                JETSweep.julia_command("/scripts/worker.jl", String[]; project="/environment", threads=1), copy(ENV)
+            end
+            @test any(variable -> occursin(r"^DISPLAY=:\d+$", variable), command.env)
+            @test !haskey(environment, "DISPLAY") && isempty(JETSweep._DISPLAY[])
+        end
+        @test withenv(() -> JETSweep.with_display(() -> JETSweep._DISPLAY[]), "DISPLAY" => ":7") == ""
     end
 end
 
@@ -197,11 +203,11 @@ end
     @test variables["OMP_NUM_THREADS"] == variables["OPENBLAS_NUM_THREADS"] == "1"
     # No code generation flags of this process, such as `--check-bounds=yes`.
     @test command.exec == [joinpath(Sys.BINDIR, Base.julia_exename()), "--startup-file=no", "--history-file=no",
-                           "--compiled-modules=yes", "--threads=3,1", "--project=/environment",
+                           "--compiled-modules=yes", "--threads=3,0", "--project=/environment",
                            "/scripts/worker.jl", "a", "b c"]
     cached = JETSweep.julia_command("/scripts/worker.jl", String[]; project="/environment", threads=1,
                                     compile=false)
-    @test "--compiled-modules=existing" in cached.exec && "--threads=1,1" in cached.exec
+    @test "--compiled-modules=existing" in cached.exec && "--threads=1,0" in cached.exec
     mktempdir() do directory
         script = joinpath(directory, "probe.jl")
         write(script, """
@@ -217,7 +223,7 @@ end
         log = joinpath(directory, "probe.log")
         @test JETSweep.run_worker(command, log, 300.0) == (code=0, timed_out=false)
         # Default code generation (check_bounds 0) even when this process runs `--check-bounds=yes`.
-        @test readlines(log) == ["2 1", "@:@stdlib", "unset", "x|y z", "0"]
+        @test readlines(log) == ["2 0", "@:@stdlib", "unset", "x|y z", "0"]
     end
 end
 

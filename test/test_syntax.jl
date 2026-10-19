@@ -762,20 +762,34 @@ end
     # The worker outlines expressions of calls and control flow, so the closures in their
     # branches need no evaluated conditions; one that assigns is not outlined.
     @test JETSweep._outlined(:(lock === nothing || atexit(() -> close(lock))))
+    @test JETSweep._outlined(:(ready || foreach(function (x)::Nothing; println(x); end, xs)))
+    # Lowering evaluates the types of a closure's parameters where it stands.
+    @test !JETSweep._outlined(:(ready || foreach((x::Row) -> x, xs)))
+    @test !JETSweep._outlined(:(ready || foreach((x; y::Row=Row()) -> x, xs)))
+    @test !JETSweep._outlined(:(ready || foreach((x, y::Row=Row()) -> x, xs)))
+    @test !JETSweep._outlined(:(ready || foreach(xs) do x::Row; x; end))
+    @test !JETSweep._outlined(:(ready || foreach(function (x::T) where {T}; x; end, xs)))
+    @test JETSweep._outlined(:(ready || foreach((x=Row()) -> x, xs)))
     @test !JETSweep._outlined(:(x = cond ? 1 : map(y -> y, z)))
     @test !JETSweep._outlined(:(ready && include(f)))
+    # A generator's ranges stand outside its closure, as do interpolations into quotes.
+    @test JETSweep._outlined(:(ready && [a.b for a in items] == [1]))
+    @test !JETSweep._outlined(:(ready && [a for a in (items = f(); items)] == [1]))
+    @test !JETSweep._outlined(:(ready && g(:(h($(y = 1)))) && map(x -> x, z)))
     @test syntax_patterns("const LOCK = isempty(ARGS) ? nothing : 1\nLOCK === nothing || atexit(() -> close(LOCK))\n") ==
           String[]
     @test syntax_patterns("const PICK = isempty(ARGS) ? 1 : 2\nconst F = PICK > 1 ? map(x -> x, 1:2) : 0\n") ==
           ["const PICK = isempty(ARGS) ? 1 : 2", "const F = PICK > 1 ? map(x -> x, 1:2) : 0"]
-    # JETLS does not follow `include_string`, so the call and what it needs are evaluated.
+    # JETLS evaluates `include_string` calls as it does `eval` calls, so what they need is.
     code = """
         const SNAPSHOT = snapshot(joinpath(@__DIR__, "helper.jl"))
         Base.include_string(@__MODULE__, String(copy(SNAPSHOT.bytes)), SNAPSHOT.path)
         using .Helper
         """
-    @test syntax_patterns(code) == ["const SNAPSHOT = snapshot(joinpath(@__DIR__, \"helper.jl\"))",
-        "Base.include_string(@__MODULE__, String(copy(SNAPSHOT.bytes)), SNAPSHOT.path)"]
+    @test syntax_patterns(code) == ["const SNAPSHOT = snapshot(joinpath(@__DIR__, \"helper.jl\"))"]
+    # `import A.f` may bind a function, so only whole modules count.
+    @test JETSweep._modules(:(using A.B, C)) == Set([:B, :C])
+    @test JETSweep._modules(:(import D, E.f, F as G, H.i as j)) == Set([:D, :G])
     # Modules that run before the file, as a driver's prelude imports, are known.
     mktempdir() do directory
         file = syntax_write(realpath(directory), "file.jl", "const DATA = joinpath(pkgdir(Pkg1), \"data\")\n")
@@ -941,6 +955,22 @@ end
     @test syntax_patterns("const N = compute()\ng(::Val{N}) = 1\n") == String[]
     # Includes inside functions run only when called, so nothing selects them statically.
     @test syntax_patterns("const FILES = list_tests()\nrun(f) = include(f)\nforeach(run, FILES)\n") == String[]
+end
+
+@testset "includes resolve through path constants other files define" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        bootstrap = syntax_write(root, "lib/bootstrap.jl", "const LIBDIR = @__DIR__\nconst DATA = joinpath(dirname(LIBDIR), \"data\")\n")
+        lib = syntax_write(root, "lib/lib.jl", "include(\"bootstrap.jl\")\n")
+        census = syntax_write(root, "lib/census.jl", "")
+        script = syntax_write(root, "dev/script.jl",
+                              "include(joinpath(dirname(@__DIR__), \"lib\", \"lib.jl\"))\ninclude(joinpath(LIBDIR, \"census.jl\"))\n")
+        inventory = discover(root)
+        syntax = JETSweep.source_syntax(inventory)
+        @test syntax[bootstrap].bindings == Dict(:LIBDIR => dirname(bootstrap), :DATA => joinpath(root, "data"))
+        @test [include.target for include in syntax[script].includes] == [lib, census]
+        @test isempty(syntax[script].notes)
+    end
 end
 
 @testset "parse_source records the packages imports load" begin

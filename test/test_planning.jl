@@ -570,12 +570,16 @@ end
         tool = planning_file(host, "scripts/tool.jl", "using Host, LinearAlgebra\nimport JSON\ninclude(\"helper.jl\")\n")
         planning_file(host, "scripts/helper.jl", "using Unknown.Inner: f\n")
         loose = planning_file(root, "loose.jl", "using Sibling\n")
+        # Modules other files define, as `LOAD_PATH` finds them, are no packages to add.
+        planning_file(root, "tools/Local.jl", "module Local\nend\n")
+        runner = planning_file(root, "tools/run.jl", "push!(LOAD_PATH, @__DIR__)\nusing Local, Sibling\n")
         inventory, units = planning_plan(root)
         # Tests and the package's scripts share the test context, which gets the union.
         imports = Dict("Sibling" => sibling, "JSON" => "", "Unknown" => "")
         @test planning_unit(units, test).context.imports == imports
         @test planning_unit(units, tool).context == planning_unit(units, test).context
         @test planning_unit(units, loose).context.imports == Dict("Sibling" => sibling)
+        @test planning_unit(units, runner).context.imports == Dict("Sibling" => sibling)
         # Package code that imports undeclared packages fails to load, as it would anyway.
         @test isempty(planning_unit(units, joinpath(host, "src", "Host.jl")).context.imports)
         @test isempty(planning_unit(units, joinpath(sibling, "src", "Sibling.jl")).context.imports)

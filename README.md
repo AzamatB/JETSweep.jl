@@ -81,14 +81,17 @@ definition or `include` that needs an assigned value stops JETLS
 (`toplevel/missing-concretization`), and other code sees assigned values only as types.
 JETSweep therefore lets JETLS evaluate the top-level statements of the files a unit loads
 that cannot have side effects: assignments of literals, paths and pure functions of names
-already bound, such as `const ROOT = normpath(joinpath(@__DIR__, ".."))`, and blocks and
+already bound, modules the file or its prelude imports among them, such as
+`const ROOT = normpath(joinpath(@__DIR__, ".."))`, and blocks and
 conditionals made only of these, definitions and imports, such as
 `if !@isdefined(Alias) const Alias = Package end`.
 
-Values that depend on how and where the program runs (`ARGS`, `ENV`, files read) are
-evaluated only where JETLS needs them: in the arguments of `include` and `eval` calls, in
+Values that depend on how and where the program runs (`ARGS`, `ENV`, `PROGRAM_FILE`, the
+working directory, files read) are evaluated only where JETLS needs them, with `PROGRAM_FILE`
+the analyzed file: in the arguments of `include` and `eval` calls, in
 definition signatures, and in conditions that define closures or choose imports. And since
-JETLS always evaluates `include` and `eval` calls, whatever their arguments need is evaluated,
+JETLS always evaluates `include` and `eval` calls, and under JETSweep `include_string` calls
+too, whatever their arguments need is evaluated,
 side effects or not, as a test driver's selection of its files is. A value that code left
 unevaluated may change, as `push!` or an indexed assignment does, is not evaluated from there
 on, and neither is a name the file rebinds, even one Base defines. JETLS matches these
@@ -101,7 +104,10 @@ test itself. So JETLS analyzes a `@test` expression that defines an anonymous fu
 branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, inside a closure of its own.
 JETSweep treats generators and comprehensions alike, as in
 `@test r.ok && [a.b for a in r.items] == [1]`, which would otherwise run the whole test set in
-JETLS's interpreter.
+JETLS's interpreter, and any other top-level expression that assigns nothing, as in
+`lock === nothing || atexit(() -> close(lock))`. Expressions that include or evaluate code
+stay at top level, where JETLS follows it, as do closures whose parameters declare types,
+since Julia evaluates those types where the closure stands.
 
 Files a finished analysis does not reach, such as package files loading leaves out or files
 after an analysis stop, get follow-up units of their own, in the same context: a package's
@@ -120,8 +126,10 @@ Existing manifests seed the resolution, keeping locked versions where they are c
 when they are not, the environment is re-resolved and the units' notes say what changed.
 Scripts and tests that import packages their projects do not declare, because they run
 with another project active or rely on their workspace, get those packages added: packages
-of the workspace from their directories, others from the registry. The units' notes name
-them, and if they cannot be added, the environment is prepared without them. With
+of the workspace from their directories, others from the registry. If they cannot all be
+added, the environment gets those of the workspace alone, or failing that none; the units'
+notes name the packages added and those left out. Modules the tree defines that are not
+packages, as scripts load through `LOAD_PATH`, are not looked up. With
 `--offline`, resolution considers installed versions only. Each environment is then
 precompiled once for all its units; packages that fail to precompile, or that a timeout
 leaves without package images, load from source. Original projects, manifests, preferences
@@ -133,7 +141,8 @@ estimated from source size, and assigns GPUs round-robin. Each analysis takes on
 `--jobs` slots: package analyses run on `--threads` threads, but use little more than one core
 on average. Workers run with Julia's default code generation flags, so they share the
 package images of ordinary sessions. On Linux without a display, they share a virtual one
-when Xvfb is installed, so packages that open windows when they load, such as GLMakie, load. Analysis is static, but it loads packages and runs their
+when Xvfb is installed, so packages that open windows when they load, such as GLMakie, load.
+Analysis is static, but it loads packages and runs their
 initialization, macros and generated functions, and the code JETLS evaluates to analyze
 scripts: use JETSweep only on code you trust.
 

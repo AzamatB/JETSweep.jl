@@ -67,11 +67,36 @@ function _test_context(owner::String)
     return Context(project, owner, true, Dict{String,String}())
 end
 
-"The include facts of every inventoried source."
-source_syntax(inventory::Inventory) =
-    let projects = Dict(project.dir => project for project in inventory.projects)
-        Dict(source.path => parse_source(source.path, _package_dirs(source, projects)) for source in inventory.sources)
+"""
+The include facts of every inventoried source. An include that names a path through a
+constant another file defines, as `include(joinpath(LIBDIR, "x.jl"))` after including the
+file that defines `LIBDIR`, resolves on a second pass.
+"""
+function source_syntax(inventory::Inventory)
+    projects = Dict(project.dir => project for project in inventory.projects)
+    parse(source; exports=Dict{String,Dict{Symbol,String}}()) =
+        parse_source(source.path, _package_dirs(source, projects); exports)
+    syntax = Dict(source.path => parse(source) for source in inventory.sources)
+    # The path constants a file defines, after those of the files it includes at top level.
+    exports = Dict{String,Dict{Symbol,String}}()
+    function exported(file::String, seen::Set{String})
+        haskey(exports, file) && return exports[file]
+        (file in seen || !haskey(syntax, file)) && return Dict{Symbol,String}()
+        push!(seen, file)
+        bindings = Dict{Symbol,String}()
+        for include in syntax[file].includes
+            include.depth == 0 && include.followed && !isempty(include.target) &&
+                merge!(bindings, exported(include.target, seen))
+        end
+        return exports[file] = merge!(bindings, syntax[file].bindings)
     end
+    foreach(file -> exported(file, Set{String}()), collect(keys(syntax)))
+    for source in inventory.sources
+        any(include -> isempty(include.target), syntax[source.path].includes) &&
+            (syntax[source.path] = parse(source; exports))
+    end
+    return syntax
+end
 
 """
     plan(inventory, config=Config(); syntax=source_syntax(inventory)) -> Vector{Unit}
@@ -183,7 +208,9 @@ function _imports!(units::Vector{Unit}, syntax::Dict{String,Syntax}, inventory::
     names = [project.name for project in inventory.projects if ispackage(project)]
     workspace = Dict(project.name => project.dir for project in inventory.projects
                      if ispackage(project) && count(==(project.name), names) == 1)
-    available = union(Set(readdir(Sys.STDLIB)), ("Base", "Core", "Main"))
+    # Other modules the tree defines, loaded through `LOAD_PATH`, say, are not packages to look up.
+    defined = setdiff(Set(name for facts in values(syntax) for name in facts.modules), names)
+    available = union(Set(readdir(Sys.STDLIB)), ("Base", "Core", "Main"), defined)
     imported = Dict{Context,Set{String}}()
     for unit in units
         unit.kind in (:script, :test) || continue

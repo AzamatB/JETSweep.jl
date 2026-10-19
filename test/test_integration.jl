@@ -64,7 +64,7 @@ end
 @testset "incomplete analyses are explicit" begin
     mktempdir() do root
         write(joinpath(root, "missing_package.jl"), "using NotAPackageAnywhere\nf(x::Int) = x\n")
-        write(joinpath(root, "unresolved.jl"), "const PATHS = readdir(pwd())\nstruct S\n    x::typeof(PATHS)\nend\n")
+        write(joinpath(root, "unresolved.jl"), "const PATHS = rand(Bool) ? [\"a\"] : String[]\nstruct S\n    x::typeof(PATHS)\nend\n")
         mkpath(joinpath(root, "Broken", "src"))
         mkpath(joinpath(root, "Broken", "ext"))
         write(joinpath(root, "Broken", "Project.toml"), """
@@ -113,6 +113,14 @@ end
             LOCK === nothing || atexit(() -> close(LOCK))
             after() = 1 + "one"
             """)
+        # A script runs as the program, so a check for that holds as it would.
+        write(joinpath(root, "main_check.jl"), """
+            const MAIN = abspath(PROGRAM_FILE) == abspath(@__FILE__)
+            if MAIN
+                report() = foreach(x -> println(x), 1:2)
+            end
+            after() = 1 + "one"
+            """)
         # Code loaded with `include_string` is loaded.
         write(joinpath(root, "bootstrap.jl"), """
             const CODE = read(joinpath(@__DIR__, "bootstrapped.txt"), String)
@@ -151,6 +159,7 @@ end
         @test status("outlined.jl") === :clean && !isfile(joinpath(root, "ran.marker"))
         @test status("locked.jl") === :findings && !isfile(joinpath(root, "acquired.marker"))
         @test status("bootstrap.jl") === :findings
+        @test status("main_check.jl") === :findings
         @test status("uses_sibling.jl") === :findings
         sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
         @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)

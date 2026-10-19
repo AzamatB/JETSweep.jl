@@ -18,8 +18,20 @@ const LS = Base.require(JETLS, :JETLSCore)
 # otherwise `@test r.ok && [a.b for a in r.items] == [1]` runs whatever computes `r`.
 # `JETSweep._outlined` mirrors these rules.
 Core.eval(LS.JET, quote
+    # A generator's ranges are evaluated where it stands, so it can be outlined only if they can.
+    function outlinable_generator(@nospecialize(ex))
+        isexpr(ex, (:comprehension, :flatten), 1) && return outlinable_generator(only(ex.args))
+        isexpr(ex, :typed_comprehension, 2) &&
+            return is_test_expression_thunk_safe(first(ex.args)) && outlinable_generator(last(ex.args))
+        isexpr(ex, :generator) || return false
+        for spec in ex.args[2:end]
+            specs = isexpr(spec, :filter) ? spec.args[2:end] : Any[spec]
+            all(s -> isexpr(s, :(=), 2) && is_test_expression_thunk_safe(last(s.args)), specs) || return false
+        end
+        return true
+    end
     function is_anonymous_test_function(@nospecialize(ex))
-        isexpr(ex, (:->, :generator, :flatten, :comprehension, :typed_comprehension)) && return true
+        (isexpr(ex, :->, 2) || outlinable_generator(ex)) && return true
         isexpr(ex, :function, 2) || return false
         sig = first(ex.args)
         while isexpr(sig, (:(::), :where)) && !isempty(sig.args)
@@ -28,20 +40,59 @@ Core.eval(LS.JET, quote
         return isexpr(sig, :tuple)
     end
 end)
-"Whether `ex` includes or evaluates code, which JET follows only at top level."
-runs_code(ex) = ex isa Expr && (
+"""
+Whether `ex` must stay at top level: it includes or evaluates code, which JET follows only
+there, or interpolates into quoted code, which runs where the quote stands.
+"""
+stays(ex) = ex isa Expr && (ex.head === :$ ||
     (ex.head === :call && !isempty(ex.args) && LS.JET.isexpr(first(ex.args), :.) ?
         last(first(ex.args).args) in (QuoteNode(:include), QuoteNode(:eval), QuoteNode(:include_string)) :
         ex.head === :call && first(ex.args) in (:include, :eval, :include_string)) ||
-    (ex.head === :macrocall && first(ex.args) === Symbol("@eval")) || any(runs_code, ex.args))
+    (ex.head === :macrocall && first(ex.args) === Symbol("@eval")) || any(stays, ex.args))
+
+"Whether parameters declare types, which lowering evaluates where a closure stands."
+typed(p) = p isa Expr && (p.head in (:(::), :where) ||
+    (p.head in (:tuple, :block, :parameters, :kw, :(=), :...) && any(typed, p.head in (:kw, :(=)) ? p.args[1:1] : p.args)))
+
+"Whether `ex` defines a closure with typed parameters or a `where` clause."
+function typed_closure(ex)
+    ex isa Expr || return false
+    ex.head === :-> && typed(first(ex.args)) && return true
+    if ex.head === :function && length(ex.args) == 2
+        signature = first(ex.args)
+        Meta.isexpr(signature, :(::), 2) && (signature = first(signature.args))
+        (Meta.isexpr(signature, :where) || (Meta.isexpr(signature, :tuple) && typed(signature))) && return true
+    end
+    return any(typed_closure, ex.args)
+end
 
 # JET analyzes any top-level expression it can outline the same way, such as
 # `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`.
+# Closures with typed parameters stay, since lowering would evaluate their types anyway.
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
-        should_wrap_test_expression_in_thunk(x) && !$runs_code(x) || return x
+        should_wrap_test_expression_in_thunk(x) && !$stays(x) && !$typed_closure(x) || return x
         return wrap_test_expression_in_thunk(x)
+    end
+end)
+
+# JET evaluates every `eval` call, since it may define anything; `include_string` calls too.
+Core.eval(LS.JET, quote
+    known_names(func::Symbol) = func === :eval ? (:eval, :include_string) : (func,)
+    function is_known_call(@nospecialize(stmt), func::Symbol, stmts::Vector{Any})
+        isexpr(stmt, :call) || return false
+        f = stmt.args[1]
+        f isa SSAValue && (f = stmts[f.id])
+        return (f isa Symbol && f in known_names(func)) || (f isa GlobalRef && f.name in known_names(func))
+    end
+    function is_known_getproperty(@nospecialize(stmt), func::Symbol, stmts::Vector{Any})
+        isexpr(stmt, :call) && length(stmt.args) >= 3 || return false
+        f = stmt.args[1]
+        f isa SSAValue && (f = stmts[f.id])
+        callee_matches(f, Base, :getproperty) || callee_matches(f, Core, :getproperty) ||
+            callee_matches(f, CC, :getproperty) || return false
+        return any(name -> JuliaInterpreter.is_quotenode_egal(stmt.args[3], name), known_names(func))
     end
 end)
 
@@ -221,6 +272,8 @@ function analyze(request, log::ErrorLog)
     push!(LOAD_PATH, "@", "@stdlib")
     empty!(ARGS)
     append!(ARGS, request["args"])
+    # A script runs as the program, so `abspath(PROGRAM_FILE) == @__FILE__` holds as it would.
+    kind in ("test", "script", "orphan") && (Base.PROGRAM_FILE = request["entry"])
     merge!(ENV, request["env"])
     # An empty module keeps worker globals out of reach of analyzed code. JET finds the
     # context by its path from `Main`.

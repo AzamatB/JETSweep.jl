@@ -390,25 +390,35 @@ with the analyzer, resolved from their existing manifests where possible. With
 versions only. Dependency build scripts never run; see also `precompile_environment`.
 """
 function prepare(context::Context, directory::String; instantiate::Bool=true)
-    environment = _prepared(context, directory, instantiate)
-    isempty(context.imports) && return environment
-    if ready(environment)
-        added = sort!(collect(intersect(keys(context.imports), keys(TOML.parsefile(joinpath(directory, "Project.toml"))["deps"]))))
-        isempty(added) && return environment
-        return Environment(:ready, environment.dir,
-            strip("It adds packages imported without being declared: $(join(added, ", ")). " * environment.message))
+    directory = abspath(directory)
+    isdir(directory) && !isempty(readdir(directory)) &&
+        return Environment(:failed, directory, "preparation directory is not empty: $directory")
+    # Undeclared imports are added if they resolve; failing that, those of the workspace;
+    # failing that, none, so that what is declared can still be analyzed.
+    workspace = filter(((_, path),) -> !isempty(path), context.imports)
+    failure = ""
+    for imports in unique([context.imports, workspace, Dict{String,String}()])
+        environment = _prepared(Context(context.project, context.owner, context.test, context.triggers, imports),
+                                directory, instantiate)
+        if !ready(environment) && !isempty(imports)
+            isempty(failure) && (failure = first(split(environment.message, '\n')))
+            rm(directory; recursive=true, force=true)
+            continue
+        end
+        ready(environment) && !isempty(context.imports) || return environment
+        deps = keys(TOML.parsefile(joinpath(directory, "Project.toml"))["deps"])
+        added = sort!([name for name in keys(imports) if name in deps])
+        dropped = sort!([name for name in keys(context.imports) if !(name in added)])
+        notes = String[]
+        isempty(added) || push!(notes, "It adds packages imported without being declared: $(join(added, ", ")).")
+        isempty(dropped) || push!(notes, "Packages imported without being declared that could not be added: " *
+            join(dropped, ", ") * (isempty(failure) ? "." : " ($failure)."))
+        return Environment(:ready, directory, strip(join(notes, " ") * " " * environment.message))
     end
-    # Without them, what is declared can still be analyzed.
-    rm(directory; recursive=true, force=true)
-    declared = _prepared(Context(context.project, context.owner, context.test, context.triggers), directory, instantiate)
-    return Environment(declared.status, declared.dir,
-        strip("Packages imported without being declared could not be added ($(environment.message)). " * declared.message))
 end
 
 function _prepared(context::Context, directory::String, instantiate::Bool)
-    directory = abspath(directory)
     try
-        isdir(directory) && !isempty(readdir(directory)) && error("preparation directory is not empty: $directory")
         mkpath(directory)
         envs = _context_envs(context)
         project, preferences = _scratch_project(context, envs)
