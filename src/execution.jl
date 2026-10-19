@@ -82,9 +82,11 @@ function _prepare(context::Context, directory::String, options::SweepOptions)
         "environment preparation exited with code $(process.code); see $log")
     data = TOML.parsefile(result)
     message = data["message"]
-    # Preparation writes its outcome before precompiling, which can then run out of time.
-    process.timed_out && data["status"] == "ready" &&
-        (message = strip(message * " Precompilation timed out; packages without package images load from source."))
+    # Preparation writes its outcome before precompiling, which can then time out or crash.
+    if data["status"] == "ready" && (process.timed_out || process.code != 0)
+        ending = process.timed_out ? "timed out" : "exited with code $(process.code); see $log"
+        message = strip("$message Precompilation $ending; packages without package images load from source.")
+    end
     return Environment(Symbol(data["status"]), data["dir"], message)
 end
 
@@ -264,9 +266,9 @@ function _followups(unit::Unit, result::UnitResult, sweep::_Sweep, planned::Set{
 end
 
 """
-Seconds each unit took in the latest report below `root/.jetsweep` that this version of
-JETSweep wrote, for units it analyzed completely. Unit ids are stable across runs, so a
-repeated sweep can start its longest analyses first.
+Seconds each unit took in the latest report below `root/.jetsweep`, if this version of
+JETSweep wrote it, for units it analyzed completely or stopped at the time limit. Unit ids
+are stable across runs, so a repeated sweep can start its longest analyses first.
 """
 function _previous_seconds(root::String)
     directory = joinpath(root, ".jetsweep")
@@ -276,7 +278,7 @@ function _previous_seconds(root::String)
         report = TOML.parsefile(argmax(mtime, reports))
         report["jetsweep"] == string(pkgversion(@__MODULE__)) || return Dict{String,Float64}()
         return Dict{String,Float64}(r["unit"] => r["seconds"] for r in report["results"]
-                                    if r["status"] in ("clean", "findings"))
+                                    if r["status"] in ("clean", "findings", "timeout"))
     catch
         return Dict{String,Float64}()
     end

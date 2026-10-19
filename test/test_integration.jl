@@ -22,6 +22,7 @@ integration_status(result, entry) = only(r.status for (u, r) in zip(result.units
         @test Set((u.kind, relpath(u.entry, root)) for u in result.units) == Set([
             (:package, "Witness/src/Witness.jl"), (:extension, "Witness/ext/WitnessTestExt.jl"),
             (:orphan, "Witness/src/disconnected.jl"), (:orphan, "Witness/src/inactive.jl"),
+            (:orphan, "Witness/ext/dormant.jl"),
             (:test, "Witness/test/runtests.jl"), (:test, "Witness/test/test_dynamic.jl"),
             (:test, "Witness/test/test_independent.jl"), (:script, "scripts/main.jl"),
             (:script, "scripts/clean.jl"), (:script, "tools/report.jl")])
@@ -37,6 +38,8 @@ integration_status(result, entry) = only(r.status for (u, r) in zip(result.units
             ("Witness/src/disconnected.jl", 1, "inference/method-error"),
             ("Witness/ext/WitnessTestExt.jl", 6, "inference/method-error"),
             ("Witness/ext/helper.jl", 1, "inference/method-error"),
+            # Analyzed in the extension's module, where `extension_failure` is defined.
+            ("Witness/ext/dormant.jl", 1, "inference/method-error"),
             ("Witness/test/test_dynamic.jl", 1, "inference/method-error"),
             ("scripts/main.jl", 3, "inference/method-error"),
             ("tools/report.jl", 3, "inference/method-error")])
@@ -96,6 +99,16 @@ end
             const RUN = isempty(ASKED) ? ["a"] : filter(name -> name in ASKED, ["a"])
             selected() = RUN
             """)
+        # A generator in a branch of a `@test` expression does not make JETLS run the test.
+        write(joinpath(root, "outlined.jl"), """
+            using Test
+            const MARKER = joinpath(@__DIR__, "ran.marker")
+            setup() = (touch(MARKER); (ok=true, items=[(b=1,)]))
+            @testset "outlined" begin
+                r = setup()
+                @test r.ok && [a.b for a in r.items] == [1]
+            end
+            """)
         output = joinpath(root, ".jetsweep", "report")
         io = IOBuffer()
         result = integration_sweep(root, output; io, fail_on=:none)
@@ -113,11 +126,12 @@ end
         @test any(reason -> occursin("silenced/stop.jl:2 [toplevel/", reason), reasons("silenced/stop.jl"))
         @test status("arguments.jl") in (:clean, :findings)
         @test status("selection.jl") === :clean
+        @test status("outlined.jl") === :clean && !isfile(joinpath(root, "ran.marker"))
         @test result.exit_code == 2
         @test !isempty(TOML.parsefile(joinpath(output, "report.toml"))["unanalyzed"])
         # The terminal summary groups incomplete analyses by cause, with paths relative to the root.
         summary = String(take!(io))
-        @test occursin(r"\n +1  incomplete  analysis stopped \[syntax/parse-error\]\n +unparsable\.jl\n", summary)
+        @test occursin(r"\n +1  incomplete  \[syntax/parse-error\]: [^\n]+\n +unparsable\.jl\n", summary)
         @test occursin("silenced/stop.jl", summary) && !occursin(realpath(root) * "/silenced", summary)
     end
 end

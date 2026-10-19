@@ -89,12 +89,14 @@ function write_report(result::SweepResult; io::IO=stderr)
     return nothing
 end
 
-"Why a unit did not complete, without the locations that differ from unit to unit."
+"""
+Why a unit did not complete, without what differs from unit to unit: the location of a stop
+and the names in backquotes, as in "`X` must have a concrete value".
+"""
 function _cause(result::UnitResult)
     result.status === :timeout && return "time limit exceeded"
     reason = isempty(result.reasons) ? "" : first(split(first(result.reasons), '\n'))
-    stop = match(r"^analysis stopped at .*?:\d+ \[([^\]]+)\]:", reason)
-    stop === nothing || return "analysis stopped [$(stop[1])]"
+    reason = replace(reason, r"^analysis stopped at .*?:\d+ \[" => "[", r"`[^`]*`" => "`…`")
     return length(reason) > 160 ? first(reason, 159) * "…" : reason
 end
 

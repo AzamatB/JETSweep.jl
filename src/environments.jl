@@ -3,9 +3,12 @@
 # preferences are never written, and package sources stay in place, so diagnostics name the
 # original files. Preparation runs in its own process; see `scripts/prepare.jl`.
 
+"Write `data` to `path` as TOML, whole or not at all, since other processes read results."
 function _write_toml(path::String, data)
     mkpath(dirname(path))
-    open(io -> TOML.print(io, data; sorted=true), path, "w")
+    partial = path * ".partial"
+    open(io -> TOML.print(io, data; sorted=true), partial, "w")
+    mv(partial, path; force=true)
     return path
 end
 
@@ -347,13 +350,13 @@ function _check_deferred(env, deferred::Dict{String,String})
 end
 
 """
-    prepare(context, directory; instantiate=true, precompile=true) -> Environment
+    prepare(context, directory; instantiate=true) -> Environment
 
 Write the analysis environment for `context` into the empty `directory`: the combined
 dependencies, sources, compat bounds and effective preferences of its projects, together
 with the analyzer, resolved from their existing manifests where possible. With
-`instantiate`, missing packages are downloaded; with `precompile`, the environment is
-precompiled once for all the units that share it. Dependency build scripts never run.
+`instantiate`, missing packages are downloaded; otherwise resolution considers installed
+versions only. Dependency build scripts never run; see also `precompile_environment`.
 """
 function prepare(context::Context, directory::String; instantiate::Bool=true)
     directory = abspath(directory)

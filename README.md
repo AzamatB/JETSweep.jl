@@ -121,7 +121,7 @@ leaves without package images, load from source. Original projects, manifests, p
 and sources are never written, and package build scripts never run.
 
 The scheduler prepares environments first, then starts the longest analyses, as measured by
-the latest report in `DIRECTORY/.jetsweep` that the same JETSweep version wrote, or
+the latest report in `DIRECTORY/.jetsweep` if the same JETSweep version wrote it, or
 estimated from source size, and assigns GPUs round-robin. Each analysis takes one of the
 `--jobs` slots: package analyses run on `--threads` threads, but use little more than one core
 on average. Workers run with Julia's default code generation flags, so they share the

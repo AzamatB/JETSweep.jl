@@ -96,25 +96,39 @@ function bind(mod::Module)
     return nothing
 end
 
+"A binding's name as `import` syntax takes it, or `nothing`."
+function import_name(name::Symbol)
+    text = String(name)
+    startswith(text, '#') && return nothing
+    text = Base.isidentifier(name) || Base.isoperator(name) || startswith(text, '@') ? text : "var$(repr(text))"
+    return Meta.isexpr(Meta.parse("import M: $text"; raise=false), :import) ? text : nothing
+end
+
 """
-An entry file that recreates the scope of `parent` before including `file`: the modules it
-uses and every binding it defines or imports. A used module is named through `parent` when
-`parent` binds it, since its package need not be loadable from the environment by name: a
-dependency of a dependency, say.
+An entry file that recreates the scope of `target`, a package's module or an extension's,
+before including `file`: the modules it uses and every binding it defines or imports. A
+used module is named through `target` when `target` binds it, since its package need not be
+loadable from the environment by name: a dependency of a dependency, say. An extension is
+reached through its package, since it has no name to load it by.
 """
-function orphan_entry(parent::Module, file::String)
-    path(m) = isdefined(parent, nameof(m)) && getglobal(parent, nameof(m)) === m ?
-        "$(nameof(parent)).$(nameof(m))" : join(fullname(m), '.')
-    usings = [path(m) for m in ccall(:jl_module_usings, Any, (Any,), parent)
-              if m !== Base && m !== Core && m !== parent && first(fullname(m)) !== :Main]
-    bindings = filter(names(parent; all=true, imported=true)) do name
-        Base.isidentifier(name) && !startswith(String(name), '#') && !(name in (:eval, :include)) &&
-            isdefined(parent, name)
-    end
+function orphan_entry(target::Module, file::String, package::String, extension::String)
     io = IOBuffer()
-    println(io, "const Main = @__MODULE__\nimport ", nameof(parent))
-    foreach(path -> println(io, "using ", path), usings)
-    isempty(bindings) || println(io, "import ", nameof(parent), ": ", join(bindings, ", "))
+    println(io, "const Main = @__MODULE__\nimport ", package)
+    reference = package
+    if !isempty(extension)
+        # Evaluated, so that analysis knows the module.
+        println(io, "@eval const ", extension, " = Base.get_extension(", package, ", :", extension, ")")
+        reference = "." * extension
+    end
+    path(m) = isdefined(target, nameof(m)) && getglobal(target, nameof(m)) === m ?
+        "$reference.$(nameof(m))" : join(fullname(m), '.')
+    for m in ccall(:jl_module_usings, Any, (Any,), target)
+        m === Base || m === Core || m === target || first(fullname(m)) === :Main || println(io, "using ", path(m))
+    end
+    bindings = [text for name in names(target; all=true, imported=true)
+                if !(name in (:eval, :include)) && isdefined(target, name)
+                for text in (import_name(name),) if text !== nothing]
+    isempty(bindings) || println(io, "import ", reference, ": ", join(bindings, ", "))
     println(io, "include(", repr(file), ")")
     return String(take!(io))
 end
@@ -197,7 +211,10 @@ function analyze(request, log::ErrorLog)
     if kind in ("package", "extension", "orphan")
         target = load(request, log)
         timings["load"] = time() - started
-        kind == "orphan" && (write(request["generated"], orphan_entry(target, request["entry"])); target = nothing)
+        if kind == "orphan"
+            write(request["generated"], orphan_entry(target, request["entry"], request["package"], request["extension"]))
+            target = nothing
+        end
     end
     generated = canonical(request["generated"])
     cd(dirname(request["entry"]))
@@ -262,7 +279,9 @@ function main(request_file::String, result_file::String)
         Dict{String,Any}("error" => sprint(showerror, err, catch_backtrace()))
     end
     result["errors"] = log.analyzer
-    open(io -> TOML.print(io, result; sorted=true), result_file, "w")
+    # Whole or not at all, since JETSweep reads the result once the worker exits.
+    open(io -> TOML.print(io, result; sorted=true), result_file * ".partial", "w")
+    mv(result_file * ".partial", result_file; force=true)
     return 0
 end
 
