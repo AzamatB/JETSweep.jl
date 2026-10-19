@@ -3,8 +3,6 @@ const _LOADED_PROJECT = Ref("")
 "The project JETSweep was loaded from, which also provides JETLS to analysis environments."
 tool_project() = _LOADED_PROJECT[]
 
-_timestamp() = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS") * "Z"
-
 function _write_toml(path::String, data)
     mkpath(dirname(path))
     open(io -> TOML.print(io, data; sorted=true), path, "w")
@@ -109,31 +107,52 @@ function _jetls_config(unit::Unit, root::String)
     end
 end
 
+"A path as a literal glob: JETLS matches configured paths with escapes enabled."
+_glob_literal(path::AbstractString) = replace(_slash(path), r"([\\*?\[\]])" => s"\\\1")
+
+const _PATH_SETTINGS = (("diagnostic", "patterns"), ("full_analysis", "concretization_patterns"),
+                        ("initialization_options", "analysis_overrides"))
+
 """
-Write the unit's JETLS configuration: the user's, with the settings a sweep requires, and
-return the directory its paths are relative to. A test driver whose run-time includes are
-analyzed as their own units evaluates its constants, so that analysis gets past its
-selection logic, and skips those includes.
+Write the unit's JETLS configuration and return the root its paths are relative to, the
+sweep root. The user's configuration applies with its paths rebased from its own
+directory, plus the settings a sweep requires.
+
+Script analysis may also evaluate the unit's statically side-effect-free top-level
+statements (`concretization_patterns`), so that definitions and includes depending on their
+values load. A test driver whose run-time includes are analyzed as their own units also
+evaluates the assignments that select those files, and then skips including them.
 """
 function _write_jetls_config(unit::Unit, directory::String, root::String, separate::Vector{String})
     source = _jetls_config(unit, root)
-    base = isempty(source) ? root : dirname(source)
     data = isempty(source) ? Dict{String,Any}() : TOML.parsefile(source)
+    prefix = isempty(source) ? "." : relpath(dirname(source), root)
+    for (section, key) in _PATH_SETTINGS, entry in get(get(data, section, Dict()), key, Any[])
+        prefix != "." && entry isa AbstractDict && get(entry, "path", nothing) isa String &&
+            (entry["path"] = _glob_literal(prefix) * "/" * entry["path"])
+    end
     full = get!(data, "full_analysis", Dict{String,Any}())
     full["auto_instantiate"] = "never"   # JETSweep prepares every environment itself
     diagnostic = get!(data, "diagnostic", Dict{String,Any}())
     diagnostic["enabled"] = true
     diagnostic["all_files"] = true
+    if unit.kind in (:test, :script, :orphan)
+        patterns = get!(full, "concretization_patterns", Any[])
+        for file in [unit.expected; unit.overrides.setup]
+            path = _glob_literal(relpath(file, root))
+            for pattern in concretization_patterns(file; selection=file == unit.entry && !isempty(separate))
+                push!(patterns, Dict("pattern" => pattern, "path" => path))
+            end
+        end
+    end
     if !isempty(separate)
-        push!(get!(full, "concretization_patterns", Any[]),
-              Dict("pattern" => "const x_ = y_", "path" => _slash(relpath(unit.entry, base))))
         overrides = get!(get!(data, "initialization_options", Dict{String,Any}()), "analysis_overrides", Any[])
         for file in separate
-            push!(overrides, Dict("path" => _slash(relpath(file, base)), "on_include" => "skip"))
+            push!(overrides, Dict("path" => _glob_literal(relpath(file, root)), "on_include" => "skip"))
         end
     end
     _write_toml(joinpath(directory, "config", ".JETLSConfig.toml"), data)
-    return base
+    return root
 end
 
 "The entry file analyzed for a test or script unit: its context, then the original file."
@@ -176,20 +195,15 @@ function _analyze(unit::Unit, environment::Environment, inventory::Inventory, ou
     result = joinpath(directory, "result.toml")
     threads = unit.kind in (:package, :extension) ? options.threads : 1
     command = julia_command(joinpath(_SCRIPTS, "analyze.jl"), [request, result]; project=environment.dir,
-        threads, env=gpu === nothing ? Dict{String,String}() : Dict("CUDA_VISIBLE_DEVICES" => gpu))
+        threads, compile=false, env=gpu === nothing ? Dict{String,String}() : Dict("CUDA_VISIBLE_DEVICES" => gpu))
     process = run_worker(Cmd(command; dir=dirname(unit.entry)), log, options.timeout)
     process.timed_out && return failure(:timeout, "time limit of $(options.timeout) s exceeded")
     isfile(result) || return failure(:failed, "worker exited with code $(process.code) without a result")
     data = TOML.parsefile(result)
     haskey(data, "error") && return failure(:failed, first(split(data["error"], '\n')))
     reasons = String[data["reasons"]..., ("logged error: " * error for error in data["errors"])...]
-    notes = String[]
-    if !isempty(data["missing"])
-        # A package's conditionally included files are analyzed as orphan units instead.
-        unit.kind in (:package, :extension) ?
-            push!(notes, "loading did not include: " * join(data["missing"], ", ")) :
-            push!(reasons, "not analyzed: " * join(data["missing"], ", "))
-    end
+    # Files the analysis did not reach are analyzed by follow-up units; see `_followups`.
+    notes = isempty(data["missing"]) ? String[] : ["not reached by this analysis: " * join(data["missing"], ", ")]
     found = [Finding(row["file"], row["line"], row["column"], row["end_line"], row["end_column"],
                      row["severity"], row["code"], row["message"]) for row in data["findings"]]
     status = !isempty(reasons) ? :incomplete : isempty(found) ? :clean : :findings
@@ -197,16 +211,26 @@ function _analyze(unit::Unit, environment::Environment, inventory::Inventory, ou
 end
 
 """
-Orphan units for the files a package or extension unit expected to cover but its loaded
-module did not include, such as conditionally included code.
+Units for the files a unit expected to cover but did not reach. Package and extension files
+that loading left out, such as conditionally included code, become orphan units. Files a
+test or script did not reach, after an analysis stop say, are analyzed from themselves in
+the same context.
 """
-function _missed_sources(unit::Unit, result::UnitResult, inventory::Inventory, planned::Set{String})
-    unit.kind in (:package, :extension) && !isempty(result.analyzed) || return Unit[]
+function _followups(unit::Unit, result::UnitResult, inventory::Inventory, planned::Set{String},
+                    sources::Dict{String,Source})
+    result.status in (:clean, :findings, :incomplete) && !isempty(result.analyzed) || return Unit[]
     analyzed = Set(result.analyzed)
     missed = filter(file -> !(realpath(file) in analyzed) && !(file in planned), unit.expected)
-    return [Unit(_unit_id(:orphan, file, inventory.root), :orphan, file,
-                 Context(unit.context.owner, unit.context.owner, false, Dict{String,String}()), [file], "", "",
-                 Overrides(), ["loading the package did not include this file"]) for file in missed]
+    isempty(missed) && return Unit[]
+    if unit.kind in (:package, :extension, :orphan)
+        context = Context(unit.context.owner, unit.context.owner, false, Dict{String,String}())
+        return [Unit(_unit_id(:orphan, file, inventory.root), :orphan, file, context, [file], "", "",
+                     Overrides(), ["not included when its package loaded"]) for file in missed]
+    end
+    syntax = Dict(file => parse_source(file) for file in missed)
+    return [Unit(_unit_id(unit.kind, entry, inventory.root), unit.kind, entry, unit.context, expected,
+                 unit.kind === :test ? _driver(entry, unit.context.owner, sources) : "", "", unit.overrides,
+                 ["not reached when analyzing $(unit.entry)"]) for (entry, expected) in _entries(missed, syntax)]
 end
 
 "Source bytes a unit analyzes, the scheduler's estimate of its cost."
@@ -262,7 +286,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     root = realpath(root)
     config = read_config(root, options.config)
     output = isempty(options.output) ?
-        joinpath(root, ".jetsweep", Dates.format(Dates.now(Dates.UTC), "yyyymmdd-HHMMSS")) : abspath(options.output)
+        joinpath(root, ".jetsweep", Libc.strftime("%Y%m%d-%H%M%S", time())) : abspath(options.output)
     ispath(output) && !(isdir(output) && isempty(readdir(output))) &&
         throw(ArgumentError("report directory must be new or empty: $output"))
     inventory = discover(root; exclude=[config.exclude; options.exclude], output,
@@ -287,25 +311,37 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     foreach(unit -> isempty(unit.driver) || push!(get!(separate, unit.driver, String[]), unit.entry), units)
     environments = Dict{Context,Environment}()
     results = Dict{String,UnitResult}()
+    sources = Dict(source.path => source for source in inventory.sources)
+    # Files some unit's entry already covers need no follow-up units of their own.
     planned = Set(unit.entry for unit in units)
     started_units = Ref(0)
+    # A failure handling one environment or unit is recorded as its result, not raised.
+    contained(f, failed) = try
+        f()
+    catch err
+        err isa InterruptException && rethrow()
+        failed(sprint(showerror, err))
+    end
     function step(task::_Task)
         work = task.work
         if work isa Context
-            environments[work] = _prepare(work, joinpath(output, "environments", _context_key(work)), options)
+            directory = joinpath(output, "environments", _context_key(work))
+            environments[work] = contained(() -> _prepare(work, directory, options),
+                                           message -> Environment(:failed, directory, message))
             return [_task(unit, options) for unit in members[work]]
         end
         gpu = isempty(gpus) ? nothing : gpus[mod1(started_units[] += 1, length(gpus))]
-        result = _analyze(work, environments[work.context], inventory, output, options, gpu,
-                          work.kind === :test ? get(separate, work.entry, String[]) : String[])
+        result = contained(() -> _analyze(work, environments[work.context], inventory, output, options, gpu,
+                                          work.kind === :test ? get(separate, work.entry, String[]) : String[]),
+                           message -> UnitResult(work.id, :failed, Finding[], String[], [message], String[], 0.0, ""))
         results[work.id] = result
         report_progress(io, work, result, length(results), length(units), root)
-        orphans = _missed_sources(work, result, inventory, planned)
-        for orphan in orphans
-            push!(planned, orphan.entry)
-            push!(units, orphan)
+        followups = _followups(work, result, inventory, planned, sources)
+        for unit in followups
+            union!(planned, unit.expected)
+            push!(units, unit)
         end
-        return [_task(orphan, options) for orphan in orphans]
+        return [_task(unit, options) for unit in followups]
     end
     _dispatch(step, [_task(context, members[context]) for context in contexts], options.jobs)
     after = _snapshot(discover(root; exclude=[config.exclude; options.exclude], output,

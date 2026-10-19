@@ -4,12 +4,11 @@ directory, with each analysis in its own process. See [`sweep`](@ref).
 """
 module JETSweep
 
-using Dates
+using Base: UUID
 using LibGit2
 using Pkg
 using SHA
 using TOML
-using UUIDs
 
 include("model.jl")
 include("discovery.jl")

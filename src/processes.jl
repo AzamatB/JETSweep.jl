@@ -32,7 +32,11 @@ function run_worker(command::Cmd, log::String, timeout::Float64)
         @lock _ACTIVE_LOCK _ACTIVE[pid] = process
         timed_out = false
         try
-            timed_out = timeout > 0 && timedwait(() -> process_exited(process), timeout; pollint=0.1) === :timed_out
+            if timeout > 0
+                timed_out = timedwait(() -> process_exited(process), timeout; pollint=0.1) === :timed_out
+            else
+                wait(process)
+            end
         finally
             # The leader may exit before its children; always reap the whole group.
             _terminate(process, pid)
@@ -50,10 +54,18 @@ function _terminate_all()
     end
 end
 
-"The worker Julia command, with this process's runtime flags so package images match."
+"""
+The worker Julia command. Workers use Julia's default code generation flags, whatever this
+process runs with (`--check-bounds=yes` under `Pkg.test`, say), so they share the package
+images of ordinary sessions and analyze code as it normally runs. With `compile=false` a
+worker uses existing package images only, loading a package from source otherwise, since
+environment preparation already precompiled what can be.
+"""
 function julia_command(script::String, args::Vector{String}; project::String, threads::Int,
-                       env::Dict{String,String}=Dict{String,String}())
-    command = `$(Base.julia_cmd()) --startup-file=no --history-file=no --threads=$threads,1
+                       compile::Bool=true, env::Dict{String,String}=Dict{String,String}())
+    julia = joinpath(Sys.BINDIR, Base.julia_exename())
+    modules = compile ? "yes" : "existing"
+    command = `$julia --startup-file=no --history-file=no --compiled-modules=$modules --threads=$threads,1
                --project=$project $script $args`
     variables = merge(Dict(ENV), Dict(
         "JULIA_LOAD_PATH" => "@:@stdlib", "JULIA_PKG_PRECOMPILE_AUTO" => "0",

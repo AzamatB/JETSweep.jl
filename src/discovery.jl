@@ -39,9 +39,23 @@ function _glob(pattern::AbstractString)
 end
 
 """
-Whether a root-relative path matches an exclusion. A pattern containing `/` matches the
-whole relative path; otherwise it matches any single path segment.
+Translate exclusion globs, relative to the root. A pattern containing `/`, or starting with
+`/` or `./`, matches the whole relative path; any other pattern matches any path segment.
 """
+function _exclusions(patterns::Vector{String})
+    globs, anchored = Regex[], Bool[]
+    for pattern in patterns
+        pattern = rstrip(_slash(pattern), '/')
+        rooted = startswith(pattern, '/') || startswith(pattern, "./")
+        pattern = rooted ? lstrip(pattern[(startswith(pattern, "./") ? 3 : 2):end], '/') : pattern
+        isempty(pattern) && continue
+        push!(globs, _glob(pattern))
+        push!(anchored, rooted || occursin('/', pattern))
+    end
+    return globs, anchored
+end
+
+"Whether a root-relative path matches an exclusion."
 function _excluded(relative::String, patterns::Vector{Regex}, anchored::Vector{Bool})
     for (pattern, whole) in zip(patterns, anchored)
         if whole
@@ -164,24 +178,28 @@ function _read_project(file::String, issues::Vector{String})
     return Project(directory, file, name, uuid, entry, extensions)
 end
 
+"`isdir` and `ispath` throw for unreadable paths and symlink loops; treat those as absent."
+_isdir(path::String) = try isdir(path) catch; false end
+_ispath(path::String) = try ispath(path) catch; false end
+
 """
     discover(root; exclude=String[], output="", include_ignored=false, tracked_only=false)
 
 Recursively inventory the Julia projects and source files below `root`. Inside Git
 repositories, LibGit2 applies each repository's ignore rules, including nested
-repositories; tracked files are always kept. Hidden directories are skipped unless Git
-tracks files inside them. Directory symlinks that stay inside `root` are followed once.
-`exclude` holds globs relative to `root`; `output` names a report directory to skip.
+repositories, and files Git tracks are kept even when ignored. Hidden directories are
+skipped unless Git tracks files inside them, as are `node_modules` and `__pycache__`.
+Symlinks are not followed: inside the root they are aliases of what discovery reaches
+anyway, or of what it excludes. `exclude` holds globs relative to `root`; `output` names
+a report directory to skip.
 """
 function discover(root::AbstractString; exclude::Vector{String}=String[], output::AbstractString="",
                   include_ignored::Bool=false, tracked_only::Bool=false)::Inventory
     isdir(root) || throw(ArgumentError("not a directory: $root"))
     root = realpath(root)
     output = isempty(output) ? "" : ispath(output) ? realpath(output) : abspath(output)
-    patterns = [_glob(rstrip(_slash(p), '/')) for p in exclude]
-    anchored = [occursin('/', rstrip(_slash(p), '/')) for p in exclude]
+    patterns, anchored = _exclusions(exclude)
     excluded, issues, files, project_files = String[], String[], String[], String[]
-    visited = Set{String}()
     repositories = _Git[]
 
     function open_git(directory)
@@ -196,33 +214,28 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], output
     end
 
     function walk(directory::String, git::Union{Nothing,_Git})
-        realpath(directory) in visited && return push!(excluded, "$directory (symlink cycle or alias)")
-        push!(visited, realpath(directory))
-        ispath(joinpath(directory, ".git")) && directory != root && (git = open_git(directory))
         entries = try
             readdir(directory; join=true)
         catch err
             return push!(issues, "$directory: cannot list directory: $(sprint(showerror, err))")
         end
-        # Visit real directories before symlinked aliases of them.
-        sort!(entries; by=path -> (islink(path), path))
+        directory != root && ".git" in basename.(entries) && (git = open_git(directory))
         metadata = String[]
         for path in entries
             name = basename(path)
             name == ".git" && continue
-            isdirectory = isdir(path)
+            link = islink(path)
+            isdirectory = !link && _isdir(path)
             hidden = isdirectory && startswith(name, '.')
-            reason = if _excluded(_slash(relpath(path, root)), patterns, anchored)
+            reason = if link
+                "symlink"
+            elseif _excluded(_slash(relpath(path, root)), patterns, anchored)
                 "excluded by pattern"
             elseif !isempty(output) && _within(path, output)
                 "report output"
             elseif isdirectory && name in _PRUNED
                 "dependency or cache directory"
-            elseif islink(path) && !ispath(path)
-                "broken symlink"
-            elseif islink(path) && !_within(realpath(path), root)
-                "symlink outside the root"
-            elseif git !== nothing && !(isdirectory && ispath(joinpath(path, ".git")))
+            elseif git !== nothing && !(isdirectory && _ispath(joinpath(path, ".git")))
                 try
                     _git_exclusion(git, path, isdirectory, hidden, include_ignored, tracked_only)
                 catch err
@@ -253,7 +266,7 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], output
         git = nothing
         ancestor = root
         while true
-            ispath(joinpath(ancestor, ".git")) && (git = open_git(ancestor); break)
+            _ispath(joinpath(ancestor, ".git")) && (git = open_git(ancestor); break)
             dirname(ancestor) == ancestor && break
             ancestor = dirname(ancestor)
         end

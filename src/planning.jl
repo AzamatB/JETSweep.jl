@@ -2,12 +2,12 @@ _unit_id(kind::Symbol, entry::String, root::String, extension::String="") =
     string(kind, '-', bytes2hex(sha256(string(_slash(relpath(entry, root)), '\0', extension)))[1:12])
 
 "Files reachable from `entry` through statically resolved includes, optionally only those analysis follows."
-function _reach(entry::String, syntax::Dict{String,Syntax}; followed_only::Bool)
+function _reach(entry::String, syntax::Dict{String,Syntax}; followed_only::Bool, within=nothing)
     seen = Set{String}()
     pending = [entry]
     while !isempty(pending)
         file = pop!(pending)
-        file in seen && continue
+        (file in seen || (within !== nothing && !(file in within))) && continue
         push!(seen, file)
         facts = get(syntax, file, nothing)
         facts === nothing && continue
@@ -19,25 +19,20 @@ function _reach(entry::String, syntax::Dict{String,Syntax}; followed_only::Bool)
 end
 
 """
-Select entry files that cover `files`: files no other file in the set includes come first,
-each covering what it reaches; files left in include cycles become entries in path order.
+Choose entry files that cover `files`, each covering what it includes. An entry is a file
+that every file including it, directly or not, is itself included by: a file nothing else
+in the set includes, or the first file of an include cycle nothing outside it includes.
 """
 function _entries(files::Vector{String}, syntax::Dict{String,Syntax})
     remaining = Set(files)
+    reach = Dict(file => _reach(file, syntax; followed_only=true, within=remaining) for file in files)
     entries = Pair{String,Vector{String}}[]
-    while !isempty(remaining)
-        included = Set{String}()
-        for file in remaining, include in syntax[file].includes
-            include.followed && include.target != file && push!(included, include.target)
-        end
-        roots = sort!([file for file in remaining if !(file in included)])
-        isempty(roots) && (roots = [minimum(remaining)])
-        for root in roots
-            root in remaining || continue
-            covered = sort!(collect(intersect(_reach(root, syntax; followed_only=true), remaining)))
-            setdiff!(remaining, covered)
-            push!(entries, root => covered)
-        end
+    for file in sort(files)
+        file in remaining || continue
+        all(other -> !(file in reach[other]) || other in reach[file], files) || continue
+        covered = sort!(collect(intersect(reach[file], remaining)))
+        setdiff!(remaining, covered)
+        push!(entries, file => covered)
     end
     return entries
 end
@@ -62,16 +57,26 @@ function _extension_entry(package::Project, name::String)
     return ""
 end
 
+"The context of a package's tests: its test project when it has one, and its test dependencies."
+function _test_context(owner::String)
+    tests = joinpath(owner, "test")
+    project = any(name -> isfile(joinpath(tests, name)), _PROJECT_FILES) ? tests : owner
+    return Context(project, owner, true, Dict{String,String}())
+end
+
 """
     plan(inventory, config=Config()) -> Vector{Unit}
 
 Partition the inventory into analysis units:
 
-- each package entry and each declared extension, covering the files they include;
+- each package entry and each declared extension, covering the files they include, and
+  for a package also its other `src/` files: those loading leaves out become orphan units
+  during the sweep;
 - each package's `test/runtests.jl`, covering the files analysis follows from it, and
   every other test file as its own unit after a prelude of the driver's definitions;
-- scripts, grouped by the files they include, in their nearest environment;
-- package sources that no entry includes, with the package's bindings in scope.
+- scripts, grouped by the files they include, in their nearest environment; a package's
+  own scripts use its test environment;
+- extension sources no extension includes, with the package's bindings in scope.
 
 Includes are found by parsing, without executing any code.
 """
@@ -94,32 +99,31 @@ function plan(inventory::Inventory, config::Config=Config())::Vector{Unit}
     owned(owner) = file -> haskey(sources, file) && sources[file].owner == owner
 
     for package in sort!(filter(ispackage, inventory.projects); by=project -> project.dir)
+        haskey(sources, package.entry) || continue
         context = Context(package.dir, package.dir, false, Dict{String,String}())
-        add!(:package, package.entry, context,
-             filter(owned(package.dir), _reach(package.entry, syntax; followed_only=false)))
+        files = union(filter(owned(package.dir), _reach(package.entry, syntax; followed_only=false)),
+                      (s.path for s in inventory.sources if s.owner == package.dir && s.kind === :package))
+        add!(:package, package.entry, context, files)
         for (name, triggers) in sort!(collect(package.extensions); by=first)
             entry = _extension_entry(package, name)
-            isempty(entry) && continue
+            haskey(sources, entry) || continue
             add!(:extension, entry, Context(package.dir, package.dir, false, triggers),
                  filter(owned(package.dir), _reach(entry, syntax; followed_only=false)); extension=name)
         end
     end
 
-    uncovered = filter(source -> !(source.path in covered), inventory.sources)
     # Test files are analyzed in their package's test environment. Each package's
     # runtests.jl comes first, so the files it includes statically need no units of their own.
     tests = Dict{String,Vector{String}}()
-    for source in uncovered
+    for source in inventory.sources
+        source.path in covered && continue
         source.kind === :test && source.project in (source.owner, joinpath(source.owner, "test")) &&
             push!(get!(tests, source.owner, String[]), source.path)
     end
     for owner in sort!(collect(keys(tests)))
         files = tests[owner]
-        project = isfile(joinpath(owner, "test", "Project.toml")) || isfile(joinpath(owner, "test", "JuliaProject.toml")) ?
-            joinpath(owner, "test") : owner
-        context = Context(project, owner, true, Dict{String,String}())
-        drivers = sort!(filter(file -> basename(file) == "runtests.jl", files); by=length)
-        for driver in drivers
+        context = _test_context(owner)
+        for driver in sort!(filter(file -> basename(file) == "runtests.jl", files); by=length)
             driver in covered && continue
             add!(:test, driver, context, filter(file -> !(file in covered), _reach(driver, syntax; followed_only=true)))
         end
@@ -128,20 +132,18 @@ function plan(inventory::Inventory, config::Config=Config())::Vector{Unit}
         end
     end
 
-    uncovered = filter(source -> !(source.path in covered), inventory.sources)
-    orphans = filter(source -> source.kind in (:package, :extension) && haskey(projects, source.owner) &&
-                               ispackage(projects[source.owner]), uncovered)
-    for source in orphans
+    for source in inventory.sources
+        source.path in covered && continue
+        source.kind === :extension && haskey(projects, source.owner) && ispackage(projects[source.owner]) || continue
         add!(:orphan, source.path, Context(source.owner, source.owner, false, Dict{String,String}()), [source.path])
     end
 
-    # Everything else is a script, analyzed in its nearest environment. A script of a
-    # package that has no environment of its own loads the package's dependencies.
+    # Everything else is a script, analyzed in its nearest environment.
     scripts = Dict{Context,Vector{String}}()
-    for source in uncovered
+    for source in inventory.sources
         source.path in covered && continue
-        context = Context(source.project, source.project == source.owner ? source.owner : "", false,
-                          Dict{String,String}())
+        context = !isempty(source.owner) && source.project == source.owner ? _test_context(source.owner) :
+            Context(source.project, "", false, Dict{String,String}())
         push!(get!(scripts, context, String[]), source.path)
     end
     for context in sort!(collect(keys(scripts)); by=context -> context.project)
@@ -165,10 +167,14 @@ function _configure(units::Vector{Unit}, config::Config, root::String)
         for (i, unit) in pairs(units)
             occursin(rule.pattern, _slash(relpath(unit.entry, root))) || continue
             matched = true
-            context = isempty(rule.project) ? unit.context :
-                Context(rule.project, unit.context.owner, unit.context.test, unit.context.triggers)
+            set(key, value, current) = key in rule.keys ? value : current
+            context = unit.context
+            "project" in rule.keys && (context = Context(rule.project, context.owner, context.test, context.triggers))
+            current = unit.overrides
+            overrides = Overrides(set("setup", rule.setup, current.setup), set("args", rule.args, current.args),
+                                  merge(current.env, rule.env), set("jetls_config", rule.jetls_config, current.jetls_config))
             units[i] = Unit(unit.id, unit.kind, unit.entry, context, unit.expected, unit.driver,
-                            unit.extension, rule.overrides, unit.notes)
+                            unit.extension, overrides, unit.notes)
         end
         matched || throw(ArgumentError("$(config.file): [[context]] match $(repr(rule.match)) selects no unit"))
     end

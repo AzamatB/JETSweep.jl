@@ -40,12 +40,15 @@ function _merge_dep!(deps::Dict{String,String}, name::String, uuid)
     return deps
 end
 
+_bound(bound) = bound.n == 0 ? "0" : join(bound.t[1:bound.n], ".")
+"A version range in compat syntax: Pkg prints ranges in a notation compat reads differently."
+_compat(range) = range.upper.n == 0 ? ">= " * _bound(range.lower) : _bound(range.lower) * " - " * _bound(range.upper)
+
 function _merge_compat!(compat::Dict{String,String}, name::String, value::String)
     if haskey(compat, name)
         both = intersect(Pkg.Types.semver_spec(compat[name]), Pkg.Types.semver_spec(value))
         isempty(both) && error("incompatible compat bounds for $name: $(compat[name]) and $value")
-        # A VersionSpec prints disjoint ranges in brackets, which Project.toml rejects.
-        compat[name] = join(string.(both.ranges), ", ")
+        compat[name] = join(_compat.(both.ranges), ", ")
     else
         compat[name] = value
     end
@@ -92,10 +95,10 @@ function _scratch_project(context::Context, envs)
             _merge_dep!(bindings, name, uuid)
         end
         if context.test
+            # Pkg has already rejected test targets that name undeclared packages.
             for name in get(get(raw, "targets", Dict()), "test", String[])
                 uuid = get(get(raw, "extras", Dict()), name, get(get(raw, "weakdeps", Dict()), name, get(deps, name, nothing)))
-                uuid === nothing && error("test target dependency $name has no declared UUID")
-                _merge_dep!(deps, name, uuid)
+                uuid === nothing || _merge_dep!(deps, name, uuid)
             end
         end
         if env.pkg !== nothing
@@ -238,7 +241,10 @@ function _unavailable(env)
         Pkg.Types.is_stdlib(uuid) || haskey(env.manifest, uuid) || push!(missing, "$name ($uuid), needed by $(entry.name)")
     end
     isempty(missing) || return "unresolved dependencies: " * join(sort!(unique!(missing)), "; ")
-    Pkg.Operations.is_instantiated(env, true) || return "package sources or artifacts are not installed"
+    absent = [package.name for package in Pkg.Operations.load_all_deps(env)
+              if !Pkg.Operations.is_package_downloaded(env.manifest_file, package)]
+    isempty(absent) || return "packages not installed: " * join(sort!(absent), ", ")
+    Pkg.Operations.is_instantiated(env, true) || return "package artifacts are not installed"
     return ""
 end
 
@@ -252,9 +258,16 @@ function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool=true)
     packages = Pkg.Types.PackageSpec[]
     Pkg.API.append_all_pkgs!(packages, ctx, exact ? Pkg.PKGMODE_MANIFEST : Pkg.PKGMODE_PROJECT; workspace=true)
     for package in packages
-        Pkg.API.update_source_if_set(ctx.env, package)
         identity = _identity(package, "dependency")
-        path, repo = Pkg.Types.get_path_repo(ctx.env.project, ctx.env.project_file, ctx.env.manifest_file, identity.name)
+        # Pkg looks `[sources]` up by name. They must not reach a private namesake, such as
+        # the analyzer's vendored JET when the target develops its own JET.
+        if get(ctx.env.project.deps, identity.name, nothing) == identity.uuid
+            Pkg.API.update_source_if_set(ctx.env, package)
+            path, repo = Pkg.Types.get_path_repo(ctx.env.project, ctx.env.project_file, ctx.env.manifest_file, identity.name)
+        else
+            package.path, package.repo = nothing, Pkg.Types.GitRepo()
+            path, repo = nothing, Pkg.Types.GitRepo()
+        end
         ops.up_load_versions!(ctx, package, get(ctx.env.manifest, identity.uuid, nothing), path, repo,
                               exact ? Pkg.UPLEVEL_FIXED : Pkg.UPLEVEL_MAJOR)
     end
@@ -329,15 +342,15 @@ function _check_deferred(env, deferred::Dict{String,String})
 end
 
 """
-    prepare(context, directory; instantiate=true) -> Environment
+    prepare(context, directory; instantiate=true, precompile=true) -> Environment
 
 Write the analysis environment for `context` into the empty `directory`: the combined
 dependencies, sources, compat bounds and effective preferences of its projects, together
 with the analyzer, resolved from their existing manifests where possible. With
-`instantiate`, missing packages are downloaded. The environment is then precompiled;
-dependency build scripts never run.
+`instantiate`, missing packages are downloaded; with `precompile`, the environment is
+precompiled once for all the units that share it. Dependency build scripts never run.
 """
-function prepare(context::Context, directory::String; instantiate::Bool=true)
+function prepare(context::Context, directory::String; instantiate::Bool=true, precompile::Bool=true)
     directory = abspath(directory)
     try
         isdir(directory) && !isempty(readdir(directory)) && error("preparation directory is not empty: $directory")
@@ -375,7 +388,7 @@ function prepare(context::Context, directory::String; instantiate::Bool=true)
         isempty(unavailable) || error(instantiate ? unavailable : "$unavailable (downloads are disabled)")
         instantiate || Pkg.Types.write_manifest(env.manifest, joinpath(directory, "Manifest.toml"))
         _check_deferred(env, deferred)
-        try
+        precompile && try
             Pkg.precompile(Pkg.Types.Context(; env), Pkg.Types.PackageSpec[]; already_instantiated=true, warn_loaded=false)
         catch err
             err isa InterruptException && rethrow()

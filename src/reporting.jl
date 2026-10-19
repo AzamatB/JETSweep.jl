@@ -81,13 +81,13 @@ function write_report(result::SweepResult; io::IO=stderr)
             end
         end
         isempty(findings) || println(summary)
-        _summarize(summary, result, findings, statuses, severities, codes, unanalyzed, byid)
+        _summarize(summary, result, findings, statuses, severities, codes, unanalyzed, byid; detailed=true)
     end
-    _summarize(io, result, findings, statuses, severities, codes, unanalyzed, byid)
+    _summarize(io, result, findings, statuses, severities, codes, unanalyzed, byid; detailed=false)
     return nothing
 end
 
-function _summarize(io::IO, result::SweepResult, findings, statuses, severities, codes, unanalyzed, byid)
+function _summarize(io::IO, result::SweepResult, findings, statuses, severities, codes, unanalyzed, byid; detailed::Bool)
     root = result.root
     println(io)
     println(io, "JETSweep analyzed $(length(result.units)) units in $(round(result.seconds; digits=1)) s: ",
@@ -106,11 +106,13 @@ function _summarize(io::IO, result::SweepResult, findings, statuses, severities,
     for r in result.results
         complete(r) && continue
         unit = byid[r.unit]
-        println(io, "Incomplete ($(r.status)): ", _display(unit.entry, root), isempty(unit.extension) ? "" : " ($(unit.extension))")
-        for reason in first(r.reasons, 3)
-            println(io, "    ", first(split(reason, '\n')))
+        println(io, rpad(String(r.status), 11), " ", _display(unit.entry, root),
+                isempty(unit.extension) ? "" : " ($(unit.extension))")
+        for reason in (detailed ? r.reasons : first(r.reasons, 1))
+            line = first(split(reason, '\n'))
+            println(io, "    ", detailed ? line : first(line, 200))
         end
-        isempty(r.log) || println(io, "    log: ", r.log)
+        detailed && !isempty(r.log) && println(io, "    log: ", r.log)
     end
     isempty(unanalyzed) || println(io, length(unanalyzed), " files were not covered by a complete analysis")
     println(io, "Report: ", joinpath(result.output, "report.toml"))

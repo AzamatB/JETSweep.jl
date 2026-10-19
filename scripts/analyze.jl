@@ -15,24 +15,38 @@ const LS = Base.require(JETLS, :JETLSCore)
 const STOPS = ("toplevel/error", "toplevel/missing-concretization", "toplevel/concretization-timeout",
                "toplevel/analysis-stopped")
 
-"Collects error-level log records, which signal analysis problems JETLS does not raise."
+"""
+Collects error-level log records. The analyzer's errors signal analysis problems it does not
+raise. Julia's loader logs, rather than raises, the failure of a package extension.
+"""
 struct ErrorLog{L<:Base.CoreLogging.AbstractLogger} <: Base.CoreLogging.AbstractLogger
     parent::L
-    errors::Vector{String}
+    analyzer::Vector{String}
+    loading::Vector{String}
     lock::ReentrantLock
 end
+ErrorLog(parent) = ErrorLog(parent, String[], String[], ReentrantLock())
 Base.CoreLogging.min_enabled_level(log::ErrorLog) = Base.CoreLogging.min_enabled_level(log.parent)
 Base.CoreLogging.shouldlog(log::ErrorLog, args...) = Base.CoreLogging.shouldlog(log.parent, args...)
 Base.CoreLogging.catch_exceptions(::ErrorLog) = false
-function Base.CoreLogging.handle_message(log::ErrorLog, level, message, args...; kwargs...)
-    level >= Base.CoreLogging.Error && @lock log.lock push!(log.errors, string(message))
-    return Base.CoreLogging.handle_message(log.parent, level, message, args...; kwargs...)
+"The exception a log record carries, which loggers accept bare, with a backtrace or as a stack."
+_exception(e) = e isa Exception ? e : e isa Base.ExceptionStack ? (isempty(e) ? e : _exception(last(e))) :
+    e isa NamedTuple && haskey(e, :exception) ? _exception(e.exception) : e isa Tuple ? _exception(first(e)) : e
+function Base.CoreLogging.handle_message(log::ErrorLog, level, message, _module, args...; kwargs...)
+    if level >= Base.CoreLogging.Error && _module isa Module
+        text = string(message)
+        haskey(kwargs, :exception) && (text *= " " * sprint(showerror, _exception(kwargs[:exception])))
+        origin = nameof(Base.moduleroot(_module))
+        @lock log.lock push!(origin in (:JETLSCore, :JETLS, :JET, :Revise) ? log.analyzer :
+                             origin === :Base ? log.loading : String[], text)
+    end
+    return Base.CoreLogging.handle_message(log.parent, level, message, _module, args...; kwargs...)
 end
 
 canonical(path::AbstractString) = ispath(path) ? realpath(path) : abspath(path)
 
 "Load a package, an extension's parent and triggers, and return the module to analyze."
-function load(request)
+function load(request, log::ErrorLog)
     package = Base.PkgId(Base.UUID(request["uuid"]), request["package"])
     parent = Base.require(package)
     # Revise resolves a file's outer `module` block by name; bind the loaded module so a
@@ -42,8 +56,12 @@ function load(request)
     for (name, uuid) in sort!(collect(request["triggers"]); by=first)
         Base.require(Base.PkgId(Base.UUID(uuid), name))
     end
-    extension = Base.get_extension(parent, Symbol(request["extension"]))
-    extension isa Module || error("extension $(request["extension"]) did not load with its triggers")
+    name = request["extension"]
+    # A failed extension can still be registered, half defined, so check the loader's log.
+    failure = findfirst(text -> occursin("extension $name ", text), log.loading)
+    failure === nothing || error("extension $name failed to load: ", log.loading[failure])
+    extension = Base.get_extension(parent, Symbol(name))
+    extension isa Module || error("extension $name did not load with its triggers")
     canonical(something(pathof(extension), "")) == canonical(request["entry"]) ||
         error("extension $(request["extension"]) loaded from $(pathof(extension)), not $(request["entry"])")
     bind(extension)
@@ -58,15 +76,23 @@ function bind(mod::Module)
     return nothing
 end
 
-"An entry file that brings every binding of `parent` into scope before including `file`."
+"""
+An entry file that recreates the scope of `parent` before including `file`: the modules it
+uses and every binding it defines or imports.
+"""
 function orphan_entry(parent::Module, file::String)
+    usings = [join(fullname(m), '.') for m in ccall(:jl_module_usings, Any, (Any,), parent)
+              if m !== Base && m !== Core && m !== parent && first(fullname(m)) !== :Main]
     bindings = filter(names(parent; all=true, imported=true)) do name
         Base.isidentifier(name) && !startswith(String(name), '#') && !(name in (:eval, :include)) &&
             isdefined(parent, name)
     end
-    return string("const Main = @__MODULE__\nimport ", nameof(parent), "\n",
-                  isempty(bindings) ? "" : "import $(nameof(parent)): " * join(bindings, ", ") * "\n",
-                  "include(", repr(file), ")\n")
+    io = IOBuffer()
+    println(io, "const Main = @__MODULE__\nimport ", nameof(parent))
+    foreach(path -> println(io, "using ", path), usings)
+    isempty(bindings) || println(io, "import ", nameof(parent), ": ", join(bindings, ", "))
+    println(io, "include(", repr(file), ")")
+    return String(take!(io))
 end
 
 "`target` and the modules defined inside it."
@@ -146,7 +172,7 @@ function analyze(request, log::ErrorLog)
     target = nothing
     generated = canonical(request["generated"])
     if kind in ("package", "extension", "orphan")
-        target = load(request)
+        target = load(request, log)
         timings["load"] = time() - started
         kind == "orphan" && (write(generated, orphan_entry(target, request["entry"])); target = nothing)
     end
@@ -207,13 +233,13 @@ end
 
 function main(request_file::String, result_file::String)
     request = TOML.parsefile(request_file)
-    log = ErrorLog(Base.CoreLogging.current_logger(), String[], ReentrantLock())
+    log = ErrorLog(Base.CoreLogging.current_logger())
     result = try
         Base.CoreLogging.with_logger(() -> analyze(request, log), log)
     catch err
         Dict{String,Any}("error" => sprint(showerror, err, catch_backtrace()))
     end
-    result["errors"] = log.errors
+    result["errors"] = log.analyzer
     open(io -> TOML.print(io, result; sorted=true), result_file, "w")
     return 0
 end
