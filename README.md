@@ -43,7 +43,7 @@ jetsweep --exclude vendor --exclude '**/generated/*.jl' DIRECTORY
 | --- | --- |
 | `--jobs N` | Analyses run in parallel. Default: the CPU threads, at most one per 3 GiB of memory. |
 | `--threads N` | Threads for package and extension analyses, whose signature analysis is parallel (default 4). Other analyses run single-threaded. |
-| `--timeout SECONDS` | Time limit per analysis or environment, 0 for none (default 1800). |
+| `--timeout SECONDS` | Time limit per analysis or environment, 0 for none (default 1800). JETLS's own limit on evaluating each top-level statement, which counts compilation and so grows with load, is 300 s instead of its editor default of 10 s, unless `.JETLSConfig.toml` sets `full_analysis.concretization_timeout`. |
 | `--gpus auto\|none\|LIST` | GPUs assigned round-robin through `CUDA_VISIBLE_DEVICES` (default `auto`: the visible devices). |
 | `--output DIRECTORY` | Report directory, new or empty (default `DIRECTORY/.jetsweep/TIMESTAMP`). |
 | `--config FILE` | Configuration file (default `DIRECTORY/.JETSweep.toml`, if present). |
@@ -167,7 +167,8 @@ scripts: use JETSweep only on code you trust.
 `.JETLSConfig.toml` files are respected: each unit uses the nearest one at or above its
 entry, with paths relative to its directory, as in the editor, so severity overrides and
 concretization patterns apply. JETSweep prepares environments itself, so it sets
-`full_analysis.auto_instantiate = "never"`, and it keeps diagnostics enabled for all files.
+`full_analysis.auto_instantiate = "never"`; it keeps diagnostics enabled for all files, and
+defaults `full_analysis.concretization_timeout` as `--timeout` describes.
 
 An optional `.JETSweep.toml` at the root adds exclusions and context for units that need it,
 such as scripts that expect arguments or a different environment. `exclude` patterns follow

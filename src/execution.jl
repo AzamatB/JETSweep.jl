@@ -156,7 +156,7 @@ end
 """
 Write the unit's JETLS configuration and return its directory. The user's configuration
 applies with its paths rebased from its own directory to the sweep root, plus the settings
-a sweep requires.
+a sweep requires, and a batch default for `concretization_timeout`.
 
 Script analysis also evaluates the statements of the files it loads that are free of side
 effects, and those `include` and `eval` calls need (`concretization_patterns`), so that
@@ -175,6 +175,9 @@ function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separ
     end
     full = get!(data, "full_analysis", Dict{String,Any}())
     full["auto_instantiate"] = "never"   # JETSweep prepares every environment itself
+    # JETLS's 10 s per top-level statement suits an editor; it counts compilation, which
+    # parallel analyses slow down, so a sweep's results would depend on its load.
+    get!(full, "concretization_timeout", 300.0)
     diagnostic = get!(data, "diagnostic", Dict{String,Any}())
     diagnostic["enabled"] = true
     diagnostic["all_files"] = true

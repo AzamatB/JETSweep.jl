@@ -446,6 +446,7 @@ const EXECUTION_USER_JETLS = """
     [full_analysis]
     debounce = 2.0
     auto_instantiate = "always"
+    concretization_timeout = 30
 
     [[full_analysis.concretization_patterns]]
     pattern = "const C_ = v_"
@@ -483,6 +484,8 @@ const EXECUTION_USER_JETLS = """
         base, data = execution_jetls(unit, root)
         @test base == root
         @test data["full_analysis"]["auto_instantiate"] == "never"
+        # A batch limit on evaluating each top-level statement, not the editor's 10 s.
+        @test data["full_analysis"]["concretization_timeout"] == 300.0
         @test data["diagnostic"] == Dict("enabled" => true, "all_files" => true)
         @test Set(execution_patterns(data)) == Set(pure)
         @test !haskey(data, "initialization_options")
@@ -501,6 +504,7 @@ const EXECUTION_USER_JETLS = """
         @test read(user, String) == EXECUTION_USER_JETLS
         @test data["full_analysis"]["debounce"] == 2.0
         @test data["full_analysis"]["auto_instantiate"] == "never"
+        @test data["full_analysis"]["concretization_timeout"] == 30
         patterns = execution_patterns(data)
         @test first(patterns) == ("const C_ = v_", "")
         @test Set(patterns[2:end]) == Set(pure)
@@ -532,6 +536,7 @@ const EXECUTION_USER_JETLS = """
         base, data = execution_jetls(execution_unit(script; kind=:script, setup=[setup]), root)
         @test base == root
         @test data["full_analysis"]["debounce"] == 9.0
+        @test data["full_analysis"]["concretization_timeout"] == 300.0
         @test Set(execution_patterns(data)) ==
               Set([("const N = 2 + 3", "scripts/deep/run.jl"), ("const MODE = \"fast\"", "scripts/setup.jl")])
 
