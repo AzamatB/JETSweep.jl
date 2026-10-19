@@ -246,8 +246,8 @@ function analyze(request, log::ErrorLog)
         uris = LS.collect_workspace_uris(server)
         diagnostics = LS.get_full_diagnostics(server)
         if target !== nothing
-            LS.toplevel_warning_reports_to_diagnostics!(diagnostics, abstract_fields(target, files), server,
-                                                        LS.JET.PostProcessor())
+            reports = Base.invokelatest(abstract_fields, target, files)
+            LS.toplevel_warning_reports_to_diagnostics!(diagnostics, reports, server, LS.JET.PostProcessor())
         end
         progress = LS.ProgressContext(LS.PROGRESS_NONE, stderr)
         LS.run_per_file_diagnostics!(diagnostics, uris, server, request["root"], progress; skip_analysis=false)

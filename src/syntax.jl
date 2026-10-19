@@ -585,6 +585,30 @@ function _signature_types!(names::Set{Symbol}, ex)
     return names
 end
 
+"""
+Symbols code that `eval` runs at top level reads: those outside method and closure bodies,
+argument names and quoted symbols, and those interpolated anywhere, which are read when the
+code is built.
+"""
+function _code_reads!(names::Set{Symbol}, ex)
+    if ex isa Symbol
+        push!(names, ex)
+    elseif ex isa Expr && ex.head === :$
+        _symbols!(names, ex)
+    elseif ex isa Expr && !(ex.head === :inert)
+        if ex.head === :-> || _method(ex) || ex.head === :struct
+            _interpolated!(names, ex)
+            ex.head === :-> || (_method(ex) ? _signature_types!(names, first(ex.args)) : _type_symbols!(names, ex))
+        else
+            foreach(arg -> _code_reads!(names, arg), ex.args)
+        end
+    end
+    return names
+end
+
+_interpolated!(names::Set{Symbol}, ex) =
+    ex isa Expr ? (ex.head === :$ ? _symbols!(names, ex) : foreach(arg -> _interpolated!(names, arg), ex.args); names) : names
+
 "Symbols a type definition evaluates: its header, field types and constructor signatures."
 function _type_symbols!(names::Set{Symbol}, ex::Expr)
     ex.head === :struct || return _symbols!(names, ex)
@@ -617,19 +641,17 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
         elseif head === :macrocall
             name = _macro_name(ex)
             name in _TEST_MACROS && return     # JETLS outlines their closures into thunks
-            if name == "@eval"
-                # `@eval [module] code` evaluates the module, and of the code what it interpolates.
-                arguments = filter(arg -> !(arg isa LineNumberNode), ex.args[2:end])
-                isempty(arguments) && return
-                needs!(arguments[1:end-1], controls)
-                return _evaluated_symbols!(direct, last(arguments), true)
-            end
+            # `@eval [module] code` evaluates its module, and the code at top level.
+            name == "@eval" && return (foreach(arg -> _code_reads!(direct, arg), ex.args[2:end]); needs!(Any[], controls))
             # `@static` evaluates its condition when it expands.
             !forced && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
                 needs!(Any[first(last(ex.args).args)], controls)
             foreach(arg -> visit(arg, controls, branches), ex.args[2:end])
-        elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "eval")
+        elseif _is_include(ex)
             needs!(ex.args[2:end], controls)
+        elseif head === :call && _name(first(ex.args)) == "eval"
+            foreach(arg -> _code_reads!(direct, arg), ex.args[2:end])
+            needs!(Any[], controls)
         elseif _method(ex)
             forced || (_closure(ex) ? needs!(branches, Any[]) :
                        (_signature_types!(direct, first(ex.args)); needs!(Any[], controls)))
@@ -700,10 +722,16 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int})
             union!(scope.known, known)
             setdiff!(variable, binds)
         else
-            # JETLS evaluates part of a statement anyway when it defines a closure in a
-            # branch, and then not the closure in the other branch: evaluating it whole is better.
+            # JETLS evaluates the conditions of a statement anyway when it defines closures in
+            # its branches, and then not the closures of branches not taken: evaluating it whole
+            # is better, unless what it evaluates besides the conditions depends on the run.
             evaluated = _reads!(Set{Symbol}(), ex)
-            isempty(evaluated) ? (deferred[i] = (reads, true)) : (push!(selected, i); need!(reads, i, false))
+            if !isempty(evaluated) && isdisjoint(setdiff(reads, evaluated), variable)
+                push!(selected, i)
+                need!(reads, i, false)
+            else
+                deferred[i] = (reads, true)
+            end
             need!(evaluated, i, false)
             union!(scope.known, known)
             union!(variable, binds)
@@ -721,6 +749,8 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int})
         k = findlast(<(i), positions)
         k === nothing && continue
         k = positions[k]
+        # A conditional or block may leave the name as an earlier statement bound it.
+        _assignment(expressions[k]) === nothing && push!(needs, (name, k, forced))
         haskey(deferred, k) && !(k in selected) || continue
         reads, pure = deferred[k]
         pure || forced || continue

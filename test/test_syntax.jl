@@ -737,6 +737,8 @@ end
         # does not define those in the branch not taken, unless the whole statement is evaluated.
         const RUN = isempty(ASKED) ? FILES : filter(f -> f in ASKED, FILES)
         const PICKED = isempty(ASKED) ? ["a"] : filter(f -> f in ASKED, ["a"])
+        # Unless what it evaluates besides the conditions depends on the run.
+        const LABELS = isempty(ASKED) ? sort([f for f in readdir("fields")]) : ASKED
         const SKIP = get(ENV, "SKIP", "")
         skipped() = SKIP
         # JETLS evaluates the condition that chooses what to import.
@@ -757,6 +759,19 @@ end
     @test syntax_patterns("outdir = ARGS[1]\nwrite_to(x; dir=outdir) = x\n") == String[]
     @test syntax_patterns("const NAME = ARGS[1]\n@eval named() = NAME\n") == String[]
     @test syntax_patterns("const LEVEL = length(ARGS)\n@eval level() = \$LEVEL\n") == ["const LEVEL = length(ARGS)"]
+    # Code `eval` runs at top level reads what it reads, not what its methods do.
+    @test syntax_patterns("const X = length(ARGS)\n@eval const Y = X + 1\n") == ["const X = length(ARGS)"]
+    @test syntax_patterns("out = open(\"run.log\", \"w\")\n@eval log(out, msg) = println(out, msg)\n") == String[]
+    # An earlier binding counts where a conditional may leave the name as it was.
+    code = """
+        file = isempty(ARGS) ? "default.jl" : ARGS[1]
+        if Sys.iswindows()
+            file = "windows.jl"
+        end
+        include(file)
+        """
+    @test syntax_patterns(code) == ["file = isempty(ARGS) ? \"default.jl\" : ARGS[1]",
+                                    "if Sys.iswindows()\n    file = \"windows.jl\"\nend"]
     # The binding that reaches the need is evaluated, not an earlier one.
     code = """
         file = ARGS[1]
