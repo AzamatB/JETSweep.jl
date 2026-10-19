@@ -118,7 +118,11 @@ extension triggers, `[sources]`, workspaces, compat bounds and effective prefere
 the analyzer resolved alongside, so that packages both use, such as Revise, have one version.
 Existing manifests seed the resolution, keeping locked versions where they are consistent;
 when they are not, the environment is re-resolved and the units' notes say what changed.
-With `--offline`, resolution considers installed versions only. Each environment is then
+Scripts and tests that import packages their projects do not declare, because they run
+with another project active or rely on their workspace, get those packages added: packages
+of the workspace from their directories, others from the registry. The units' notes name
+them, and if they cannot be added, the environment is prepared without them. With
+`--offline`, resolution considers installed versions only. Each environment is then
 precompiled once for all its units; packages that fail to precompile, or that a timeout
 leaves without package images, load from source. Original projects, manifests, preferences
 and sources are never written, and package build scripts never run.

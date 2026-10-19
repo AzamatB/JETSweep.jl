@@ -557,3 +557,27 @@ end
         @test unit.overrides.env == Dict("A" => "1", "B" => "2")
     end
 end
+
+@testset "scripts and tests get the packages they import without declaring them" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        sibling = planning_package(root, "Sibling", "Sibling")
+        planning_file(sibling, "src/Sibling.jl", "module Sibling\nend\n")
+        host = planning_package(root, "Host", "Host"; deps=Dict("Dates" => PLANNING_DATES, "Declared" => PLANNING_OTHER),
+                                extras=Dict("Test" => PLANNING_TEST), targets=Dict("test" => ["Test"]))
+        planning_file(host, "src/Host.jl", "module Host\nusing Dates\nend\n")
+        test = planning_file(host, "test/runtests.jl", "using Test, Host, Declared\nusing Sibling\n")
+        tool = planning_file(host, "scripts/tool.jl", "using Host, LinearAlgebra\nimport JSON\ninclude(\"helper.jl\")\n")
+        planning_file(host, "scripts/helper.jl", "using Unknown.Inner: f\n")
+        loose = planning_file(root, "loose.jl", "using Sibling\n")
+        inventory, units = planning_plan(root)
+        # Tests and the package's scripts share the test context, which gets the union.
+        imports = Dict("Sibling" => sibling, "JSON" => "", "Unknown" => "")
+        @test planning_unit(units, test).context.imports == imports
+        @test planning_unit(units, tool).context == planning_unit(units, test).context
+        @test planning_unit(units, loose).context.imports == Dict("Sibling" => sibling)
+        # Package code that imports undeclared packages fails to load, as it would anyway.
+        @test isempty(planning_unit(units, joinpath(host, "src", "Host.jl")).context.imports)
+        @test isempty(planning_unit(units, joinpath(sibling, "src", "Sibling.jl")).context.imports)
+    end
+end

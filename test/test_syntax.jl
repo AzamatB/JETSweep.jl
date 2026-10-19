@@ -911,3 +911,18 @@ end
     # Includes inside functions run only when called, so nothing selects them statically.
     @test syntax_patterns("const FILES = list_tests()\nrun(f) = include(f)\nforeach(run, FILES)\n") == String[]
 end
+
+@testset "parse_source records the packages imports load" begin
+    parsed = syntax_parse("""
+        using A, B.C
+        import D as E
+        import F: g, h as k
+        using .Local, ..Parent
+        quoted() = :(using Q)
+        @eval using Generated
+        if flag
+            using Conditional
+        end
+        """)
+    @test parsed.syntax.imports == ["A", "B", "D", "F", "Generated", "Conditional"]
+end

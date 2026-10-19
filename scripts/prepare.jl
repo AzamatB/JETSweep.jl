@@ -8,7 +8,7 @@ using JETSweep, TOML
 
 request = TOML.parsefile(ARGS[1])
 context = JETSweep.Context(request["project"], request["owner"], request["test"],
-                           Dict{String,String}(request["triggers"]))
+                           Dict{String,String}(request["triggers"]), Dict{String,String}(request["imports"]))
 environment = JETSweep.prepare(context, request["directory"]; instantiate=request["instantiate"])
 outcome(message) = JETSweep._write_toml(ARGS[2], Dict("status" => String(environment.status),
                                                        "dir" => environment.dir, "message" => message))

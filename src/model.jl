@@ -34,20 +34,24 @@ end
 
 """
 The dependency context a unit is loaded in: the selected project, the package that owns
-the unit, whether the package's test dependencies apply, and extension triggers. Units
-with equal contexts share one prepared environment.
+the unit, whether the package's test dependencies apply, extension triggers, and packages
+its code imports without its projects declaring them. Units with equal contexts share one
+prepared environment.
 """
 struct Context
     project::String
     owner::String
     test::Bool
     triggers::Dict{String,String}
+    "Undeclared imports: the directory of each package in the workspace, `\"\"` for registered ones."
+    imports::Dict{String,String}
 end
+Context(project, owner, test, triggers) = Context(project, owner, test, triggers, Dict{String,String}())
 
-Base.:(==)(a::Context, b::Context) =
-    a.project == b.project && a.owner == b.owner && a.test == b.test && a.triggers == b.triggers
+Base.:(==)(a::Context, b::Context) = a.project == b.project && a.owner == b.owner && a.test == b.test &&
+    a.triggers == b.triggers && a.imports == b.imports
 Base.hash(context::Context, h::UInt) =
-    hash((context.project, context.owner, context.test, context.triggers), h)
+    hash((context.project, context.owner, context.test, context.triggers, context.imports), h)
 
 "Configured additions to a unit's runtime context, from `.JETSweep.toml`."
 Base.@kwdef struct Overrides

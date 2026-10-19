@@ -171,7 +171,41 @@ function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String
         end
     end
     sort!(units; by=unit -> (unit.entry, unit.extension))
-    return _configure(units, config, root)
+    return _imports!(_configure(units, config, root), syntax, inventory)
+end
+
+"""
+Give the contexts of scripts and tests the packages their files import without their
+projects declaring them, as code does that runs with another project active or relies on
+its workspace: packages of the workspace from their directories, others from the registry.
+"""
+function _imports!(units::Vector{Unit}, syntax::Dict{String,Syntax}, inventory::Inventory)
+    names = [project.name for project in inventory.projects if ispackage(project)]
+    workspace = Dict(project.name => project.dir for project in inventory.projects
+                     if ispackage(project) && count(==(project.name), names) == 1)
+    available = union(Set(readdir(Sys.STDLIB)), ("Base", "Core", "Main"))
+    imported = Dict{Context,Set{String}}()
+    for unit in units
+        unit.kind in (:script, :test) || continue
+        files = union((_reach(file, syntax; followed_only=true) for file in [unit.entry; unit.overrides.setup])...)
+        union!(get!(imported, unit.context, Set{String}()),
+               (name for file in files if haskey(syntax, file) for name in syntax[file].imports))
+    end
+    extended = Dict{Context,Context}()
+    for (context, names) in imported
+        loadable = try
+            _loadable(context)
+        catch
+            continue   # preparing the environment reports what is wrong with its projects
+        end
+        undeclared = setdiff(names, loadable, available)
+        isempty(undeclared) && continue
+        extended[context] = Context(context.project, context.owner, context.test, context.triggers,
+                                    Dict(name => get(workspace, name, "") for name in undeclared))
+    end
+    return [haskey(extended, unit.context) && unit.kind in (:script, :test) ?
+            Unit(unit.id, unit.kind, unit.entry, extended[unit.context], unit.expected, unit.driver, unit.extension,
+                 unit.overrides, unit.notes) : unit for unit in units]
 end
 
 "Directories of packages a source can name in `pkgdir(Name)`: its owner, statically."

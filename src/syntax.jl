@@ -18,7 +18,10 @@ struct Syntax
     includes::Vector{Include}
     "Parse failures and includes that cannot be resolved statically."
     notes::Vector{String}
+    "The packages that `using` and `import` statements load, by name."
+    imports::Vector{String}
 end
+Syntax(includes::Vector{Include}, notes::Vector{String}) = Syntax(includes, notes, String[])
 
 _name(ex::Symbol) = String(ex)
 _name(ex::GlobalRef) = String(ex.name)
@@ -109,7 +112,7 @@ Find the `include` calls of `file`. `packages` maps package names to their direc
 which resolves `pkgdir(Name)` paths.
 """
 function parse_source(file::String, packages::Dict{String,String}=Dict{String,String}())
-    includes, notes = Include[], String[]
+    includes, notes, imports = Include[], String[], String[]
     tree = try
         Meta.parseall(read(file, String); filename=file)
     catch err
@@ -124,6 +127,13 @@ function parse_source(file::String, packages::Dict{String,String}=Dict{String,St
             push!(notes, "$file:$line: cannot be parsed")
             return
         elseif head === :quote
+            return
+        elseif head in (:using, :import)
+            for path in ex.args
+                path isa Expr && path.head in (:(:), :as) && (path = first(path.args))
+                path isa Expr && path.head === :. && !isempty(path.args) && first(path.args) isa Symbol &&
+                    first(path.args) !== :. && push!(imports, String(first(path.args)))
+            end
             return
         elseif _is_include(ex)
             target = _path(last(ex.args), file, bindings, packages)
@@ -158,7 +168,7 @@ function parse_source(file::String, packages::Dict{String,String}=Dict{String,St
         return
     end
     visit(tree, Dict{Symbol,String}(), true)
-    return Syntax(unique!(includes), unique!(notes))
+    return Syntax(unique!(includes), unique!(notes), unique!(imports))
 end
 
 # Top-level statements

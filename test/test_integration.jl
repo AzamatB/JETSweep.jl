@@ -99,6 +99,12 @@ end
             const RUN = isempty(ASKED) ? ["a"] : filter(name -> name in ASKED, ["a"])
             selected() = RUN
             """)
+        # A script loads a package of its workspace that no project of it declares.
+        mkpath(joinpath(root, "Sibling", "src"))
+        write(joinpath(root, "Sibling", "Project.toml"),
+              "name = \"Sibling\"\nuuid = \"6f4d0fd2-62a3-4c43-9d6e-0c3fdd2a6f3b\"\nversion = \"0.1.0\"\n")
+        write(joinpath(root, "Sibling", "src", "Sibling.jl"), "module Sibling\nsibling_value() = 1\nend\n")
+        write(joinpath(root, "uses_sibling.jl"), "using Sibling\nuse() = Sibling.sibling_value() + \"one\"\n")
         # A generator in a branch of a `@test` expression does not make JETLS run the test.
         write(joinpath(root, "outlined.jl"), """
             using Test
@@ -127,6 +133,9 @@ end
         @test status("arguments.jl") in (:clean, :findings)
         @test status("selection.jl") === :clean
         @test status("outlined.jl") === :clean && !isfile(joinpath(root, "ran.marker"))
+        @test status("uses_sibling.jl") === :findings
+        sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
+        @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)
         @test result.exit_code == 2
         @test !isempty(TOML.parsefile(joinpath(output, "report.toml"))["unanalyzed"])
         # The terminal summary groups incomplete analyses by cause, with paths relative to the root.

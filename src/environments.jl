@@ -28,7 +28,28 @@ function _project_file(path::String)
 end
 
 "The projects whose dependencies a context combines, the owning package first."
-function _context_envs(context::Context)
+_context_envs(context::Context) = [Pkg.Types.EnvCache(file) for file in _context_files(context)]
+
+"Names code can load in a context's environment: its projects, their dependencies and triggers."
+function _loadable(context::Context)
+    names = Set{String}(keys(context.triggers))
+    for file in _context_files(context)
+        raw = TOML.parsefile(file)
+        haskey(raw, "name") && push!(names, raw["name"])
+        union!(names, keys(get(raw, "deps", Dict())))
+        context.test && union!(names, get(get(raw, "targets", Dict()), "test", String[]))
+    end
+    return names
+end
+
+"The UUID of the package a registry names `name`, if exactly one."
+function _registered(name::String)
+    uuids = unique!([uuid for registry in Pkg.Registry.reachable_registries()
+                     for uuid in Pkg.Registry.uuids_from_name(registry, name)])
+    return length(uuids) == 1 ? only(uuids) : nothing
+end
+
+function _context_files(context::Context)
     files = String[]
     owner = _project_file(context.owner)
     owner === nothing || push!(files, owner)
@@ -39,7 +60,7 @@ function _context_envs(context::Context)
         tests = _project_file(joinpath(dirname(owner), "test"))
         tests === nothing || push!(files, tests)
     end
-    return [Pkg.Types.EnvCache(file) for file in unique!(files)]
+    return unique!(files)
 end
 
 function _merge_dep!(deps::Dict{String,String}, name::String, uuid)
@@ -123,6 +144,16 @@ function _scratch_project(context::Context, envs)
         union!(workspace, dirname.(keys(env.workspace)))
     end
     foreach(((name, uuid),) -> _merge_dep!(deps, name, uuid), context.triggers)
+    for (name, directory) in context.imports
+        haskey(deps, name) && continue
+        if isempty(directory)
+            uuid = _registered(name)
+            uuid === nothing || _merge_dep!(deps, name, uuid)
+        else
+            _merge_dep!(deps, name, _identity(Pkg.Types.EnvCache(_project_file(directory)).pkg, "package at $directory").uuid)
+            sources[name] = Dict("path" => directory)
+        end
+    end
     filter!(((name, _),) -> haskey(deps, name), sources)
     filter!(((name, _),) -> name == "julia" || haskey(deps, name), compat)
     # Preferences may name packages through [extras]/[weakdeps]; keep those bindings
@@ -359,6 +390,22 @@ with the analyzer, resolved from their existing manifests where possible. With
 versions only. Dependency build scripts never run; see also `precompile_environment`.
 """
 function prepare(context::Context, directory::String; instantiate::Bool=true)
+    environment = _prepared(context, directory, instantiate)
+    isempty(context.imports) && return environment
+    if ready(environment)
+        added = sort!(collect(intersect(keys(context.imports), keys(TOML.parsefile(joinpath(directory, "Project.toml"))["deps"]))))
+        isempty(added) && return environment
+        return Environment(:ready, environment.dir,
+            strip("It adds packages imported without being declared: $(join(added, ", ")). " * environment.message))
+    end
+    # Without them, what is declared can still be analyzed.
+    rm(directory; recursive=true, force=true)
+    declared = _prepared(Context(context.project, context.owner, context.test, context.triggers), directory, instantiate)
+    return Environment(declared.status, declared.dir,
+        strip("Packages imported without being declared could not be added ($(environment.message)). " * declared.message))
+end
+
+function _prepared(context::Context, directory::String, instantiate::Bool)
     directory = abspath(directory)
     try
         isdir(directory) && !isempty(readdir(directory)) && error("preparation directory is not empty: $directory")

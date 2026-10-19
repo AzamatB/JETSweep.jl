@@ -65,12 +65,13 @@ end
 # ============
 
 _context_key(context::Context) = bytes2hex(sha256(string(context.project, '\0', context.owner, '\0', context.test,
-    '\0', join(sort!(["$k=$v" for (k, v) in context.triggers]), '\0'))))[1:12]
+    '\0', join(sort!(["$k=$v" for (k, v) in context.triggers]), '\0'),
+    '\0', join(sort!(["$k=$v" for (k, v) in context.imports]), '\0'))))[1:12]
 
 function _prepare(context::Context, directory::String, options::SweepOptions)
     request = _write_toml(joinpath(directory, "request.toml"), Dict(
         "project" => context.project, "owner" => context.owner, "test" => context.test,
-        "triggers" => context.triggers, "directory" => joinpath(directory, "env"),
+        "triggers" => context.triggers, "imports" => context.imports, "directory" => joinpath(directory, "env"),
         "instantiate" => options.instantiate))
     result = joinpath(directory, "result.toml")
     log = joinpath(directory, "log.txt")

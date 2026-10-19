@@ -647,3 +647,25 @@ end
         end
     end
 end
+
+@testset "undeclared imports are added, or left out when they cannot be" begin
+    _environments_sandbox() do root, envs
+        sibling, sibling_uuid = _environments_package(root, "Sibling"; body="value() = 7")
+        scripts = joinpath(root, "scripts")
+        _environments_write(joinpath(scripts, "Project.toml"), Dict("deps" => Dict()))
+        context(imports) = JETSweep.Context(scripts, "", false, Dict{String,String}(), imports)
+        added = _environments_prepare(context(Dict("Sibling" => sibling, "NotRegisteredAnywhere" => "")),
+                                      joinpath(envs, "added"))
+        @test added.status === :ready
+        @test added.message == "It adds packages imported without being declared: Sibling."
+        @test _environments_project(added)["deps"]["Sibling"] == sibling_uuid
+        @test _environments_run(added, "using Sibling; print(Sibling.value())") == "7"
+
+        # A package that cannot be resolved leaves the declared environment.
+        broken, _ = _environments_package(root, "Broken"; deps=Dict("Ghost" => string(uuid4())))
+        fallback = _environments_prepare(context(Dict("Broken" => broken)), joinpath(envs, "fallback"))
+        @test fallback.status === :ready
+        @test startswith(fallback.message, "Packages imported without being declared could not be added (")
+        @test !haskey(_environments_project(fallback)["deps"], "Broken")
+    end
+end

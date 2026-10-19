@@ -14,7 +14,8 @@ function _unit_dict(unit::Unit)
     return Dict("id" => unit.id, "kind" => String(unit.kind), "entry" => unit.entry,
         "expected" => unit.expected, "driver" => unit.driver, "extension" => unit.extension,
         "context" => Dict("project" => unit.context.project, "owner" => unit.context.owner,
-                          "test" => unit.context.test, "triggers" => unit.context.triggers),
+                          "test" => unit.context.test, "triggers" => unit.context.triggers,
+                          "imports" => unit.context.imports),
         "setup" => unit.overrides.setup, "args" => unit.overrides.args, "env" => unit.overrides.env,
         "jetls_config" => unit.overrides.jetls_config, "notes" => unit.notes)
 end
