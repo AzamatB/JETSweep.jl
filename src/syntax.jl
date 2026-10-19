@@ -1024,7 +1024,8 @@ Collect the statements of `file` that set up what it includes as `next`: those b
 include of `next`, or before its first run-time include, also from the files it includes
 statically before then. Returns whether that include was reached.
 """
-function _driver_statements!(statements::Vector{_DriverStatement}, file::String, next::String, seen::Set{String})
+function _driver_statements!(statements::Vector{_DriverStatement}, file::String, next::String, seen::Set{String},
+                             packages::Dict{String,Project})
     file in seen && return false
     push!(seen, file)
     text, nodes = _statements(file)
@@ -1034,18 +1035,18 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
         # wherever the call is, but other includes are test files, except nested drivers
         # included inside a `@testset`, say.
         for include in _nested_includes!(Expr[], ex)
-            path = _path(last(include.args), file, bindings, Dict{String,Project}())
+            path = _path(last(include.args), file, bindings, packages)
             path === nothing && return true
             path = normpath(dirname(file), path)
             path == next && return true
             (_is_include(ex) || basename(path) == "runtests.jl") && isfile(path) &&
-                _driver_statements!(statements, path, next, seen) && return true
+                _driver_statements!(statements, path, next, seen, packages) && return true
         end
         _is_include(ex) && continue
         assignment = _assignment(ex)
         if assignment !== nothing
             names, value = assignment
-            known = length(names) == 1 ? _path(value, file, bindings, Dict{String,Project}()) : nothing
+            known = length(names) == 1 ? _path(value, file, bindings, packages) : nothing
             known === nothing ? foreach(name -> delete!(bindings, name), names) : (bindings[only(names)] = known)
         end
         conditional = _conditional_definitions(ex)
@@ -1069,29 +1070,30 @@ function _relative_modules(ex)
                      path.args[2] isa Symbol]
 end
 
-function _drivers_statements(drivers::Vector{String}, target::String)
+function _drivers_statements(drivers::Vector{String}, target::String, packages::Dict{String,Project})
     statements = _DriverStatement[]
     seen = Set{String}()
     for (i, driver) in pairs(drivers)
-        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen)
+        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen, packages)
     end
     return statements
 end
 
 "The modules the prelude of `drivers` for `target` imports, which `target` can read."
-prelude_modules(drivers::Vector{String}, target::String) =
-    union(Set{Symbol}(), (_modules(statement.ex) for statement in _drivers_statements(drivers, target))...)
+prelude_modules(drivers::Vector{String}, target::String; packages::Dict{String,Project}=Dict{String,Project}()) =
+    union(Set{Symbol}(), (_modules(statement.ex) for statement in _drivers_statements(drivers, target, packages))...)
 
 """
-    prelude(drivers, target) -> String
+    prelude(drivers, target; packages) -> String
 
 Source text recreating the context that `drivers`, outermost first, establish for `target`,
 which the last of them includes at run time: imports, definitions and the global
 assignments, modules and conditional definitions `target` transitively refers to, also from
-files the drivers include statically.
+files the drivers include statically. `packages` are those whose `pkgdir` and `pathof` the
+files may name in include paths, by name.
 """
-function prelude(drivers::Vector{String}, target::String)
-    statements = _drivers_statements(drivers, target)
+function prelude(drivers::Vector{String}, target::String; packages::Dict{String,Project}=Dict{String,Project}())
+    statements = _drivers_statements(drivers, target, packages)
     needed = Set{Symbol}()
     pending, visited = [target], Set{String}()
     while !isempty(pending)
@@ -1099,7 +1101,7 @@ function prelude(drivers::Vector{String}, target::String)
         (file in visited || !isfile(file)) && continue
         push!(visited, file)
         _symbols!(needed, Meta.parseall(read(file, String); filename=file))
-        append!(pending, (i.target for i in parse_source(file).includes if !isempty(i.target)))
+        append!(pending, (i.target for i in parse_source(file, packages).includes if !isempty(i.target)))
     end
     # A relative import of a module the prelude does not define would fail.
     defined = Set{Symbol}(name for statement in statements if statement.ex.head === :module for name in statement.names)

@@ -129,6 +129,28 @@ end
     @test defined.syntax.notes == [syntax_dynamic(defined.file, 2)]
 end
 
+@testset "prelude follows includes through pkgdir and pathof of the unit's package" begin
+    mktempdir() do directory
+        dir = realpath(directory)
+        driver = syntax_write(dir, "test/runtests.jl", """
+            include(joinpath(pkgdir(Dep), "test", "helpers.jl"))
+            include(joinpath(dirname(pathof(Dep)), "..", "test", "more.jl"))
+            for file in ARGS
+                include(file)
+            end
+            """)
+        syntax_write(dir, "test/helpers.jl", "helper() = 1\n")
+        syntax_write(dir, "test/more.jl", "more() = 2\n")
+        target = syntax_write(dir, "test/target.jl", "helper() + more()\n")
+        dep = JETSweep.Project(dir, joinpath(dir, "Project.toml"), "Dep", "", joinpath(dir, "src", "Dep.jl"),
+                               Dict{String,Dict{String,String}}())
+        # Without the package, the first include ends what the prelude can know.
+        @test !occursin("helper() = 1", JETSweep.prelude([driver], target))
+        text = JETSweep.prelude([driver], target; packages=Dict("Dep" => dep))
+        @test occursin("helper() = 1", text) && occursin("more() = 2", text)
+    end
+end
+
 @testset "parse_source resolves pkgdir and pathof through the packages map" begin
     root = "/depot/packages/Dep"
     code = """

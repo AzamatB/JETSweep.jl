@@ -116,8 +116,8 @@ end
 function _summarize(io::IO, result::SweepResult, findings, statuses, severities, codes, unanalyzed, byid; detailed::Bool)
     root = result.root
     println(io)
-    println(io, "JETSweep analyzed $(length(result.units)) units in $(round(result.seconds; digits=1)) s: ",
-            join(("$n $status" for (status, n) in sort!(collect(statuses))), ", "))
+    println(io, "JETSweep analyzed $(length(result.units)) units in $(round(result.seconds; digits=1)) s",
+            isempty(statuses) ? "" : ": " * join(("$n $status" for (status, n) in sort!(collect(statuses))), ", "))
     println(io, length(findings), " unique diagnostics",
             isempty(findings) ? "" : ": " * join(("$n $(_severity(level))" for (level, n) in pairs(severities) if n > 0), ", "))
     for (code, n) in first(sort!(collect(codes); by=last, rev=true), 10)
