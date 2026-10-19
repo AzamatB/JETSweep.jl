@@ -196,6 +196,8 @@ timing, and the deduplicated diagnostics), `summary.txt` (the diagnostics as
 `file:line:column` with messages, every incomplete unit with its reasons and log, and the
 files no complete analysis covered), the inventory and plan, and each unit's and
 environment's request, result and log. The terminal summary groups incomplete units by cause.
+Messages name what scripts, tests and orphan sources define as JETLS names what `Main`
+defines, without the module JETSweep analyzes them in.
 
 | Exit | Meaning |
 | --- | --- |

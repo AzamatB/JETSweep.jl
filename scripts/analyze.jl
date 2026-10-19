@@ -180,6 +180,24 @@ Core.eval(LS.JET, quote
     end
 end)
 
+"""
+The module analyses run in, empty to keep worker globals out of reach of analyzed code. JET
+finds it by its path from `Main`.
+"""
+const CONTEXT = Core.eval(Main, :(module JETSweepAnalysis end))
+
+# JETLS names what it analyzes in JET's virtual module of `Main` as if `Main` defined it,
+# leaving `Main.` out. Name what is analyzed in the worker's context so too, leaving out only
+# the virtual module: JET leaves out every `Main.`, that of `MyMain.x` too.
+Core.eval(LS.JET, quote
+    function (postprocessor::PostProcessor)(s::AbstractString)
+        isdefined(postprocessor, :actual2virtual) || return s
+        actual, virtual = postprocessor.actual2virtual
+        actual == $(string(CONTEXT)) || return replace(s, virtual => actual)
+        return replace(s, virtual * "." => "", virtual => "Main")
+    end
+end)
+
 # JETLS dispatches in the world it was loaded in, to stay clear of analyzed code.
 LS.advance_server_world!()
 
@@ -359,9 +377,7 @@ function analyze(request, log::ErrorLog)
     # A script runs as the program, so `abspath(PROGRAM_FILE) == @__FILE__` holds as it would.
     kind in ("test", "script", "orphan") && (Base.PROGRAM_FILE = request["entry"])
     merge!(ENV, request["env"])
-    # An empty module keeps worker globals out of reach of analyzed code. JET finds the
-    # context by its path from `Main`.
-    LS.FULL_ANALYSIS_CONTEXT[] = Core.eval(Main, :(module JETSweepAnalysis end))
+    LS.FULL_ANALYSIS_CONTEXT[] = CONTEXT
     target = nothing
     if kind in ("package", "extension", "orphan")
         target = load(request, log)

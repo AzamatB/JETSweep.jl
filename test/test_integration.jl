@@ -29,20 +29,34 @@ integration_status(result, entry) = only(r.status for (u, r) in zip(result.units
         @test all(r -> r.status in (:clean, :findings), result.results)
         @test integration_status(result, file("Witness/test/runtests.jl")) === :clean
         @test integration_status(result, file("scripts/clean.jl")) === :clean
-        found = Set((relpath(f.file, root), f.line, f.code) for f in JETSweep.unique_findings(result.results))
+        messages = Dict((relpath(f.file, root), f.line, f.code) => f.message for f in JETSweep.unique_findings(result.results))
+        found = Set(keys(messages))
         @test found == Set([
             ("Witness/src/Witness.jl", 6, "inference/method-error"),
             ("Witness/src/nested.jl", 1, "inference/method-error"),
             ("Witness/src/nested.jl", 4, "toplevel/abstract-field"),
             ("Witness/src/inactive.jl", 1, "inference/method-error"),
             ("Witness/src/disconnected.jl", 1, "inference/method-error"),
+            ("Witness/src/disconnected.jl", 2, "inference/undef-global-var"),
+            ("Witness/src/disconnected.jl", 2, "lowering/undef-global-var"),
             ("Witness/ext/WitnessTestExt.jl", 6, "inference/method-error"),
             ("Witness/ext/helper.jl", 1, "inference/method-error"),
             # Analyzed in the extension's module, where `extension_failure` is defined.
             ("Witness/ext/dormant.jl", 1, "inference/method-error"),
             ("Witness/test/test_dynamic.jl", 1, "inference/method-error"),
             ("scripts/main.jl", 3, "inference/method-error"),
+            ("scripts/main.jl", 9, "inference/field-error"),
+            ("scripts/main.jl", 11, "inference/undef-global-var"),
+            ("scripts/main.jl", 11, "lowering/undef-global-var"),
             ("tools/report.jl", 3, "inference/method-error")])
+        # Messages name what scripts and orphans define as JETLS names what `Main` defines,
+        # without the module they are analyzed in, and without mangling `MyMain`.
+        @test messages["scripts/main.jl", 9, "inference/field-error"] ==
+              "FieldError: type `Point` has no field `y`, available fields: `x`"
+        @test messages["scripts/main.jl", 11, "inference/undef-global-var"] ==
+              messages["scripts/main.jl", 11, "lowering/undef-global-var"] == "`MyMain.not_defined_in_mymain` is not defined"
+        @test messages["Witness/src/disconnected.jl", 2, "inference/undef-global-var"] ==
+              "`not_defined_anywhere` is not defined"
         package = only(r for (u, r) in zip(result.units, result.results) if u.kind === :package)
         @test any(note -> occursin("inactive.jl", note), package.notes)
         @test result.exit_code == 1
