@@ -103,8 +103,11 @@ working directory, files read) are evaluated only where JETLS needs them, with `
 the analyzed file: in the arguments of `include` and `eval` calls, in
 definition signatures, and in conditions that define closures or choose imports. And since
 JETLS always evaluates `include` and `eval` calls, and under JETSweep `include_string` calls
-too, whatever their arguments need is evaluated,
-side effects or not, as a test driver's selection of its files is. A value that code left
+too, whatever their arguments need is evaluated, side effects or not, as a test driver's
+selection of its files is, and so is what decides whether they run: the conditions around
+them, and those of a `continue`, `break` or `return` that may skip them, as of
+`file in SKIPPED && continue` before `include(file)`, or of a `break` after it, which decides
+whether later iterations run. A value that code left
 unevaluated may change, as `push!` or an indexed assignment does, is not evaluated from there
 on, and neither is a name the file rebinds, even one Base defines. JETLS matches these
 statements as patterns, in which names such as `x_` and `@__DIR__` are wildcards, so a

@@ -319,7 +319,9 @@ end
 # only where analysis needs them: in `include` and `eval` arguments, definition signatures,
 # and the conditions JETLS evaluates to define the closures in their branches or to import.
 # Since JETLS always evaluates `include` and `eval` calls, whatever their arguments need is
-# evaluated too, pure or not, as a test driver's selection of the files it includes.
+# evaluated too, pure or not, as a test driver's selection of the files it includes, and so
+# are the conditions that decide whether they run, also those of early exits such as
+# `file in SKIPPED && continue`.
 
 const _PURE_NAMES = Set([:nothing, :missing, :true, :false, :Inf, :NaN, :pi, :π, :ℯ])
 "Names whose values depend on how the analyzed program is run."
@@ -881,11 +883,35 @@ function _type_symbols!(names::Set{Symbol}, ex::Expr)
 end
 
 """
+Push the conditions under which statement `ex` exits early with one of `exits` onto
+`conditions`, as `file in SKIPPED` of `file in SKIPPED && continue`: those of the branches
+and loops around each exit that leaves `ex`. A `break` or `continue` in a loop of `ex` leaves
+only that loop, and code in functions exits nothing.
+"""
+function _exits!(conditions::Vector{Any}, ex, exits::Tuple, path::Vector{Any}=Any[])
+    ex isa Expr && !(ex.head in (:quote, :inert, :module)) && !_method(ex) || return conditions
+    head = ex.head
+    if head in exits
+        append!(conditions, path)
+    elseif head in (:if, :elseif, :&&, :||)
+        _exits!(conditions, first(ex.args), exits, path)
+        foreach(arg -> _exits!(conditions, arg, exits, [path; first(ex.args)]), ex.args[2:end])
+    elseif head in (:for, :while)
+        :return in exits && _exits!(conditions, last(ex.args), (:return,), [path; first(ex.args)])
+    else
+        foreach(arg -> _exits!(conditions, arg, exits, path), ex.args)
+    end
+    return conditions
+end
+
+"""
 Add the names whose values JETLS evaluates when it analyzes the top-level statement `ex`:
 arguments of `include` and `eval` calls, signatures of definitions, the control flow around
 these and around imports, and the conditions of branches that define closures, which JETLS
 evaluates to define them; with `forced`, only those of `include` and `eval` calls, which
 JETLS evaluates whatever they need. Assignments in `ex` that these names depend on count too.
+Control flow includes early exits: the conditions of a `continue`, `break` or `return` control
+what follows it, and those of a `break` or `return` every iteration of its loop.
 """
 function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
     # Closures in an outlined expression's branches need no conditions.
@@ -905,6 +931,10 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
     locals = Pair{Set{Symbol},Set{Symbol}}[]
     needs!(parts, controls) =
         (foreach(part -> _evaluated_symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
+    # What follows an early exit, as `include(file)` follows `file in SKIPPED && continue`,
+    # runs only where its conditions let it.
+    exited(controls, part) = (exits = _exits!(Any[], part, (:break, :continue, :return));
+                              isempty(exits) ? controls : [controls; exits])
     # Functions defined in loops, `let` and `try` blocks are local: closures. The closures in
     # statements moved out of a conditional need no conditions either.
     function visit(ex, controls::Vector{Any}, branches::Vector{Any}, scoped::Bool, forced::Bool, toplevel::Bool=false)
@@ -921,6 +951,7 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
                 outlined = forced || head === :block && moved(part)
                 visit(part, controls, branches, scoped, outlined,
                       !outlined && Meta.isexpr(part, head === :block ? (:if, :block) : (:elseif, :block)))
+                head === :block && (controls = exited(controls, part))
             end
         elseif head in (:quote, :inert, :module)
             return
@@ -951,12 +982,19 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
             foreach(arg -> visit(arg, [controls; condition], [branches; condition], scoped, forced), ex.args[2:end])
         elseif head in (:for, :while)
             visit(first(ex.args), controls, branches, scoped, forced)
-            visit(last(ex.args), [controls; first(ex.args)], branches, true, forced)
+            # A `break` or `return` decides whether the later iterations run.
+            body = _exits!([controls; first(ex.args)], last(ex.args), (:break, :return))
+            visit(last(ex.args), body, branches, true, forced)
         elseif head === :let
             visit(first(ex.args), controls, branches, scoped, forced)
             visit(last(ex.args), controls, branches, true, forced)
         elseif head === :try
             foreach(arg -> visit(arg, controls, branches, true, forced), ex.args)
+        elseif head === :block
+            for part in ex.args
+                visit(part, controls, branches, scoped, forced)
+                controls = exited(controls, part)
+            end
         else
             !forced && head in (:generator, :comprehension, :typed_comprehension, :do) && needs!(branches, Any[])
             if head === :(=) && !_signature(first(ex.args))

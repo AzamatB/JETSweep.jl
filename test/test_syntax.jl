@@ -1214,6 +1214,41 @@ end
     @test syntax_patterns("const FILES = list_tests()\nrun(f) = include(f)\nforeach(run, FILES)\n") == String[]
 end
 
+@testset "concretization_patterns evaluates the conditions of early exits that control includes" begin
+    selection = """
+        const FILES = ["test_a.jl", "test_guards.jl"]
+        const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)
+        const ORIGINAL = filter(==("test_guards.jl"), RUN)
+        const OTHER = filter(!=("test_guards.jl"), RUN)
+        """
+    run, original, other = ["const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)",
+                            "const ORIGINAL = filter(==(\"test_guards.jl\"), RUN)",
+                            "const OTHER = filter(!=(\"test_guards.jl\"), RUN)"]
+    patterns(loop) = syntax_patterns(selection * loop)[2:end]
+    # A test driver skips what another phase runs, as DispatchCheckup's `original=` files.
+    @test patterns("""
+        @testset "suite" begin
+            for file in RUN
+                file in ORIGINAL && get(ENV, "DISPATCH_CHECKUP", "") == "checked" && continue
+                include(file)
+            end
+        end
+        """) == [run, original]
+    @test patterns("for file in RUN\n    if file in ORIGINAL\n        continue\n    end\n    include(file)\nend\n") ==
+          patterns("for file in RUN\n    file in ORIGINAL || continue\n    include(file)\nend\n") == [run, original]
+    # Every condition on the way to the exit counts, as a `break` does for every iteration and a
+    # `return` for what follows it anywhere in the statement.
+    @test patterns("for file in RUN\n    if file in OTHER\n        file in ORIGINAL && continue\n    end\n    include(file)\nend\n") ==
+          [run, original, other]
+    @test patterns("for file in RUN\n    include(file)\n    file in ORIGINAL && break\nend\n") == [run, original]
+    @test patterns("for file in RUN\n    for o in OTHER\n        o in ORIGINAL && return\n    end\n    include(file)\nend\n") ==
+          [run, original, other]
+    # A `continue` controls what follows it, and a `break` in an inner loop only that loop.
+    @test patterns("for file in RUN\n    include(file)\n    file in ORIGINAL && continue\nend\n") == [run]
+    @test patterns("for file in RUN\n    for o in OTHER\n        o in ORIGINAL && break\n    end\n    include(file)\nend\n") == [run]
+    @test patterns("for file in RUN\n    foreach(f -> f in ORIGINAL && return, OTHER)\n    include(file)\nend\n") == [run]
+end
+
 @testset "includes resolve through path constants other files define" begin
     mktempdir() do directory
         root = realpath(directory)

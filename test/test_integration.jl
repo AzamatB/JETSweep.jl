@@ -134,6 +134,19 @@ end
             const RUN = isempty(ASKED) ? ["a"] : filter(name -> name in ASKED, ["a"])
             selected() = RUN
             """)
+        # Nor is the selection of what a driver skips before an include, as DispatchCheckup's
+        # skip of its `original=` files is.
+        write(joinpath(root, "skipping.jl"), """
+            const FILES = ["skipping_a.txt", "skipping_b.txt"]
+            const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)
+            const ORIGINAL = filter(==("skipping_b.txt"), RUN)
+            for file in RUN
+                file in ORIGINAL && get(ENV, "DISPATCH_CHECKUP", "") == "checked" && continue
+                include(file)
+            end
+            """)
+        write(joinpath(root, "skipping_a.txt"), "skipped_a() = 1 + \"a\"\n")
+        write(joinpath(root, "skipping_b.txt"), "skipped_b() = 2 + \"b\"\n")
         # A script loads a package of its workspace that no project of it declares.
         mkpath(joinpath(root, "Sibling", "src"))
         write(joinpath(root, "Sibling", "Project.toml"),
@@ -512,6 +525,8 @@ end
         unit(name) = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, name))
         errors(name) = sort!([f.line for f in unit(name).findings if f.code == "inference/method-error"])
         undefined(name) = [f for f in unit(name).findings if occursin("undef-global-var", f.code)]
+        @test status("skipping.jl") === :findings &&
+              sort!([basename(f.file) for f in unit("skipping.jl").findings]) == ["skipping_a.txt", "skipping_b.txt"]
         @test errors("tiers.jl") == [5, 15] && isempty(undefined("tiers.jl"))
         @test errors("testsets.jl") == [7, 19] && isempty(undefined("testsets.jl"))
         @test !isfile(joinpath(root, "testsets.marker"))
