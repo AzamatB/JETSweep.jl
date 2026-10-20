@@ -87,6 +87,16 @@ end
         write(joinpath(root, "missing_package.jl"), "using NotAPackageAnywhere\nf(x::Int) = x\n")
         # Where a message locates a method, it names the module as JETLS does.
         write(joinpath(root, "kwdef.jl"), "Base.@kwdef struct Opts{T}\n    a::T = 1\nend\nmake() = Opts(1, 2)\n")
+        # A tier of tests an environment variable enables is analyzed without it.
+        write(joinpath(root, "gated.jl"), """
+            using Test
+            if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                @testset "tier" begin
+                    foreach(x -> println(x), 1:2)
+                    sin("tier")
+                end
+            end
+            """)
         # A line ending in "\r\n" ends before its '\r'.
         write(joinpath(root, "crlf.jl"), "crlf_failure() = sin(\"abc\")\r\ncrlf_failure()\r\n")
         write(joinpath(root, "unresolved.jl"), "const PATHS = rand(Bool) ? [\"a\"] : String[]\nstruct S\n    x::typeof(PATHS)\nend\n")
@@ -229,6 +239,9 @@ end
         status(name) = integration_status(result, realpath(joinpath(root, name)))
         reasons(name) = only(r.reasons for (u, r) in zip(result.units, result.results) if endswith(u.entry, name))
         @test status("missing_package.jl") === :incomplete
+        gated = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "gated.jl"))
+        @test any(f -> f.code == "inference/method-error" && f.line == 5, gated.findings)
+        @test !any(f -> occursin("undef-global-var", f.code), gated.findings)
         kwdef = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "kwdef.jl"))
         @test any(f -> occursin("@ Main ", f.message), kwdef.findings)
         @test !any(f -> occursin("JETSweepAnalysis", f.message), kwdef.findings)

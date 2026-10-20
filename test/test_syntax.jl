@@ -161,6 +161,26 @@ end
     end
 end
 
+@testset "prelude follows the branch of a conditional that includes the test file" begin
+    driver = """
+        using Test
+        if !isempty(ARGS)
+            foreach(run_selected, ARGS)
+        else
+            helper() = 1
+            if get(ENV, "TIER", "") == "1"
+                tiered() = 2
+                include("target.jl")
+            end
+            after() = 3
+        end
+        """
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "helper() + tiered()\n") do text, dir
+        @test occursin("helper() = 1", text) && occursin("tiered() = 2", text)
+        @test !occursin("after() = 3", text) && !occursin("run_selected", text)
+    end
+end
+
 @testset "prelude follows includes through pkgdir and pathof of the unit's package" begin
     mktempdir() do directory
         dir = realpath(directory)
@@ -886,6 +906,13 @@ end
     @test !JETSweep._outlined(:(ready || foreach(xs) do x::Row; x; end))
     @test !JETSweep._outlined(:(ready || foreach(function (x::T) where {T}; x; end, xs)))
     @test JETSweep._outlined(:(ready || foreach((x=Row()) -> x, xs)))
+    # A conditional of tests binds nothing either, unless a branch does at its own level.
+    @test JETSweep._outlined(:(if get(ENV, "X", "") == "1"; f(); @testset "t" begin; y = 1; foreach(x -> x + y, 1:2); end; end))
+    @test !JETSweep._outlined(:(if get(ENV, "X", "") == "1"; y = 1; @testset "t" begin; foreach(x -> x, 1:2); end; end))
+    @test !JETSweep._outlined(:(if ready; @testset "t" include("t.jl"); foreach(x -> x, 1:2); end))
+    @test !JETSweep._outlined(:(if ready; @time foreach(x -> x, 1:2); end))
+    @test syntax_patterns("const ON = get(ENV, \"X\", \"\") == \"1\"\nif ON\n    @testset \"t\" begin\n        foreach(x -> x, 1:2)\n    end\nend\n") ==
+          String[]
     # Loop and `let` bodies are local scopes already, unless they import.
     @test JETSweep._outlined(:(for (name, entries) in deps; if haskey(m, name); all(e -> e, entries); end; end))
     @test JETSweep._outlined(:(let r = slow(); if r > 0; g(x) = x + 1; end; end))
