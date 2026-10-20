@@ -8,10 +8,13 @@ write_tag(directory::String) = write(joinpath(directory, "CACHEDIR.TAG"), _CACHE
     """)
 
 function write_inventory(file::String, inventory::Inventory)
+    project(p::Project) = Dict("dir" => p.dir, "file" => p.file, "name" => p.name, "uuid" => p.uuid,
+                               "entry" => p.entry, "extensions" => p.extensions)
     _write_toml(file, Dict(
         "root" => inventory.root,
-        "projects" => [Dict("dir" => p.dir, "file" => p.file, "name" => p.name, "uuid" => p.uuid,
-                            "entry" => p.entry, "extensions" => p.extensions) for p in inventory.projects],
+        "projects" => project.(inventory.projects),
+        # Packages the sweep leaves out but code may load; those the configuration excludes come last.
+        "available" => [merge(project(p), Dict("tier" => tier)) for (tier, ps) in enumerate(inventory.available) for p in ps],
         "sources" => [Dict("path" => s.path, "kind" => String(s.kind), "project" => s.project, "owner" => s.owner)
                       for s in inventory.sources],
         "excluded" => inventory.excluded, "issues" => inventory.issues))

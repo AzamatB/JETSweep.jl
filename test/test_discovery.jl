@@ -65,6 +65,7 @@ discovery_project_at(inventory, relative) =
 
 discovery_snapshot(inventory) = (inventory.root,
     [(p.dir, p.file, p.name, p.uuid, p.entry, p.extensions) for p in inventory.projects],
+    [[p.file for p in tier] for tier in inventory.available],
     [(s.path, s.kind, s.project, s.owner) for s in inventory.sources], inventory.excluded, inventory.issues)
 
 const DISCOVERY_DATES = "ade2ca70-3891-5945-98fb-dc099432e06a"
@@ -284,38 +285,60 @@ end
     end
 end
 
-@testset "Excluded directories keep their projects, without their sources or issues (Git: $git)" for git in (false, true)
+@testset "The packages a sweep leaves out stay available, without their sources or issues (Git: $git)" for git in (false, true)
     mktempdir() do directory
         root = realpath(directory)
         sibling = discovery_package(root, "Sibling", "Sibling")
         discovery_write(sibling, "test/runtests.jl")
         discovery_write(sibling, "vendor/Broken/Project.toml", "[deps\n")
+        discovery_write(sibling, "vendor/Environment/Project.toml", "[deps]\n")
+        discovery_package(sibling, "vendor/Vendored", "Vendored")
         # What discovery leaves out for another reason stays out.
         discovery_package(sibling, "node_modules/Pruned", "Pruned")
         discovery_package(sibling, ".state/Hidden", "Hidden")
         discovery_package(sibling, "ignored/Ignored", "Ignored")
-        discovery_package(root, "Kept", "Kept")
+        kept = discovery_package(root, "Kept", "Kept")
         if git
             discovery_write(root, ".gitignore", "ignored/\n")
             discovery_git(root)
         end
+        available(inventory) = [[discovery_relative(inventory, p.dir) for p in tier] for tier in inventory.available]
+        ignored = git ? String[] : ["Sibling/ignored/Ignored"]
         inventory = discover(root; exclude=["Sibling"])
         @test discovery_files(inventory) == ["Kept/src/Kept.jl"]
-        @test sort!([discovery_relative(inventory, p.dir) for p in inventory.projects]) ==
-              (git ? ["Kept", "Sibling", "Sibling/vendor/Broken"] : ["Kept", "Sibling", "Sibling/ignored/Ignored", "Sibling/vendor/Broken"])
-        @test JETSweep.ispackage(discovery_project_at(inventory, "Sibling"))
+        @test [discovery_relative(inventory, p.dir) for p in inventory.projects] == ["Kept"]
+        @test available(inventory) == [["Sibling"; ignored; "Sibling/vendor/Vendored"], String[]]
         @test isempty(inventory.issues)
         @test discovery_reasons(inventory) == Dict("Sibling" => "excluded by pattern")
         # An excluded project file is left out with the rest.
         inventory = discover(root; exclude=["Sibling/Project.toml"])
-        @test !any(p -> p.dir == sibling, inventory.projects)
+        @test !any(p -> p.dir == sibling, inventory.projects) && all(isempty, inventory.available)
         @test discovery_placement(inventory)["Sibling/src/Sibling.jl"] == (:script, "", "")
-        # A configuration's patterns are relative to its directory.
-        config = JETSweep.Config(joinpath(root, ".JETSweep.toml"), ["Sibling/test", "Broken"], JETSweep.ContextRule[])
-        ignored = git ? String[] : ["ignored/Ignored/src/Ignored.jl"]
-        @test discovery_files(discover(sibling; config)) == [ignored; "src/Sibling.jl"]
-        @test discovery_files(discover(sibling; exclude=["Sibling/test"])) == [ignored; "src/Sibling.jl"; "test/runtests.jl"]
-        @test isempty(discover(sibling; config).issues) && !isempty(discover(sibling).issues)
+        # A configuration's patterns are relative to its directory when the sweep is of part of
+        # it, and what they exclude comes after what only the sweep leaves out: the rest of that
+        # directory, and what `--exclude` excludes there.
+        file = discovery_write(root, ".JETSweep.toml", "exclude = [\"Sibling/test\", \"vendor\"]\n")
+        inventory = discover(root; exclude=["Sibling"], config=JETSweep.read_config(root, file))
+        @test available(inventory) == [["Sibling"; ignored], ["Sibling/vendor/Vendored"]]
+        inventory = discover(kept; config=JETSweep.read_config(kept, file))
+        @test discovery_files(inventory) == ["src/Kept.jl"]
+        @test available(inventory) == [relpath.(joinpath.(root, ["Sibling"; ignored]), kept), ["../Sibling/vendor/Vendored"]]
+        @test isempty(inventory.issues) && isempty(inventory.excluded)
+        # `--exclude` applies within the directory swept.
+        @test available(discover(kept; exclude=["vendor"], config=JETSweep.read_config(kept, file))) == available(inventory)
+        inventory = discover(sibling; config=JETSweep.read_config(sibling, file))
+        @test discovery_files(inventory) == [relpath.(joinpath.(root, ignored, "src", "Ignored.jl"), sibling); "src/Sibling.jl"]
+        @test available(inventory) == [["../Kept"], ["vendor/Vendored"]]
+        @test discovery_files(discover(sibling; exclude=["Sibling/test"])) ==
+              [relpath.(joinpath.(root, ignored, "src", "Ignored.jl"), sibling); "src/Sibling.jl"; "test/runtests.jl";
+               "vendor/Vendored/src/Vendored.jl"]
+        @test isempty(discover(sibling; config=JETSweep.read_config(sibling, file)).issues) && !isempty(discover(sibling).issues)
+        # Globs of a configuration whose directory is not above the sweep's are relative to the
+        # directory swept, so all paths are within the directory they are relative to.
+        @test JETSweep.read_config(sibling, file).directory == root
+        @test JETSweep.read_config(root, file).directory == root
+        @test JETSweep.read_config(root, discovery_write(sibling, "tools/.JETSweep.toml", "")).directory == root
+        @test isempty(discover(kept; config=JETSweep.read_config(kept, joinpath(sibling, "tools/.JETSweep.toml"))).available[1])
     end
 end
 

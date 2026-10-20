@@ -509,9 +509,9 @@ directory without `--exclude`, is a mistake.
 function _unselected(config::Config, units::Vector{Unit}, root::String, options::SweepOptions, output::String)
     unselected = filter(rule -> !any(unit -> _selects(rule, config, unit.entry), units), config.contexts)
     isempty(unselected) && return String[]
-    whole = _within(root, _directory(config)) ? _directory(config) : root
-    full = whole == root && isempty(options.exclude) ? units :
-        plan(discover(whole; config, output, include_ignored=options.include_ignored, tracked_only=options.tracked_only))
+    full = config.directory == root && isempty(options.exclude) ? units :
+        plan(discover(config.directory; config, output, include_ignored=options.include_ignored,
+                      tracked_only=options.tracked_only))
     for rule in unselected
         any(unit -> _selects(rule, config, unit.entry), full) ||
             throw(ArgumentError("$(config.file): [[context]] match $(repr(rule.match)) selects no unit"))
@@ -552,9 +552,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     write_inventory(joinpath(output, "inventory.toml"), inventory)
     write_plan(joinpath(output, "plan.toml"), units, inventory.root, notes)
     contexts = unique(unit.context for unit in units)
-    # Packages of excluded directories are not analyzed.
-    files = Set(source.path for source in inventory.sources)
-    packages = count(project -> ispackage(project) && project.entry in files, inventory.projects)
+    packages = count(ispackage, inventory.projects)
     println(io, "JETSweep: $(length(inventory.sources)) files, $packages packages, $(length(units)) units, ",
             "$(length(contexts)) environments")
     if options.plan_only

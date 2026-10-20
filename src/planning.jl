@@ -204,13 +204,21 @@ end
 Give the contexts of scripts and tests the packages their files import without their
 projects declaring them, as code does that runs with another project active or relies on
 its workspace: packages of the workspace from their directories, others from the registry.
+Where several packages of the workspace have a name, the first tier that has it decides: the
+packages the sweep analyzes, then those of the configuration's directory it leaves out, then those
+the configuration excludes, as a fixture's copy of a package may be. Several packages of that
+tier leave the name to the registry.
 """
 function _imports!(units::Vector{Unit}, syntax::Dict{String,Syntax}, inventory::Inventory)
-    names = [project.name for project in inventory.projects if ispackage(project)]
-    workspace = Dict(project.name => project.dir for project in inventory.projects
-                     if ispackage(project) && count(==(project.name), names) == 1)
+    workspace = Dict{String,String}()
+    for tier in [[filter(ispackage, inventory.projects)]; inventory.available]
+        names = [project.name for project in tier]
+        for project in tier
+            get!(workspace, project.name, count(==(project.name), names) == 1 ? project.dir : "")
+        end
+    end
     # Other modules the tree defines, loaded through `LOAD_PATH`, say, are not packages to look up.
-    defined = setdiff(Set(name for facts in values(syntax) for name in facts.modules), names)
+    defined = setdiff(Set(name for facts in values(syntax) for name in facts.modules), keys(workspace))
     available = union(Set(readdir(Sys.STDLIB)), ("Base", "Core", "Main"), defined)
     imported = Dict{Context,Set{String}}()
     for unit in units
@@ -243,7 +251,7 @@ function _packages(source::Source, projects::Dict{String,Project})
 end
 
 "Whether `rule` of `config` selects the unit whose entry is `entry`."
-_selects(rule::ContextRule, config::Config, entry::String) = occursin(rule.pattern, _slash(relpath(entry, _directory(config))))
+_selects(rule::ContextRule, config::Config, entry::String) = occursin(rule.pattern, _slash(relpath(entry, config.directory)))
 
 function _configure(units::Vector{Unit}, config::Config)
     for rule in config.contexts

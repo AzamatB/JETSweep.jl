@@ -191,8 +191,7 @@ function _cache_tagged(directory::String)
     end
 end
 
-"`isdir` and `ispath` throw for unreadable paths and symlink loops; treat those as absent."
-_isdir(path::String) = try isdir(path) catch; false end
+"`ispath` throws for unreadable paths and symlink loops; treat those as absent."
 _ispath(path::String) = try ispath(path) catch; false end
 
 """
@@ -205,20 +204,25 @@ skipped unless Git tracks files inside them, as are `node_modules` and `__pycach
 always directories a `CACHEDIR.TAG` marks as caches, such as earlier reports. Symlinks are
 not followed: inside the root they are aliases of what discovery reaches anyway, or of what
 it excludes. `exclude` holds globs relative to `root`, and `config` exclusions relative to
-its directory; the projects of excluded directories are still inventoried, without their
-sources or issues, as packages that other code may load. `output` names a report directory
-to skip.
+its directory. `output` names a report directory to skip.
+
+The packages of directories the sweep leaves out are still inventoried, without their
+sources or issues, as `available` packages that other code may load: those of excluded
+directories, and, when `root` is part of the configuration's directory, those of the rest
+of it.
 """
 function discover(root::AbstractString; exclude::Vector{String}=String[], config::Config=Config(),
                   output::AbstractString="", include_ignored::Bool=false, tracked_only::Bool=false)::Inventory
     isdir(root) || throw(ArgumentError("not a directory: $root"))
     root = realpath(root)
     output = isempty(output) ? "" : ispath(output) ? realpath(output) : abspath(output)
-    bases = Dict{String,Vector{String}}()
-    isempty(exclude) || append!(get!(bases, root, String[]), exclude)
-    isempty(config.exclude) || append!(get!(bases, _directory(config), String[]), config.exclude)
-    exclusions = [(base, _exclusions(patterns)...) for (base, patterns) in bases]
-    excluded, issues, files, project_files = String[], String[], String[], Pair{String,Bool}[]
+    workspace = !isempty(config.directory) && config.directory != root && _within(root, config.directory) ?
+        config.directory : ""
+    options, configured = _exclusions(exclude), _exclusions(config.exclude)
+    excluded, issues, files = String[], String[], String[]
+    # Project files by how far the sweep leaves them out: not, only the sweep, or the
+    # configuration too, as `Inventory.available` orders its packages.
+    project_files = [String[], String[], String[]]
     repositories = _Git[]
 
     function open_git(directory, issues)
@@ -229,6 +233,16 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], config
             push!(issues, "$directory: cannot read Git repository, so its ignore rules are not applied: " *
                 sprint(showerror, err))
             return nothing
+        end
+    end
+
+    # The repository a directory is in, if any.
+    function repository(directory, issues)
+        ancestor = directory
+        while true
+            _ispath(joinpath(ancestor, ".git")) && return open_git(ancestor, issues)
+            dirname(ancestor) == ancestor && return nothing
+            ancestor = dirname(ancestor)
         end
     end
 
@@ -252,35 +266,44 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], config
         end
     end
 
-    # A directory excluded by pattern is walked for its projects alone, with what goes wrong
-    # there left unreported: its packages are still those of the workspace.
-    function walk(directory::String, git::Union{Nothing,_Git}, skipped::Bool=false)
-        reported = skipped ? String[] : issues
+    # A directory the sweep leaves out, at `tier` 1, or that the configuration excludes, at 2,
+    # is walked for its projects alone, with what goes wrong there left unreported: its
+    # packages are still those of the workspace.
+    function walk(directory::String, git::Union{Nothing,_Git}, tier::Int=0)
+        reported = tier == 0 ? issues : String[]
+        # Directory entries tell links and directories apart without a `stat` of each path,
+        # which matters in large excluded trees.
         entries = try
-            readdir(directory; join=true)
+            Base.Filesystem._readdirx(directory)
         catch err
             return push!(reported, "$directory: cannot list directory: $(sprint(showerror, err))")
         end
-        directory != root && ".git" in basename.(entries) && (git = open_git(directory, reported))
+        directory != root && directory != workspace && any(entry -> entry.name == ".git", entries) &&
+            (git = open_git(directory, reported))
         metadata = String[]
-        for path in entries
-            name = basename(path)
-            name == ".git" && continue
-            link = islink(path)
-            isdirectory = !link && _isdir(path)
-            skipped && !isdirectory && !(name in _PROJECT_FILES) && continue
+        for entry in entries
+            name, path = entry.name, entry.path
+            (name == ".git" || path == root) && continue
+            link, isdirectory = try
+                islink(entry), !islink(entry) && isdir(entry)
+            catch err
+                push!(reported, "$path: cannot read path: $(sprint(showerror, err))")
+                continue
+            end
+            tier > 0 && !isdirectory && !(name in _PROJECT_FILES) && continue
             hidden = isdirectory && startswith(name, '.')
-            patterned = !link && !skipped &&
-                any(((base, patterns, anchored),) -> _excluded(_slash(relpath(path, base)), patterns, anchored), exclusions)
-            reason = link ? "symlink" : patterned ? "excluded by pattern" :
+            patterned = link || tier == 2 ? 0 :
+                !isempty(config.exclude) && _excluded(_slash(relpath(path, config.directory)), configured...) ? 2 :
+                tier == 0 && _excluded(_slash(relpath(path, root)), options...) ? 1 : 0
+            reason = link ? "symlink" : patterned > 0 ? "excluded by pattern" :
                 omission(path, name, git, isdirectory, hidden, reported)
             if reason !== nothing
-                skipped || push!(excluded, "$path ($reason)")
-                patterned && isdirectory && omission(path, name, git, isdirectory, hidden, String[]) === nothing &&
-                    walk(path, git, true)
+                tier == 0 && push!(excluded, "$path ($reason)")
+                patterned > 0 && isdirectory && omission(path, name, git, isdirectory, hidden, String[]) === nothing &&
+                    walk(path, git, max(tier, patterned))
             elseif isdirectory
-                walk(path, git, skipped)
-            elseif endswith(name, ".jl")
+                walk(path, git, tier)
+            elseif tier == 0 && endswith(name, ".jl")
                 push!(files, path)
             elseif name in _PROJECT_FILES
                 push!(metadata, name)
@@ -288,24 +311,19 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], config
         end
         # Julia prefers JuliaProject.toml when both project files exist.
         for name in _PROJECT_FILES
-            name in metadata && (push!(project_files, joinpath(directory, name) => skipped); break)
+            name in metadata && (push!(project_files[tier + 1], joinpath(directory, name)); break)
         end
         return nothing
     end
 
     try
-        git = nothing
-        ancestor = root
-        while true
-            _ispath(joinpath(ancestor, ".git")) && (git = open_git(ancestor, issues); break)
-            dirname(ancestor) == ancestor && break
-            ancestor = dirname(ancestor)
-        end
-        walk(root, git)
+        walk(root, repository(root, issues))
+        isempty(workspace) || walk(workspace, repository(workspace, String[]), 1)
     finally
         foreach(close, repositories)
     end
-    projects = [_read_project(file, skipped ? String[] : issues) for (file, skipped) in sort!(project_files)]
+    projects = [_read_project(file, issues) for file in sort!(project_files[1])]
+    available = [filter(ispackage, [_read_project(file, String[]) for file in sort!(tier)]) for tier in project_files[2:3]]
     # Deepest projects first, so the first match is the nearest enclosing project. A named
     # project bounds package ownership even when its metadata is otherwise broken.
     nearest = sort(projects; by=project -> (-length(project.dir), project.dir))
@@ -316,7 +334,7 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], config
         Source(path, _source_kind(path, owner), isempty(enclosing) ? "" : first(enclosing).dir,
                owner === nothing ? "" : owner.dir)
     end
-    return Inventory(root, projects, sources, sort!(excluded), sort!(unique!(issues)))
+    return Inventory(root, projects, sources, available, sort!(excluded), sort!(unique!(issues)))
 end
 
 function _source_kind(path::String, owner::Union{Nothing,Project})

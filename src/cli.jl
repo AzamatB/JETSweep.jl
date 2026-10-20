@@ -11,9 +11,12 @@ const HELP = """
                           GPUs (indices or UUIDs) assigned round-robin through CUDA_VISIBLE_DEVICES
                           (default: auto)
       --output DIRECTORY  New or empty report directory (default: DIRECTORY/.jetsweep/TIMESTAMP)
-      --config FILE       Configuration file (default: DIRECTORY/.JETSweep.toml, if present)
+      --config FILE       Configuration file (default: DIRECTORY/.JETSweep.toml, if present). A
+                          workspace's configuration applies to a sweep of part of the workspace:
+                          its globs are relative to its directory when DIRECTORY is in it
       --exclude GLOB      Skip matching paths; repeatable. A pattern with `/`, or starting with
-                          `/` or `./`, matches paths relative to DIRECTORY, others any segment
+                          `/` or `./`, matches paths relative to DIRECTORY, others any segment.
+                          Excluded packages are not analyzed, but code that loads them finds them
       --include-ignored   Include files Git ignores
       --tracked-only      Include only files Git tracks
       --offline           Resolve among installed package versions; download nothing

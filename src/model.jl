@@ -28,6 +28,12 @@ struct Inventory
     root::String
     projects::Vector{Project}
     sources::Vector{Source}
+    """
+    Packages the sweep leaves out, which its code may still load, in two tiers: those of the
+    full sweep, of the configuration's directory, that `--exclude` or a narrower root leaves
+    out, then those the configuration excludes.
+    """
+    available::Vector{Vector{Project}}
     excluded::Vector{String}
     issues::Vector{String}
 end

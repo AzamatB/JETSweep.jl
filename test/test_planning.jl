@@ -629,5 +629,23 @@ end
         @test !any(unit -> startswith(unit.entry, sibling), units)
         @test planning_unit(units, loose).context.imports == Dict("Sibling" => sibling)
         @test planning_unit(units, test).context.imports == imports
+        # A package the sweep analyzes wins its name from one it leaves out, as a fixture's copy;
+        # two it analyzes leave the name to the registry.
+        copy = planning_package(host, "test/fixtures/Sibling", "Sibling")
+        planning_file(copy, "src/Sibling.jl", "module Sibling\nend\n")
+        @test planning_unit(plan(discover(root; exclude=["fixtures"])), loose).context.imports == Dict("Sibling" => sibling)
+        @test planning_unit(plan(discover(root)), loose).context.imports == Dict("Sibling" => "")
+        # Of those it leaves out, one of the configuration's directory wins from one the
+        # configuration excludes, as the full sweep has it.
+        file = planning_file(root, ".JETSweep.toml", "exclude = [\"fixtures\"]\n")
+        _, units = planning_plan(root)
+        @test planning_unit(units, loose).context.imports == Dict("Sibling" => sibling)
+        config = JETSweep.read_config(root)
+        @test planning_unit(plan(discover(root; exclude=["Sibling"], config), config), loose).context.imports ==
+              Dict("Sibling" => sibling)
+        # A sweep of one of its directories finds the packages of the rest of it.
+        @test planning_unit(last(planning_plan(host, file)), test).context.imports == imports
+        @test planning_unit(plan(discover(host; exclude=["fixtures"])), test).context.imports ==
+              merge(imports, Dict("Sibling" => copy))
     end
 end
