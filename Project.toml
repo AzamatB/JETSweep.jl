@@ -4,7 +4,6 @@ version = "0.3.0"
 authors = ["Azamat Berdyshev <aberdysh@gmail.com>"]
 
 [deps]
-FileWatching = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
 JETLS = "a3b70258-0602-4ee2-b5a6-54c2470400db"
 LibGit2 = "76f85450-5226-5b5a-8eaa-529ad045b433"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
@@ -16,7 +15,6 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 JETLS = {rev = "88881856f97eb4750264aec5543b22b76c15dc48", url = "https://github.com/aviatesk/JETLS.jl"}
 
 [compat]
-FileWatching = "1"
 JETLS = "=2026.10.18"
 LibGit2 = "1"
 Pkg = "1.13"

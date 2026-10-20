@@ -604,6 +604,69 @@ end
     end
 end
 
+@testset "environments are prepared again when their inputs change while they are prepared, or as a unit runs" begin
+    mktempdir() do directory
+        root, outside = mkpath(joinpath(directory, "workspace")), mkpath(joinpath(directory, "outside"))
+        file(path, text) = (mkpath(dirname(path)); write(path, text))
+        project(name, uuid, deps="") = "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n$deps"
+        helper, editor = "4b1e7c2a-93d5-4f60-8a1b-2c3d4e5f6a7b", "5c2f8d3b-a4e6-4071-9b2c-3d4e5f6a7b8c"
+        # Helper and Editor are outside the swept root, as the siblings of a swept repository are.
+        file(joinpath(outside, "Helper", "Project.toml"), project("Helper", helper))
+        file(joinpath(outside, "Helper", "src", "Helper.jl"), "module Helper\nvalue() = 1\nend\n")
+        # Precompiling Editor, which preparation does after it resolved Helper's dependencies, makes
+        # Helper import Random, as an edit while the environment is prepared would.
+        file(joinpath(outside, "Editor", "Project.toml"), project("Editor", editor))
+        file(joinpath(outside, "Editor", "src", "Editor.jl"), """
+            module Editor
+            let helper = joinpath(@__DIR__, "..", "..", "Helper")
+                if ccall(:jl_generating_output, Cint, ()) == 1 && !occursin("Random", read(joinpath(helper, "Project.toml"), String))
+                    write(joinpath(helper, "Project.toml"), $(repr(project("Helper", helper, "\n[deps]\nRandom = \"9a3f8284-a2c9-5f02-9a11-845980a1fd5c\"\n"))))
+                    write(joinpath(helper, "src", "Helper.jl"), "module Helper\\nusing Random\\nvalue() = 2\\nend\\n")
+                end
+            end
+            end
+            """)
+        file(joinpath(root, "Dependent", "Project.toml"), project("Dependent", "6d3a9e4c-b5f7-4182-8c3d-4e5f6a7b8c9d", """
+            [deps]
+            Editor = "$editor"
+            Helper = "$helper"
+
+            [sources]
+            Editor = {path = "../../outside/Editor"}
+            Helper = {path = "../../outside/Helper"}
+            """))
+        file(joinpath(root, "Dependent", "src", "Dependent.jl"), "module Dependent\nusing Helper\nvalue() = Helper.value()\nend\n")
+        # Loading Recover or Crasher the first time writes its preferences and fails; Crasher then exits
+        # without a result.
+        for (name, uuid, again) in (("Recover", "7e4b0f5d-c6a8-4293-9d4e-5f6a7b8c9d0e", "return"),
+                                    ("Crasher", "8f5c1a6e-d7b9-43a4-8e5f-6a7b8c9d0e1f", "exit(7)"))
+            file(joinpath(root, name, "Project.toml"), project(name, uuid))
+            file(joinpath(root, name, "src", "$name.jl"), """
+                module $name
+                function __init__()
+                    preferences = joinpath(@__DIR__, "..", "LocalPreferences.toml")
+                    isfile(preferences) && $again
+                    write(preferences, "[$name]\\nloaded = true\\n")
+                    error("first run failed")
+                end
+                end
+                """)
+        end
+        result = sweep(root; options=SweepOptions(jobs=3, threads=1, gpus=["none"], timeout=900.0,
+                                                  output=joinpath(directory, "report")), io=devnull)
+        unit(name) = only(r for (u, r) in zip(result.units, result.results) if u.entry == realpath(joinpath(root, name, "src", "$name.jl")))
+        again(name, changed) = any(note -> startswith(note, "environment: It was prepared again, since $(realpath(changed)) " *
+                                                         "changed during the run."), unit(name).notes)
+        @test occursin("using Random", read(joinpath(outside, "Helper", "src", "Helper.jl"), String))
+        # Without preparing it again, Dependent fails to load: "Cannot load module Random into module Helper".
+        @test unit("Dependent").status === :clean && again("Dependent", joinpath(outside, "Helper", "Project.toml"))
+        @test unit("Recover").status === :clean && again("Recover", joinpath(root, "Recover", "LocalPreferences.toml"))
+        # The result of Crasher's first run is not reported for its second.
+        @test unit("Crasher").status === :failed && again("Crasher", joinpath(root, "Crasher", "LocalPreferences.toml"))
+        @test startswith(only(unit("Crasher").reasons), "worker exited with code 7 without a result")
+    end
+end
+
 @testset "plan only" begin
     mktempdir() do directory
         root = integration_copy(directory)

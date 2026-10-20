@@ -179,13 +179,16 @@ packages, as scripts load through `LOAD_PATH`, are not looked up. With
 `--offline`, resolution considers installed versions only. Each environment is then
 precompiled once for all its units; packages that fail to precompile, or that a timeout
 leaves without package images, load from source. Preparations run side by side, but take
-turns with each Git clone in the depot, which Pkg makes and fetches into without a lock, and
-make a clone again that an interrupted preparation left broken. If a project, manifest or
-preference file of the projects an environment combines, or the project file of one of its
-path dependencies, changes during the run, the environment is prepared again before its
-next unit starts, and a unit that did not complete while it changed runs again in the new
-one; their notes name the files. Original projects, manifests, preferences and sources are
-never written, and package build scripts never run.
+turns with each Git clone in the depot, which Pkg makes and fetches into without a lock: a
+preparation locks a clone while Pkg installs a package from it, makes a new clone aside and
+moves it into place once complete, and makes a clone again that another process left
+broken. If a project, manifest or preference file of the projects an environment combines
+or of their workspace roots, the project file of another member of those workspaces, or
+the project file of one of its path dependencies changes once its preparation has started,
+the environment is prepared again before its next unit starts, and a unit that did not
+complete, other than one that ran out of time, runs again in the new one if they changed
+while it ran; their notes name the files. Original projects, manifests, preferences and
+sources are never written, and package build scripts never run.
 
 The scheduler prepares environments first, then starts the longest analyses, as measured by
 the latest report in `DIRECTORY/.jetsweep` if the same JETSweep version wrote it, or

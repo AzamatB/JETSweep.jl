@@ -109,28 +109,54 @@ const _METADATA_NAMES = (_PROJECT_FILES..., "Manifest.toml", "JuliaManifest.toml
     "LocalPreferences.toml", "JuliaLocalPreferences.toml")
 
 _digest(file::String) = isfile(file) ? bytes2hex(open(sha256, file)) : ""
+_digests(files) = Dict{String,String}(file => _digest(file) for file in files)
 
 """
 The files an environment is prepared from, whose edits can leave it out of date: the
-project, manifest and preference files of the projects its context combines and of their
-workspaces, and the project files of its path dependencies, wherever they are.
+project, manifest and preference files of the projects its context combines and of the
+workspaces they belong to, the project files of the other members of those workspaces,
+which are resolved with them, and the project files of the path dependencies that their
+sources and manifests name, wherever they are. They are digested before preparation reads
+them, so that an edit while it runs prepares the environment again; path dependencies that
+only resolution finds are added after (see `_add_resolved_inputs!`).
 """
-function _environment_inputs(context::Context, environment::Environment)
-    directories = String[]
+function _environment_inputs(context::Context)
+    directories, files = String[], String[]
     for path in (context.owner, context.project, context.test && !isempty(context.owner) ? joinpath(context.owner, "test") : "")
         isempty(path) && continue
         file = _project_file(path)
         push!(directories, file === nothing ? path : dirname(file))
-        file === nothing || append!(directories, dirname.(Base.get_projects_workspace_to_root(file)))
     end
-    files = [joinpath(directory, name) for directory in unique!(directories) for name in _METADATA_NAMES]
-    manifest = joinpath(environment.dir, "Manifest.toml")
-    if ready(environment) && isfile(manifest)
-        for entry in values(Pkg.Types.read_manifest(manifest))
-            entry.path === nothing || append!(files, joinpath.(abspath(environment.dir, entry.path), _PROJECT_FILES))
+    # Files that cannot be read now, as while they are written, fail preparation, or are
+    # read by it once written; the environment's manifest then names its path dependencies.
+    try
+        for file in _context_files(context)
+            append!(directories, dirname.(Base.get_projects_workspace_to_root(file)))
         end
+        envs = _context_envs(context)
+        append!(files, (joinpath(dirname(member), name) for env in envs for member in keys(env.workspace)
+                        for name in _PROJECT_FILES))
+        # Imports from the registry name no path dependencies; looking them up is not needed.
+        imports = filter(((_, directory),) -> !isempty(directory), context.imports)
+        project, _ = _scratch_project(Context(context.project, context.owner, context.test, context.triggers, imports), envs)
+        for entry in values(_refresh_paths!(_seed_manifest(envs), project, envs))
+            entry.path === nothing || append!(files, joinpath.(entry.path, _PROJECT_FILES))
+        end
+    catch err
+        err isa InterruptException && rethrow()
     end
-    return unique!(files)
+    return unique!([[joinpath(directory, name) for directory in unique!(directories) for name in _METADATA_NAMES]; files])
+end
+
+"Add the project files of the path dependencies of `environment`, as they are now, to `inputs` that lack them."
+function _add_resolved_inputs!(inputs::Dict{String,String}, environment::Environment)
+    manifest = joinpath(environment.dir, "Manifest.toml")
+    ready(environment) && isfile(manifest) || return inputs
+    for entry in values(Pkg.Types.read_manifest(manifest)), name in (entry.path === nothing ? () : _PROJECT_FILES)
+        file = joinpath(abspath(environment.dir, entry.path), name)
+        get!(() -> _digest(file), inputs, file)
+    end
+    return inputs
 end
 
 """
@@ -144,13 +170,13 @@ function _current!(prepare_again, prepared::_Prepared, context::Context)
     @lock prepared.lock begin
         changed = sort!([file for (file, digest) in prepared.inputs if _digest(file) != digest])
         isempty(changed) && return prepared.environment
-        inputs = Dict(file => _digest(file) for file in keys(prepared.inputs))
+        inputs = _digests(union(keys(prepared.inputs), _environment_inputs(context)))
         environment = prepare_again(prepared.preparations += 1)
         cause = join(changed, ", ") * " changed during the run"
         if ready(environment)
             prepared.environment = Environment(:ready, environment.dir,
                                                strip("It was prepared again, since $cause. " * environment.message))
-            foreach(file -> get!(() -> _digest(file), inputs, file), _environment_inputs(context, prepared.environment))
+            _add_resolved_inputs!(inputs, environment)
         else
             previous = prepared.environment
             prepared.environment = Environment(previous.status, previous.dir, strip(previous.message *
@@ -343,7 +369,9 @@ function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Unio
         "generated" => generated, "config" => _write_jetls_config(unit, directory, sweep, separate, drivers),
         "root" => sweep.inventory.root, "package" => name, "uuid" => uuid, "extension" => unit.extension,
         "triggers" => unit.context.triggers, "args" => unit.overrides.args, "env" => unit.overrides.env))
+    # A unit that runs again in an environment prepared again (see `sweep`) must not report its first result.
     result = joinpath(directory, "result.toml")
+    rm(result; force=true)
     threads = unit.kind in (:package, :extension) ? sweep.options.threads : 1
     command = julia_command(joinpath(_SCRIPTS, "analyze.jl"), [request, result]; project=environment.dir,
         threads, compile=false, env=gpu === nothing ? Dict{String,String}() : Dict("CUDA_VISIBLE_DEVICES" => gpu))
@@ -543,11 +571,10 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     function step(task::_Task)
         work = task.work
         if work isa Context
+            # What the environment is prepared from, digested before preparation reads it.
+            inputs = contained(() -> _digests(_environment_inputs(work)), _ -> Dict{String,String}())
             environment = prepared(work, _environment_directory(output, work))
-            # Inputs are compared with the sweep's start, which preparation follows.
-            inputs = contained(() -> Dict(file => get(() -> _digest(file), before, file)
-                                          for file in _environment_inputs(work, environment)),
-                               _ -> Dict{String,String}())
+            contained(() -> _add_resolved_inputs!(inputs, environment), _ -> inputs)
             environments[work] = _Prepared(environment, inputs, 1, ReentrantLock())
             return [_task(unit, previous) for unit in members[work]]
         end
