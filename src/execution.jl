@@ -93,6 +93,74 @@ function _prepare(context::Context, directory::String, options::SweepOptions)
     return Environment(Symbol(data["status"]), data["dir"], message)
 end
 
+"""
+A context's environment and the digests of the files it was prepared from (see
+`_environment_inputs`), which are checked before each of its units runs.
+"""
+mutable struct _Prepared
+    environment::Environment
+    inputs::Dict{String,String}
+    preparations::Int
+    const lock::ReentrantLock
+end
+
+const _METADATA_NAMES = (_PROJECT_FILES..., "Manifest.toml", "JuliaManifest.toml",
+    "Manifest-v$(VERSION.major).$(VERSION.minor).toml", "JuliaManifest-v$(VERSION.major).$(VERSION.minor).toml",
+    "LocalPreferences.toml", "JuliaLocalPreferences.toml")
+
+_digest(file::String) = isfile(file) ? bytes2hex(open(sha256, file)) : ""
+
+"""
+The files an environment is prepared from, whose edits can leave it out of date: the
+project, manifest and preference files of the projects its context combines and of their
+workspaces, and the project files of its path dependencies, wherever they are.
+"""
+function _environment_inputs(context::Context, environment::Environment)
+    directories = String[]
+    for path in (context.owner, context.project, context.test && !isempty(context.owner) ? joinpath(context.owner, "test") : "")
+        isempty(path) && continue
+        file = _project_file(path)
+        push!(directories, file === nothing ? path : dirname(file))
+        file === nothing || append!(directories, dirname.(Base.get_projects_workspace_to_root(file)))
+    end
+    files = [joinpath(directory, name) for directory in unique!(directories) for name in _METADATA_NAMES]
+    manifest = joinpath(environment.dir, "Manifest.toml")
+    if ready(environment) && isfile(manifest)
+        for entry in values(Pkg.Types.read_manifest(manifest))
+            entry.path === nothing || append!(files, joinpath.(abspath(environment.dir, entry.path), _PROJECT_FILES))
+        end
+    end
+    return unique!(files)
+end
+
+"""
+The environment for the next unit of a context: the one prepared, or, if files it was
+prepared from have changed since, one that `prepare_again(n)` prepares from them, for the
+`n`th time. Units that ran after such an edit would otherwise load code that their
+environment does not match, such as a path dependency that now imports a package its old
+dependencies leave out. If preparing again fails, units keep the environment they had.
+"""
+function _current!(prepare_again, prepared::_Prepared, context::Context)
+    @lock prepared.lock begin
+        changed = sort!([file for (file, digest) in prepared.inputs if _digest(file) != digest])
+        isempty(changed) && return prepared.environment
+        inputs = Dict(file => _digest(file) for file in keys(prepared.inputs))
+        environment = prepare_again(prepared.preparations += 1)
+        cause = join(changed, ", ") * " changed during the run"
+        if ready(environment)
+            prepared.environment = Environment(:ready, environment.dir,
+                                               strip("It was prepared again, since $cause. " * environment.message))
+            foreach(file -> get!(() -> _digest(file), inputs, file), _environment_inputs(context, prepared.environment))
+        else
+            previous = prepared.environment
+            prepared.environment = Environment(previous.status, previous.dir, strip(previous.message *
+                " Preparing it again, since $cause, failed: " * first(split(environment.message, '\n'))))
+        end
+        prepared.inputs = inputs
+        return prepared.environment
+    end
+end
+
 # Units
 # =====
 
@@ -452,7 +520,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     foreach(unit -> isempty(unit.driver) || push!(get!(separate, unit.driver, String[]), unit.entry), units)
     state = _Sweep(inventory, output, options, syntax, Dict(unit.entry => unit for unit in units if unit.kind === :test),
                    separate, Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
-    environments = Dict{Context,Environment}()
+    environments = Dict{Context,_Prepared}()
     results = Dict{String,UnitResult}()
     # Files some unit's entry already covers need no follow-up units of their own.
     planned = Set(unit.entry for unit in units)
@@ -464,18 +532,37 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
         err isa InterruptException && rethrow()
         failed(sprint(showerror, err))
     end
+    prepared(context, directory) = contained(() -> _prepare(context, directory, options),
+                                             message -> Environment(:failed, directory, message))
+    # Checking inputs that are being written can fail; the unit then keeps the environment.
+    current(context) = contained(_ -> environments[context].environment) do
+        _current!(environments[context], context) do n
+            prepared(context, "$(_environment_directory(output, context))-$n")
+        end
+    end
     function step(task::_Task)
         work = task.work
         if work isa Context
-            directory = _environment_directory(output, work)
-            environments[work] = contained(() -> _prepare(work, directory, options),
-                                           message -> Environment(:failed, directory, message))
+            environment = prepared(work, _environment_directory(output, work))
+            # Inputs are compared with the sweep's start, which preparation follows.
+            inputs = contained(() -> Dict(file => get(() -> _digest(file), before, file)
+                                          for file in _environment_inputs(work, environment)),
+                               _ -> Dict{String,String}())
+            environments[work] = _Prepared(environment, inputs, 1, ReentrantLock())
             return [_task(unit, previous) for unit in members[work]]
         end
         gpu = isempty(gpus) ? nothing : gpus[mod1(started_units[] += 1, length(gpus))]
-        outcome = contained(() -> _analyze(work, environments[work.context], state, gpu),
-                            message -> UnitResult(work.id, :failed, Finding[], String[], [message],
-                                                  _notes(work, environments[work.context]), 0.0, ""))
+        analyzed(environment) = contained(() -> _analyze(work, environment, state, gpu),
+                                          message -> UnitResult(work.id, :failed, Finding[], String[], [message],
+                                                                _notes(work, environment), 0.0, ""))
+        environment = current(work.context)
+        outcome = analyzed(environment)
+        # A unit that did not complete while its environment's inputs changed runs once more, in
+        # an environment prepared from them; one that ran out of time does not.
+        if !complete(outcome) && outcome.status !== :timeout
+            again = current(work.context)
+            again.dir == environment.dir || (outcome = analyzed(again))
+        end
         results[work.id] = outcome
         report_progress(io, work, outcome, length(results), length(units), root)
         followups = _followups(work, outcome, state, planned)

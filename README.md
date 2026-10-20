@@ -168,6 +168,8 @@ extension triggers, `[sources]`, workspaces, compat bounds and effective prefere
 the analyzer resolved alongside, so that packages both use, such as Revise, have one version.
 Existing manifests seed the resolution, keeping locked versions where they are consistent;
 when they are not, the environment is re-resolved and the units' notes say what changed.
+As in Pkg, a path dependency depends on what its project declares, whatever a manifest
+recorded of it.
 Scripts and tests that import packages their projects do not declare, because they run
 with another project active or rely on their workspace, get those packages added: packages
 of the workspace from their directories, others from the registry. If they cannot all be
@@ -176,8 +178,14 @@ notes name the packages added and those left out. Modules the tree defines that 
 packages, as scripts load through `LOAD_PATH`, are not looked up. With
 `--offline`, resolution considers installed versions only. Each environment is then
 precompiled once for all its units; packages that fail to precompile, or that a timeout
-leaves without package images, load from source. Original projects, manifests, preferences
-and sources are never written, and package build scripts never run.
+leaves without package images, load from source. Preparations run side by side, but take
+turns with each Git clone in the depot, which Pkg makes and fetches into without a lock, and
+make a clone again that an interrupted preparation left broken. If a project, manifest or
+preference file of the projects an environment combines, or the project file of one of its
+path dependencies, changes during the run, the environment is prepared again before its
+next unit starts, and a unit that did not complete while it changed runs again in the new
+one; their notes name the files. Original projects, manifests, preferences and sources are
+never written, and package build scripts never run.
 
 The scheduler prepares environments first, then starts the longest analyses, as measured by
 the latest report in `DIRECTORY/.jetsweep` if the same JETSweep version wrote it, or

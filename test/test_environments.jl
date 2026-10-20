@@ -414,6 +414,30 @@ end
     end
 end
 
+@testset "a path dependency's dependencies come from its project, not from a dependent's manifest" begin
+    _environments_sandbox() do root, envs
+        printf, random = "de0858da-6303-5e67-8744-51eddeeeb8d7", "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+        unicode = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
+        # The dependency imports Random now; its dependent's manifest was resolved when it imported Printf.
+        _, switched_uuid = _environments_package(root, "SwitchedHelper"; deps=Dict("Random" => random),
+                                                 body="using Random\nvalue() = 42")
+        parent, _ = _environments_package(root, "LaggingParent"; deps=Dict("SwitchedHelper" => switched_uuid),
+            sources=Dict("SwitchedHelper" => Dict("path" => "../SwitchedHelper")),
+            body="using SwitchedHelper\nvalue() = SwitchedHelper.value()")
+        _environments_seed(joinpath(parent, "Manifest.toml"),
+            _environments_entry("SwitchedHelper", switched_uuid; path="../SwitchedHelper",
+                                deps=Dict("Printf" => UUID(printf))),
+            _environments_entry("Printf", printf; version=v"1.11.0", deps=Dict("Unicode" => UUID(unicode))),
+            _environments_entry("Unicode", unicode; version=v"1.11.0"))
+        before = _environments_snapshot(root)
+        environment = _environments_prepare(_environments_context(parent), joinpath(envs, "switched"))
+        @test environment == _environments_ready(joinpath(envs, "switched"))
+        @test _environments_snapshot(root) == before
+        @test _environments_manifest(environment)[UUID(switched_uuid)].deps == Dict("Random" => UUID(random))
+        @test _environments_run(environment, "using LaggingParent; print(LaggingParent.value())") == "42"
+    end
+end
+
 @testset "explicit sources override stale manifest locations" begin
     _environments_sandbox() do root, envs
         helper, helper_uuid = _environments_package(root, "ChosenHelper")
@@ -453,6 +477,53 @@ end
         for url in ("https://example.invalid/R.jl", "git@example.invalid:org/R.jl.git", "file:///srv/R.jl")
             @test JETSweep._source(Dict("url" => url), parent) == Dict("url" => url)
         end
+    end
+end
+
+@testset "preparations side by side clone a shared Git source once, and make a broken clone again" begin
+    git = Sys.which("git")::String
+    _environments_sandbox() do root, envs
+        repository = joinpath(root, "SharedRepository")
+        _, shared_uuid = _environments_package(repository, "SharedTool")
+        revision = LibGit2.with(repo -> _environments_commit(repo, "Fixture"), LibGit2.init(repository))
+        url = "file://" * repository
+        sharers = [first(_environments_package(root, "Sharer$i"; deps=Dict("SharedTool" => shared_uuid),
+                       sources=Dict("SharedTool" => Dict("url" => url, "rev" => revision, "subdir" => "SharedTool"))))
+                   for i in 1:3]
+        # A Git whose clones get their objects after a while, so that clones started together overlap,
+        # as first clones over a network do. Pkg uses the Git command line when asked to.
+        bin = mkpath(joinpath(root, "bin"))
+        write(joinpath(bin, "git"), """
+            #!/bin/sh
+            if [ "\$1" = clone ]; then shift; exec '$git' clone -u 'sleep 3; git-upload-pack' "\$@"; fi
+            exec '$git' "\$@"
+            """)
+        chmod(joinpath(bin, "git"), 0o755)
+        # Each depot is empty but for the clones it gets; the user's depots provide the registries and analyzer.
+        depots(depot) = join([depot; DEPOT_PATH], ':')
+        prepared(sharer, name) = JETSweep._prepare(_environments_context(sharer), joinpath(envs, name), SweepOptions())
+        depot = mkpath(joinpath(root, "depot"))
+        environments = withenv("JULIA_DEPOT_PATH" => depots(depot), "JULIA_PKG_USE_CLI_GIT" => "true",
+                               "PATH" => bin * ':' * ENV["PATH"]) do
+            asyncmap(i -> prepared(sharers[i], "sharer$i"), eachindex(sharers))
+        end
+        @test [environment.status for environment in environments] == [:ready, :ready, :ready]
+        @test all(environment -> isempty(environment.message), environments)
+        clone = joinpath(depot, "clones", string(hash(url)))
+        @test JETSweep._valid_clone(clone)
+        @test !ispath(clone * ".pid")
+
+        # A clone that a killed preparation left half made, with Git's placeholder HEAD, is made again.
+        depot = mkpath(joinpath(root, "killed"))
+        broken = joinpath(depot, "clones", string(hash(url)))
+        run(`$git init --quiet --bare $broken`)
+        write(joinpath(broken, "HEAD"), "ref: refs/heads/.invalid\n")
+        @test !JETSweep._valid_clone(broken)
+        environment = withenv(() -> prepared(sharers[1], "repaired"), "JULIA_DEPOT_PATH" => depots(depot))
+        @test environment == _environments_ready(joinpath(envs, "repaired", "env"))
+        @test JETSweep._valid_clone(broken)
+        @test withenv(() -> _environments_run(environment, "using Sharer1, SharedTool; print(SharedTool.value())"),
+                      "JULIA_DEPOT_PATH" => depots(depot)) == "42"
     end
 end
 

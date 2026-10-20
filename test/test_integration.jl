@@ -553,6 +553,57 @@ end
     end
 end
 
+@testset "environments are prepared again when what they were prepared from changes during the run" begin
+    mktempdir() do directory
+        root = mkpath(joinpath(directory, "workspace"))
+        file(path, text) = (mkpath(dirname(joinpath(root, path))); write(joinpath(root, path), text))
+        helper = "0b0d6c7e-5d5c-4b8e-9f1e-3f1b1ad2c0de"
+        helper_project(deps) = "name = \"Helper\"\nuuid = \"$helper\"\nversion = \"0.1.0\"\n$deps"
+        file("Helper/Project.toml", helper_project(""))
+        file("Helper/src/Helper.jl", "module Helper\nvalue() = 1\nend\n")
+        file("Dependent/Project.toml", """
+            name = "Dependent"
+            uuid = "7a4f2e61-3c1d-4f0b-8e2a-9d5c6b7a8e10"
+            version = "0.1.0"
+
+            [deps]
+            Helper = "$helper"
+
+            [sources]
+            Helper = {path = "../Helper"}
+            """)
+        file("Dependent/src/Dependent.jl", "module Dependent\nusing Helper\nvalue() = Helper.value()\nend\n")
+        # Loading Mutator, whose analysis is the longest and so runs first, after every environment is
+        # prepared, makes Helper import Random, as an edit during the run would.
+        file("Mutator/Project.toml", "name = \"Mutator\"\nuuid = \"c3e9a1b2-6f4d-4e8a-b0c7-1d2e3f4a5b6c\"\nversion = \"0.1.0\"\n")
+        file("Mutator/src/Mutator.jl", """
+            module Mutator
+            $(repeat("# Padding that makes this the longest analysis.\n", 1000))
+            function __init__()
+                get(ENV, "MUTATE_HELPER", "") == "1" || return
+                helper = joinpath(@__DIR__, "..", "..", "Helper")
+                write(joinpath(helper, "Project.toml"), $(repr(helper_project("\n[deps]\nRandom = \"9a3f8284-a2c9-5f02-9a11-845980a1fd5c\"\n"))))
+                write(joinpath(helper, "src", "Helper.jl"), "module Helper\\nusing Random\\nvalue() = 2\\nend\\n")
+            end
+            end
+            """)
+        file(".JETSweep.toml", "[[context]]\nmatch = \"Mutator/src/Mutator.jl\"\nenv = { MUTATE_HELPER = \"1\" }\n")
+        result = sweep(root; options=SweepOptions(jobs=1, threads=1, gpus=["none"], timeout=900.0,
+                                                  output=joinpath(directory, "report")), io=devnull)
+        outcome(name) = integration_status(result, realpath(joinpath(root, name, "src", "$name.jl")))
+        notes(name) = only(r.notes for (u, r) in zip(result.units, result.results) if endswith(u.entry, "$name.jl"))
+        @test occursin("using Random", read(joinpath(root, "Helper", "src", "Helper.jl"), String))
+        # Without preparing them again, both fail to load: "Cannot load module Random into module Helper".
+        again(name) = any(note -> startswith(note, "environment: It was prepared again, since ") &&
+                                  endswith(note, "/Helper/Project.toml changed during the run."), notes(name))
+        @test outcome("Dependent") === :clean && again("Dependent")
+        @test outcome("Helper") === :clean && again("Helper")
+        @test outcome("Mutator") === :clean && isempty(notes("Mutator"))
+        @test realpath(joinpath(root, "Helper", "Project.toml")) in result.changed
+        @test result.exit_code == 2
+    end
+end
+
 @testset "plan only" begin
     mktempdir() do directory
         root = integration_copy(directory)

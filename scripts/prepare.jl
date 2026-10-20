@@ -6,6 +6,8 @@
 # without package images: an environment whose precompilation runs out of time stays usable.
 using JETSweep, TOML
 
+# Preparations run side by side and share the depot's Git clones.
+JETSweep.lock_clones!()
 request = TOML.parsefile(ARGS[1])
 context = JETSweep.Context(request["project"], request["owner"], request["test"],
                            Dict{String,String}(request["triggers"]), Dict{String,String}(request["imports"]))

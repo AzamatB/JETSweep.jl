@@ -288,10 +288,68 @@ function _unavailable(env)
 end
 
 """
+The lock on the Git clone in the depot that this process last worked in, while it holds it.
+Pkg clones a package's repository into the depot the first time it needs it, and fetches
+into that clone later, without a lock. Preparations run side by side, each in its own
+process, so they would clone into the same directory at once: one finds the other's clone
+half made, with Git's placeholder HEAD `refs/heads/.invalid`, and fails, or deletes it.
+"""
+const _CLONE_LOCK = Ref{Any}(nothing)
+
+function _release_clone!()
+    lock, _CLONE_LOCK[] = _CLONE_LOCK[], nothing
+    lock === nothing || close(lock)
+    return nothing
+end
+
+"Whether the clone at `path` is a repository with a valid HEAD, as Pkg requires."
+function _valid_clone(path::String)
+    try
+        return LibGit2.with(repo -> (close(LibGit2.head(repo)); true), LibGit2.GitRepo(path))
+    catch err
+        err isa LibGit2.GitError || rethrow()
+        return false
+    end
+end
+
+"""
+Pkg's `ensure_clone`, which opens a clone or makes it, with the clone locked against other
+processes until this one opens another or Pkg is done with it (see `_resolve!`). Pkg works
+in one clone at a time, from opening it to fetching and checking out what it needs, so
+this process waits for a lock while holding none. A holder refreshes its lock; one that
+died, as a preparation that timed out does, leaves it stale after a minute, and its broken
+clone is made again.
+"""
+function _ensure_clone(io::IO, target_path, url; kwargs...)
+    _release_clone!()
+    target = String(target_path)
+    mkpath(dirname(target))
+    _CLONE_LOCK[] = FileWatching.mkpidlock(target * ".pid"; stale_age=60)
+    ispath(target) && !_valid_clone(target) && rm(target; recursive=true, force=true)
+    return ispath(target) ? LibGit2.GitRepo(target) : Pkg.GitTools.clone(io, url, target; kwargs...)
+end
+
+"""
+Make Pkg lock its Git clones in this process, as JETSweep's preparation processes do (see
+`_ensure_clone`). Pkg's own processes, and those preparing environments with `prepare`
+directly, do not take these locks.
+"""
+lock_clones!() = Core.eval(Pkg.GitTools, :(ensure_clone(io::IO, target_path, url; kwargs...) =
+                                               $_ensure_clone(io, target_path, url; kwargs...)))
+
+"""
 Resolve and download with Pkg's own stages, stopping before the build step that
 `Pkg.resolve` would run. `exact` keeps the seed manifest's versions.
 """
 function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool)
+    try
+        _resolve_stages!(ctx; exact, download)
+    finally
+        _release_clone!()
+    end
+end
+
+function _resolve_stages!(ctx::Pkg.Types.Context; exact::Bool, download::Bool)
     ops = Pkg.Operations
     ops.prune_manifest(ctx.env)
     packages = Pkg.Types.PackageSpec[]
@@ -309,6 +367,7 @@ function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool)
         end
         ops.up_load_versions!(ctx, package, get(ctx.env.manifest, identity.uuid, nothing), path, repo,
                               exact ? Pkg.UPLEVEL_FIXED : Pkg.UPLEVEL_MAJOR)
+        _release_clone!()   # Pkg has fetched what this package needs, if anything
     end
     for package in packages
         ops.up_load_manifest_info!(package, get(ctx.env.manifest, package.uuid, nothing))
@@ -316,8 +375,11 @@ function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool)
     packages = ops.load_direct_deps(ctx.env, packages; preserve=exact ? Pkg.PRESERVE_NONE : Pkg.PRESERVE_DIRECT)
     ops.check_registered(ctx.registries, packages)
     dependencies = ops.resolve_versions!(ctx.env, ctx.registries, packages, ctx.julia_version, false)
+    # Git-tracked packages are installed now; registered ones that Pkg cannot download as
+    # archives are installed from clones below, which downloading artifacts must not hold up.
+    _release_clone!()
     ops.update_manifest!(ctx.env, packages, dependencies, ctx.julia_version, ctx.registries)
-    download && ops.download_source(ctx)
+    download && (ops.download_source(ctx); _release_clone!())
     ops.fixups_from_projectfile!(ctx)
     download && ops.download_artifacts(ctx; julia_version=ctx.julia_version)
     _supply_revise!(ctx.env.manifest)

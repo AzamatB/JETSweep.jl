@@ -5,6 +5,7 @@ directory, with each analysis in its own process. See [`sweep`](@ref).
 module JETSweep
 
 using Base: UUID
+using FileWatching
 using LibGit2
 using Pkg
 using SHA
