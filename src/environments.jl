@@ -287,6 +287,154 @@ function _unavailable(env)
     return ""
 end
 
+# Git clones
+# ==========
+# Pkg clones a package's repository into the depot's `clones` directory the first time it
+# needs it, and fetches into that clone later, without a lock. Preparations run side by side,
+# each in its own process, so they would clone into the same directory at once: one finds the
+# other's clone half made, with Git's placeholder HEAD `refs/heads/.invalid`, and fails, or
+# deletes it. Preparation processes therefore lock each clone while Pkg works in it (see
+# `lock_clones!`).
+
+"The lock files of the depot clones this process holds, by clone."
+const _CLONE_LOCKS = Dict{String,IOStream}()
+
+"The clones that the Pkg call this task is in has locked, which it unlocks when it returns."
+const _CLONE_SCOPE = Base.ScopedValues.ScopedValue{Union{Nothing,Vector{String}}}(nothing)
+
+const _LOCK_EX_NB = Cint(2 | 4)   # flock(2)'s LOCK_EX | LOCK_NB, on Linux and macOS alike
+
+"""
+Take the lock on the clone `target`: an `flock` on `target.lock`, which needs no refreshing
+however long its holder blocks, and which the kernel releases when the holder dies. This
+process polls for it, so that it keeps refreshing Pkg's own locks while it waits. A holder
+removes the file before it unlocks it, so a lock taken on a file that is no longer there
+is none, and is taken again.
+"""
+function _lock_clone(target::String)
+    file = target * ".lock"
+    while true
+        stream = open(file, "w")
+        result = ccall(:flock, Cint, (Cint, Cint), fd(stream), _LOCK_EX_NB)
+        errno = Libc.errno()
+        if result == 0
+            status, locked = stat(file), stat(stream)
+            if (status.device, status.inode) == (locked.device, locked.inode)
+                _CLONE_LOCKS[target] = stream
+                return nothing
+            end
+        elseif errno != Libc.EAGAIN && errno != Libc.EINTR
+            close(stream)
+            systemerror("locking $file", errno)
+        end
+        close(stream)
+        result == 0 || sleep(0.5)
+    end
+end
+
+function _unlock_clone(target::String)
+    stream = pop!(_CLONE_LOCKS, target)
+    rm(target * ".lock"; force=true)
+    close(stream)   # which unlocks it
+    return nothing
+end
+
+"""
+Whether `path` holds a clone Pkg can use. A clone that was stopped before it ended is not a
+repository yet, has no references, which Git writes once it has the objects, or has Git's
+placeholder HEAD. A clone whose HEAD names a branch its remote lacks is complete.
+"""
+function _valid_clone(path::String)
+    try
+        return LibGit2.with(LibGit2.GitRepo(path)) do repo
+            !isempty(LibGit2.ref_list(repo)) &&
+                LibGit2.with(LibGit2.fullname, LibGit2.GitReference(repo, "HEAD")) != "refs/heads/.invalid"
+        end
+    catch err
+        err isa LibGit2.GitError || rethrow()
+        return false
+    end
+end
+
+"""
+Open the clone at `target`, which this process has locked, or make it: a broken clone, which
+a process that is not a JETSweep preparation can leave, is made again. A clone is made in
+`target.partial` and moved into place once complete, so `target` is never half made, and
+Pkg's cleanup of a clone that fails removes only that directory; one that a killed
+preparation left there is removed first.
+"""
+function _open_clone(io::IO, target::String, url; kwargs...)
+    partial = target * ".partial"
+    rm(partial; recursive=true, force=true)
+    ispath(target) && !_valid_clone(target) && rm(target; recursive=true, force=true)
+    ispath(target) && return LibGit2.GitRepo(target)
+    LibGit2.close(Pkg.GitTools.clone(io, url, partial; kwargs...))
+    mv(partial, target)
+    return LibGit2.GitRepo(target)
+end
+
+"""
+Pkg's `ensure_clone`, which opens a clone or makes it, with a clone of a depot's `clones`
+directory locked against other processes: by the Pkg call this task is in until it returns
+(see `lock_clones!`), or else while it is opened or made. Clones elsewhere, as `Pkg.develop`
+makes, are not locked.
+"""
+function _ensure_clone(io::IO, target_path, url; kwargs...)
+    target = String(target_path)
+    if !any(depot -> dirname(abspath(target)) == abspath(depot, "clones"), DEPOT_PATH)
+        return ispath(target) ? LibGit2.GitRepo(target) : Pkg.GitTools.clone(io, url, target; kwargs...)
+    end
+    scope = _CLONE_SCOPE[]
+    locks = !haskey(_CLONE_LOCKS, target)
+    if locks
+        mkpath(dirname(target))
+        _lock_clone(target)
+        scope === nothing || push!(scope, target)
+    end
+    try
+        return _open_clone(io, target, url; kwargs...)
+    finally
+        locks && scope === nothing && _unlock_clone(target)
+    end
+end
+
+"Run `f`, a Pkg call, unlocking the clones it locks when it returns."
+function _with_clones(f)
+    scope = String[]
+    try
+        return Base.ScopedValues.with(f, _CLONE_SCOPE => scope)
+    finally
+        foreach(_unlock_clone, scope)
+    end
+end
+
+const _CLONES_LOCKED = Ref(false)
+
+"""
+Make Pkg lock its Git clones in this process, as JETSweep's preparation processes do (see
+`_ensure_clone`). The Pkg calls that preparation makes and that use a clone, which install
+a package from its repository, hold its lock until they return: one clone at a time, and
+never while they wait for another lock, such as Pkg's lock on a package it installs, so
+that preparations cannot wait for each other in a cycle. Other Pkg calls hold a clone's
+lock while it is opened or made. Pkg's own processes, and those preparing environments with
+`prepare` directly, take none of these locks, nor do processes on systems without `flock`.
+"""
+function lock_clones!()
+    (_CLONES_LOCKED[] || !Sys.isunix()) && return nothing
+    Core.eval(Pkg.GitTools, :(ensure_clone(io::IO, target_path, url; kwargs...) =
+                                  $_ensure_clone(io, target_path, url; kwargs...)))
+    # Each replaces the method with one of its signature that calls the original.
+    for f in (Pkg.Operations.install_git, Pkg.Types.handle_repo_add!)
+        method = only(methods(f))
+        arguments = [Symbol(:argument, i) for i in 2:length(method.sig.parameters)]
+        signature = [:($name::$type) for (name, type) in zip(arguments, method.sig.parameters[2:end])]
+        Core.eval(method.module, :($(method.name)($(signature...)) =
+                                       $_with_clones(() -> $invoke($f, $method, $(arguments...)))))
+    end
+    _CLONES_LOCKED[] = true
+    return nothing
+end
+
 """
 Resolve and download with Pkg's own stages, stopping before the build step that
 `Pkg.resolve` would run. `exact` keeps the seed manifest's versions.

@@ -8,10 +8,13 @@ write_tag(directory::String) = write(joinpath(directory, "CACHEDIR.TAG"), _CACHE
     """)
 
 function write_inventory(file::String, inventory::Inventory)
+    project(p::Project) = Dict("dir" => p.dir, "file" => p.file, "name" => p.name, "uuid" => p.uuid,
+                               "entry" => p.entry, "extensions" => p.extensions)
     _write_toml(file, Dict(
         "root" => inventory.root,
-        "projects" => [Dict("dir" => p.dir, "file" => p.file, "name" => p.name, "uuid" => p.uuid,
-                            "entry" => p.entry, "extensions" => p.extensions) for p in inventory.projects],
+        "projects" => project.(inventory.projects),
+        # Packages the sweep leaves out but code may load; those the configuration excludes come last.
+        "available" => [merge(project(p), Dict("tier" => tier)) for (tier, ps) in enumerate(inventory.available) for p in ps],
         "sources" => [Dict("path" => s.path, "kind" => String(s.kind), "project" => s.project, "owner" => s.owner)
                       for s in inventory.sources],
         "excluded" => inventory.excluded, "issues" => inventory.issues))
@@ -27,8 +30,8 @@ function _unit_dict(unit::Unit)
         "jetls_config" => unit.overrides.jetls_config, "notes" => unit.notes)
 end
 
-write_plan(file::String, units::Vector{Unit}, root::String) =
-    _write_toml(file, Dict("root" => root, "units" => _unit_dict.(units)))
+write_plan(file::String, units::Vector{Unit}, root::String, notes::Vector{String}=String[]) =
+    _write_toml(file, Dict("root" => root, "notes" => notes, "units" => _unit_dict.(units)))
 
 function report_progress(io::IO, unit::Unit, result::UnitResult, done::Int, total::Int, root::String)
     detail = if !complete(result)
@@ -42,8 +45,10 @@ function report_progress(io::IO, unit::Unit, result::UnitResult, done::Int, tota
     flush(io)
 end
 
-report_issues(io::IO, inventory::Inventory) =
+function report_issues(io::IO, inventory::Inventory, notes::Vector{String}=String[])
     foreach(issue -> println(io, "Discovery issue: ", _relative(issue, inventory.root)), inventory.issues)
+    foreach(note -> println(io, "Note: ", _relative(note, inventory.root)), notes)
+end
 
 "Findings deduplicated across units, which can analyze the same file."
 function unique_findings(results::Vector{UnitResult})
@@ -77,7 +82,7 @@ function write_report(result::SweepResult; io::IO=stderr)
         "root" => root, "julia" => string(VERSION), "jetsweep" => string(pkgversion(@__MODULE__)),
         "seconds" => result.seconds, "exit_code" => result.exit_code,
         "files" => length(result.inventory.sources), "units" => length(result.units), "statuses" => statuses,
-        "discovery_issues" => result.inventory.issues, "changed_during_run" => result.changed,
+        "discovery_issues" => result.inventory.issues, "notes" => result.notes, "changed_during_run" => result.changed,
         "unanalyzed" => unanalyzed,
         "results" => [Dict("unit" => r.unit, "kind" => String(byid[r.unit].kind), "entry" => byid[r.unit].entry,
                            "status" => String(r.status), "seconds" => r.seconds, "findings" => length(r.findings),
@@ -123,7 +128,7 @@ function _summarize(io::IO, result::SweepResult, findings, statuses, severities,
     for (code, n) in first(sort!(collect(codes); by=last, rev=true), 10)
         println(io, "  ", lpad(n, 6), "  ", code)
     end
-    report_issues(io, result.inventory)
+    report_issues(io, result.inventory, result.notes)
     for file in result.changed
         println(io, "Changed during the run: ", _display(file, root))
     end

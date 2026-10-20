@@ -134,6 +134,40 @@ end
             const RUN = isempty(ASKED) ? ["a"] : filter(name -> name in ASKED, ["a"])
             selected() = RUN
             """)
+        # Nor is the selection of what a driver skips before an include, as DispatchCheckup's
+        # skip of its `original=` files is.
+        write(joinpath(root, "skipping.jl"), """
+            const FILES = ["skipping_a.txt", "skipping_b.txt"]
+            const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)
+            const ORIGINAL = filter(==("skipping_b.txt"), RUN)
+            for file in RUN
+                file in ORIGINAL && get(ENV, "DISPATCH_CHECKUP", "") == "checked" && continue
+                include(file)
+            end
+            """)
+        write(joinpath(root, "skipping_a.txt"), "skipped_a() = 1 + \"a\"\n")
+        write(joinpath(root, "skipping_b.txt"), "skipped_b() = 2 + \"b\"\n")
+        write(joinpath(root, "jumping.jl"), """
+            const FILES = ["skipping_a.txt", "skipping_b.txt"]
+            const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)
+            const ORIGINAL = filter(==("skipping_b.txt"), RUN)
+            for file in RUN
+                file in ORIGINAL && get(ENV, "DISPATCH_CHECKUP", "") == "checked" && @goto skip
+                include(file)
+                @label skip
+            end
+            """)
+        # A `return` in a task ends only the task, so what decides it is not run.
+        write(joinpath(root, "tasked.jl"), """
+            const FILES = ["skipping_a.txt"]
+            const DONE = (touch(joinpath(@__DIR__, "tasked.marker")); error("needs a cluster"))
+            @sync for file in FILES
+                @async begin
+                    file in DONE && return
+                end
+                include(file)
+            end
+            """)
         # A script loads a package of its workspace that no project of it declares.
         mkpath(joinpath(root, "Sibling", "src"))
         write(joinpath(root, "Sibling", "Project.toml"),
@@ -233,6 +267,255 @@ end
                 @test r.ok && [a.b for a in r.items] == [1]
             end
             """)
+        # Tiers whose other branch logs, or whose tests stand in a `let` block, are analyzed
+        # whatever their conditions.
+        write(joinpath(root, "tiers.jl"), """
+            using Test
+            if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                @testset "logged" begin
+                    foreach(x -> println(x), 1:2)
+                    sin("logged")
+                end
+            else
+                @info "skipped"
+            end
+            if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                println("setup")
+                let n = 2
+                    @testset "scoped" begin
+                        foreach(x -> println(x + n), 1:n)
+                        cos("scoped")
+                    end
+                end
+            end
+            """)
+        # Nor do closures under control flow in a test set make JETLS run its statements or
+        # leave them undefined.
+        write(joinpath(root, "testsets.jl"), """
+            using Test
+            const RAN = joinpath(@__DIR__, "testsets.marker")
+            items() = (touch(RAN); [1, 2])
+            @testset "a branch" begin
+                if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                    foreach(x -> println(x), 1:2)
+                    sin("branch")
+                end
+            end
+            @testset "closures of the test set's values in a loop" begin
+                xs = items()
+                for (f, n) in ((() -> xs[1] + 1, 1), (() -> xs[2] + 1, 2))
+                    try
+                        @test f() > n
+                    finally
+                        nothing
+                    end
+                end
+                tan("loop")
+            end
+            """)
+        # A conditional that binds names, as a driver's selection of its files does, has the
+        # test sets in it that define closures under control flow analyzed by themselves,
+        # whichever branch runs, and finds what a branch defines defined after it.
+        write(joinpath(root, "driver.jl"), """
+            using Test
+            if !isempty(ARGS)
+                include(ARGS[1])
+            else
+                helper(x) = x + 1
+                @testset "all" begin
+                    @test helper(1) == 2
+                    if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                        foreach(x -> println(x), 1:2)
+                        sin("tier")
+                    end
+                end
+            end
+            if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                tiered() = 1
+                @testset "untaken" begin
+                    if isempty(ARGS)
+                        foreach(x -> println(x), 1:2)
+                        cos("untaken")
+                    end
+                end
+            end
+            """)
+        # The constants of a statement JETLS leaves unevaluated are all bound, also after a
+        # closure in a loop, with what JETLS knows of them; and code after it is analyzed.
+        write(joinpath(root, "constants.jl"), """
+            parsed(args) = (isempty(args) ? "mode" : args[1], "out.json")
+            const MODE, OUT = parsed(ARGS)
+            out() = sin(OUT)
+            const CONTRACT_ONLY = get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+            if !CONTRACT_ONLY
+                const ROOT = joinpath(@__DIR__, MODE)
+                const LANE = isempty(MODE) ? "default" : MODE
+                const REPORTS = string(ROOT, "/", LANE)
+            end
+            reports() = REPORTS
+            report_count() = reports() + 1
+            untyped() = Base.inferencebarrier(1)::Any
+            const VALUE = untyped()
+            value() = VALUE
+            use_value() = sin(value())
+            let
+                for x in 1:2
+                    f = y -> y + x
+                end
+                tan("after the loop")
+            end
+            """)
+        # What only top-level code may hold keeps the local scope holding it at top level,
+        # however JETLS would analyze the closures in it there; code that evaluates code too.
+        write(joinpath(root, "toplevel.jl"), """
+            using Test
+            struct Shown end
+            let
+                struct Local
+                    x::Int
+                end
+                isempty(ARGS) || foreach(x -> println(x), ARGS)
+            end
+            use_local() = Local(1).x + "one"
+            @testset "methods of functions that are not local" begin
+                Base.show(io::IO, ::Shown) = print(io, "S")
+                global const LIMIT = 3
+                for x in [Shown()]
+                    x isa Shown && @test all(c -> c != 'x' && LIMIT > 0, sprint(show, x))
+                end
+                sin("shown")
+            end
+            try
+                global handler(x) = x + 1
+                for i in 1:2
+                    g = () -> i
+                end
+            catch
+            end
+            handler("one")
+            for name in (:alpha,)
+                name === :alpha && foreach(x -> x, 1:2)
+                Base.@eval generated() = 1
+            end
+            generated() + "one"
+            """)
+        # A test that always fails in a statement moved out of a conditional is reported, as at
+        # top level.
+        write(joinpath(root, "failing.jl"), """
+            using Test
+            if isempty(ARGS)
+                helper() = 1
+                for n in 1:2
+                    @test n
+                    n > 1 && foreach(x -> println(x), 1:n)
+                end
+            end
+            """)
+        # A condition on values such as `@__FILE__` binds nothing either.
+        write(joinpath(root, "program.jl"), """
+            if basename(@__FILE__) == "never.jl"
+                let n = 2
+                    foreach(x -> println(x + n), 1:n)
+                    sin("program")
+                end
+            end
+            """)
+        # Nor does a closure in a branch of a top-level `try` block make JETLS run the block.
+        write(joinpath(root, "tried.jl"), """
+            const TRIED = joinpath(@__DIR__, "tried.marker")
+            items() = (touch(TRIED); [1, 2])
+            try
+                xs = items()
+                isempty(xs) || foreach(x -> println(x), xs)
+                cos("tried")
+            catch
+            end
+            """)
+        # A statement whose local functions' signatures read what its conditional defines,
+        # or may include, stays in it, since a moved statement is defined before it.
+        write(joinpath(root, "typed.jl"), """
+            using Test
+            if isempty(ARGS)
+                struct Point
+                    x::Int
+                end
+                @testset "a typed helper of the branch's type" begin
+                    norm1(q::Point) = abs(q.x)
+                    for p in [Point(1)]
+                        p.x > 0 && foreach(y -> println(y), 1:2)
+                        @test norm1(p) == 1
+                    end
+                    sin("typed")
+                end
+            end
+            if isempty(ARGS)
+                include(joinpath(@__DIR__, "typed_types.txt"))
+                @testset "a typed helper of an included type" begin
+                    unbox(b::IncludedBox) = b.v
+                    for b in [IncludedBox(1)]
+                        b.v > 0 && foreach(y -> println(unbox(y)), [b])
+                    end
+                    cos("included")
+                end
+            end
+            if !isempty(ARGS)
+                selected() = 1
+                @testset "a typed helper of Base types" begin
+                    twice(x::Float64) = 2x
+                    if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                        foreach(y -> println(twice(y)), [1.0])
+                    end
+                    tan("based")
+                end
+            end
+            """)
+        write(joinpath(root, "typed_types.txt"), "struct IncludedBox\n    v::Int\nend\n")
+        # The tests of a tier not taken find what the tier defines before them, closures in
+        # them too, and its code after a definition is analyzed.
+        write(joinpath(root, "untaken.jl"), """
+            using Test
+            if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                struct GPUThing
+                    n::Int
+                end
+                gpu_helper(t) = t.n + 1
+                const GPU_N = 4
+                thing = GPUThing(GPU_N)
+                sin("after the definitions")
+                @testset "tests of what the tier defines" begin
+                    for n in 1:GPU_N
+                        @test all(y -> gpu_helper(GPUThing(y)) > 0, 1:n)
+                        n > 1 && foreach(x -> println(gpu_helper(thing)), 1:n)
+                    end
+                    cos("untaken")
+                end
+            end
+            """)
+        # Outlined code finds defined what top-level code defined before it, a test set's own
+        # code or its branch's; code that runs later may find a global undefined.
+        write(joinpath(root, "defined.jl"), """
+            using Test
+            compute() = [1, 2]
+            if isempty(ARGS)
+                const N = parse(Int, "3")
+                data = compute()
+                helper() = 1
+                @testset "reads what the branch defined before" begin
+                    for i in 1:N
+                        i > 1 && foreach(y -> println(y), data)
+                    end
+                    sin("branch")
+                end
+            end
+            @testset "reads what the test set assigned" begin
+                global RESULT = compute()
+                for i in 1:2
+                    @test all(x -> x > 0, RESULT)
+                end
+                cos("test set")
+            end
+            total() = sum(RESULT)
+            """)
         output = joinpath(root, ".jetsweep", "report")
         io = IOBuffer()
         result = integration_sweep(root, output; io, fail_on=:none)
@@ -260,6 +543,31 @@ end
         @test status("arguments.jl") in (:clean, :findings)
         @test status("selection.jl") === :clean
         @test status("outlined.jl") === :clean && !isfile(joinpath(root, "ran.marker"))
+        unit(name) = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, name))
+        errors(name) = sort!([f.line for f in unit(name).findings if f.code == "inference/method-error"])
+        undefined(name) = [f for f in unit(name).findings if occursin("undef-global-var", f.code)]
+        @test status("skipping.jl") === :findings &&
+              sort!([basename(f.file) for f in unit("skipping.jl").findings]) == ["skipping_a.txt", "skipping_b.txt"]
+        @test status("jumping.jl") === :findings &&
+              sort!([basename(f.file) for f in unit("jumping.jl").findings]) == ["skipping_a.txt", "skipping_b.txt"]
+        @test status("tasked.jl") === :findings && !isfile(joinpath(root, "tasked.marker"))
+        @test errors("tiers.jl") == [5, 15] && isempty(undefined("tiers.jl"))
+        @test errors("testsets.jl") == [7, 19] && isempty(undefined("testsets.jl"))
+        @test !isfile(joinpath(root, "testsets.marker"))
+        @test errors("driver.jl") == [10, 19] && isempty(undefined("driver.jl"))
+        @test errors("constants.jl") == [3, 11, 20]
+        # Code that runs later may find the conditional's constants undefined, the statement
+        # that assigns them not.
+        @test [(f.line, f.severity) for f in undefined("constants.jl")] == [(10, 3)]
+        @test !any(f -> occursin("AbstractBindingState", f.message), unit("constants.jl").findings)
+        @test status("toplevel.jl") === :findings && errors("toplevel.jl") == [9, 16, 19, 30]
+        @test !any(f -> occursin("LIMIT", f.message) || occursin("generated", f.message), unit("toplevel.jl").findings)
+        @test any(f -> f.code == "inference/failing-test" && f.line == 5, unit("failing.jl").findings)
+        @test errors("program.jl") == [4] && isempty(undefined("program.jl"))
+        @test errors("tried.jl") == [6] && isempty(undefined("tried.jl")) && !isfile(joinpath(root, "tried.marker"))
+        @test status("typed.jl") === :findings && errors("typed.jl") == [12, 22, 32] && isempty(undefined("typed.jl"))
+        @test errors("untaken.jl") == [9, 15] && isempty(undefined("untaken.jl"))
+        @test errors("defined.jl") == [11, 19] && [(f.line, f.severity) for f in undefined("defined.jl")] == [(21, 3)]
         @test status("locked.jl") === :findings && !isfile(joinpath(root, "acquired.marker"))
         @test status("bootstrap.jl") === :findings
         @test status("main_check.jl") === :findings
@@ -281,6 +589,120 @@ end
         summary = String(take!(io))
         @test occursin(r"\n +1  incomplete  \[syntax/parse-error\]: [^\n]+\n +unparsable\.jl\n", summary)
         @test occursin("silenced/stop.jl", summary) && !occursin(realpath(root) * "/silenced", summary)
+    end
+end
+
+@testset "environments are prepared again when what they were prepared from changes during the run" begin
+    mktempdir() do directory
+        root = mkpath(joinpath(directory, "workspace"))
+        file(path, text) = (mkpath(dirname(joinpath(root, path))); write(joinpath(root, path), text))
+        helper = "0b0d6c7e-5d5c-4b8e-9f1e-3f1b1ad2c0de"
+        helper_project(deps) = "name = \"Helper\"\nuuid = \"$helper\"\nversion = \"0.1.0\"\n$deps"
+        file("Helper/Project.toml", helper_project(""))
+        file("Helper/src/Helper.jl", "module Helper\nvalue() = 1\nend\n")
+        file("Dependent/Project.toml", """
+            name = "Dependent"
+            uuid = "7a4f2e61-3c1d-4f0b-8e2a-9d5c6b7a8e10"
+            version = "0.1.0"
+
+            [deps]
+            Helper = "$helper"
+
+            [sources]
+            Helper = {path = "../Helper"}
+            """)
+        file("Dependent/src/Dependent.jl", "module Dependent\nusing Helper\nvalue() = Helper.value()\nend\n")
+        # Loading Mutator, whose analysis is the longest and so runs first, after every environment is
+        # prepared, makes Helper import Random, as an edit during the run would.
+        file("Mutator/Project.toml", "name = \"Mutator\"\nuuid = \"c3e9a1b2-6f4d-4e8a-b0c7-1d2e3f4a5b6c\"\nversion = \"0.1.0\"\n")
+        file("Mutator/src/Mutator.jl", """
+            module Mutator
+            $(repeat("# Padding that makes this the longest analysis.\n", 1000))
+            function __init__()
+                get(ENV, "MUTATE_HELPER", "") == "1" || return
+                helper = joinpath(@__DIR__, "..", "..", "Helper")
+                write(joinpath(helper, "Project.toml"), $(repr(helper_project("\n[deps]\nRandom = \"9a3f8284-a2c9-5f02-9a11-845980a1fd5c\"\n"))))
+                write(joinpath(helper, "src", "Helper.jl"), "module Helper\\nusing Random\\nvalue() = 2\\nend\\n")
+            end
+            end
+            """)
+        file(".JETSweep.toml", "[[context]]\nmatch = \"Mutator/src/Mutator.jl\"\nenv = { MUTATE_HELPER = \"1\" }\n")
+        result = sweep(root; options=SweepOptions(jobs=1, threads=1, gpus=["none"], timeout=900.0,
+                                                  output=joinpath(directory, "report")), io=devnull)
+        outcome(name) = integration_status(result, realpath(joinpath(root, name, "src", "$name.jl")))
+        notes(name) = only(r.notes for (u, r) in zip(result.units, result.results) if endswith(u.entry, "$name.jl"))
+        @test occursin("using Random", read(joinpath(root, "Helper", "src", "Helper.jl"), String))
+        # Without preparing them again, both fail to load: "Cannot load module Random into module Helper".
+        again(name) = any(note -> startswith(note, "environment: It was prepared again, since ") &&
+                                  endswith(note, "/Helper/Project.toml changed during the run."), notes(name))
+        @test outcome("Dependent") === :clean && again("Dependent")
+        @test outcome("Helper") === :clean && again("Helper")
+        @test outcome("Mutator") === :clean && isempty(notes("Mutator"))
+        @test realpath(joinpath(root, "Helper", "Project.toml")) in result.changed
+        @test result.exit_code == 2
+    end
+end
+
+@testset "environments are prepared again when their inputs change while they are prepared, or as a unit runs" begin
+    mktempdir() do directory
+        root, outside = mkpath(joinpath(directory, "workspace")), mkpath(joinpath(directory, "outside"))
+        file(path, text) = (mkpath(dirname(path)); write(path, text))
+        project(name, uuid, deps="") = "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n$deps"
+        helper, editor = "4b1e7c2a-93d5-4f60-8a1b-2c3d4e5f6a7b", "5c2f8d3b-a4e6-4071-9b2c-3d4e5f6a7b8c"
+        # Helper and Editor are outside the swept root, as the siblings of a swept repository are.
+        file(joinpath(outside, "Helper", "Project.toml"), project("Helper", helper))
+        file(joinpath(outside, "Helper", "src", "Helper.jl"), "module Helper\nvalue() = 1\nend\n")
+        # Precompiling Editor, which preparation does after it resolved Helper's dependencies, makes
+        # Helper import Random, as an edit while the environment is prepared would.
+        file(joinpath(outside, "Editor", "Project.toml"), project("Editor", editor))
+        file(joinpath(outside, "Editor", "src", "Editor.jl"), """
+            module Editor
+            let helper = joinpath(@__DIR__, "..", "..", "Helper")
+                if ccall(:jl_generating_output, Cint, ()) == 1 && !occursin("Random", read(joinpath(helper, "Project.toml"), String))
+                    write(joinpath(helper, "Project.toml"), $(repr(project("Helper", helper, "\n[deps]\nRandom = \"9a3f8284-a2c9-5f02-9a11-845980a1fd5c\"\n"))))
+                    write(joinpath(helper, "src", "Helper.jl"), "module Helper\\nusing Random\\nvalue() = 2\\nend\\n")
+                end
+            end
+            end
+            """)
+        file(joinpath(root, "Dependent", "Project.toml"), project("Dependent", "6d3a9e4c-b5f7-4182-8c3d-4e5f6a7b8c9d", """
+            [deps]
+            Editor = "$editor"
+            Helper = "$helper"
+
+            [sources]
+            Editor = {path = "../../outside/Editor"}
+            Helper = {path = "../../outside/Helper"}
+            """))
+        file(joinpath(root, "Dependent", "src", "Dependent.jl"), "module Dependent\nusing Helper\nvalue() = Helper.value()\nend\n")
+        # Loading Recover or Crasher the first time writes its preferences and fails; Crasher then exits
+        # without a result.
+        for (name, uuid, again) in (("Recover", "7e4b0f5d-c6a8-4293-9d4e-5f6a7b8c9d0e", "return"),
+                                    ("Crasher", "8f5c1a6e-d7b9-43a4-8e5f-6a7b8c9d0e1f", "exit(7)"))
+            file(joinpath(root, name, "Project.toml"), project(name, uuid))
+            file(joinpath(root, name, "src", "$name.jl"), """
+                module $name
+                function __init__()
+                    preferences = joinpath(@__DIR__, "..", "LocalPreferences.toml")
+                    isfile(preferences) && $again
+                    write(preferences, "[$name]\\nloaded = true\\n")
+                    error("first run failed")
+                end
+                end
+                """)
+        end
+        result = sweep(root; options=SweepOptions(jobs=3, threads=1, gpus=["none"], timeout=900.0,
+                                                  output=joinpath(directory, "report")), io=devnull)
+        unit(name) = only(r for (u, r) in zip(result.units, result.results) if u.entry == realpath(joinpath(root, name, "src", "$name.jl")))
+        again(name, changed) = any(note -> startswith(note, "environment: It was prepared again, since $(realpath(changed)) " *
+                                                         "changed during the run."), unit(name).notes)
+        @test occursin("using Random", read(joinpath(outside, "Helper", "src", "Helper.jl"), String))
+        # Without preparing it again, Dependent fails to load: "Cannot load module Random into module Helper".
+        @test unit("Dependent").status === :clean && again("Dependent", joinpath(outside, "Helper", "Project.toml"))
+        @test unit("Recover").status === :clean && again("Recover", joinpath(root, "Recover", "LocalPreferences.toml"))
+        # The result of Crasher's first run is not reported for its second.
+        @test unit("Crasher").status === :failed && again("Crasher", joinpath(root, "Crasher", "LocalPreferences.toml"))
+        @test startswith(only(unit("Crasher").reasons), "worker exited with code 7 without a result")
     end
 end
 

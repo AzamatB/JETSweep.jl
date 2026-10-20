@@ -28,7 +28,7 @@ planning_context(project, owner, test=false, triggers=Dict{String,String}()) =
 
 function planning_plan(root::String, file::String="")
     config = JETSweep.read_config(root, file)
-    inventory = discover(root; exclude=config.exclude)
+    inventory = discover(root; config)
     return inventory, plan(inventory, config)
 end
 
@@ -546,11 +546,6 @@ end
         @test planning_unit(units, entry).context == planning_context(package, package)
         planning_invariants(inventory, units)
 
-        for match in ("tools/absent.jl", "Pkg/src/part.jl")
-            file = planning_file(root, ".JETSweep.toml", "[[context]]\nmatch = \"$match\"\n")
-            message = "ArgumentError: $file: [[context]] match $(repr(match)) selects no unit"
-            @test_throws message planning_plan(root)
-        end
         planning_file(root, ".JETSweep.toml", "[[context]]\nmatch = \"*.jl\"\nargs = [\"--all\"]\n")
         _, units = planning_plan(root)
         @test planning_unit(units, loose).overrides.args == ["--all"]
@@ -628,5 +623,29 @@ end
         # Package code that imports undeclared packages fails to load, as it would anyway.
         @test isempty(planning_unit(units, joinpath(host, "src", "Host.jl")).context.imports)
         @test isempty(planning_unit(units, joinpath(sibling, "src", "Sibling.jl")).context.imports)
+        # Excluding a package leaves it out of the analysis, not of the workspace.
+        inventory = discover(root; exclude=["Sibling"])
+        units = plan(inventory)
+        @test !any(unit -> startswith(unit.entry, sibling), units)
+        @test planning_unit(units, loose).context.imports == Dict("Sibling" => sibling)
+        @test planning_unit(units, test).context.imports == imports
+        # A package the sweep analyzes wins its name from one it leaves out, as a fixture's copy;
+        # two it analyzes leave the name to the registry.
+        copy = planning_package(host, "test/fixtures/Sibling", "Sibling")
+        planning_file(copy, "src/Sibling.jl", "module Sibling\nend\n")
+        @test planning_unit(plan(discover(root; exclude=["fixtures"])), loose).context.imports == Dict("Sibling" => sibling)
+        @test planning_unit(plan(discover(root)), loose).context.imports == Dict("Sibling" => "")
+        # Of those it leaves out, one of the configuration's directory wins from one the
+        # configuration excludes, as the full sweep has it.
+        file = planning_file(root, ".JETSweep.toml", "exclude = [\"fixtures\"]\n")
+        _, units = planning_plan(root)
+        @test planning_unit(units, loose).context.imports == Dict("Sibling" => sibling)
+        config = JETSweep.read_config(root)
+        @test planning_unit(plan(discover(root; exclude=["Sibling"], config), config), loose).context.imports ==
+              Dict("Sibling" => sibling)
+        # A sweep of one of its directories finds the packages of the rest of it.
+        @test planning_unit(last(planning_plan(host, file)), test).context.imports == imports
+        @test planning_unit(plan(discover(host; exclude=["fixtures"])), test).context.imports ==
+              merge(imports, Dict("Sibling" => copy))
     end
 end

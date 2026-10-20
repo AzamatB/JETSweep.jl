@@ -48,7 +48,7 @@ stays(ex) = ex isa Expr && (ex.head === :$ ||
     (ex.head === :call && !isempty(ex.args) && LS.JET.isexpr(first(ex.args), :.) ?
         last(first(ex.args).args) in (QuoteNode(:include), QuoteNode(:eval), QuoteNode(:include_string)) :
         ex.head === :call && first(ex.args) in (:include, :eval, :include_string)) ||
-    (ex.head === :macrocall && first(ex.args) === Symbol("@eval")) || any(stays, ex.args))
+    (ex.head === :macrocall && macro_name(ex) === Symbol("@eval")) || any(stays, ex.args))
 
 "Whether parameters declare types, which lowering evaluates where a closure stands."
 typed(p) = p isa Expr && (p.head in (:(::), :where) ||
@@ -66,55 +66,247 @@ function typed_closure(ex)
     return any(typed_closure, ex.args)
 end
 
-"Whether `ex` defines a function, anonymous or local, in a branch, whose condition JET would evaluate."
-function branch_function(ex, conditional::Bool=false)
+"""
+Whether `ex` defines a function, anonymous or local, under control flow: in a branch, whose
+condition JET would evaluate to define it, or, with `nested`, in a loop too, whose control
+flow and captured values JET may run to define it there.
+"""
+function controlled_function(ex, controlled::Bool=false; nested::Bool=false)
     ex isa Expr && !(ex.head in (:quote, :inert)) || return false
-    (ex.head in (:->, :function, :generator) || (ex.head === :(=) && signature(first(ex.args)))) && return conditional
-    ex.head in (:if, :elseif, :&&, :||) &&
-        return branch_function(first(ex.args), conditional) || any(arg -> branch_function(arg, true), ex.args[2:end])
-    return any(arg -> branch_function(arg, conditional), ex.args)
+    (ex.head in (:->, :function, :generator) || (ex.head === :(=) && signature(first(ex.args)))) && return controlled
+    if ex.head in (:if, :elseif, :&&, :||)
+        return controlled_function(first(ex.args), controlled; nested) ||
+            any(arg -> controlled_function(arg, true; nested), ex.args[2:end])
+    end
+    nested && ex.head in (:for, :while) && return any(arg -> controlled_function(arg, true; nested), ex.args)
+    return any(arg -> controlled_function(arg, controlled; nested), ex.args)
 end
 signature(ex) = ex isa Expr && (ex.head === :call || (ex.head in (:where, :(::)) && signature(first(ex.args))))
 imports(ex) = ex isa Expr && !(ex.head in (:quote, :inert)) && (ex.head in (:using, :import) || any(imports, ex.args))
 
 """
-Whether `ex` is a loop or `let` block that defines a function in a branch. Its body is a
-local scope already, as a closure's is, so JET can analyze it in one; only imports, which
-must stand at top level, keep it there.
+The name of the function a method definition's signature `sig` extends: a symbol for a
+function of its own, an expression for a qualified or callable one, `nothing` for an
+anonymous function.
 """
-outlinable_scope(ex) = ex isa Expr && ex.head in (:for, :while, :let) && branch_function(ex) && !imports(ex)
+function method_name(sig)
+    sig isa Symbol && return sig
+    while Meta.isexpr(sig, :where) || Meta.isexpr(sig, :(::), 2)
+        sig = first(sig.args)
+    end
+    return Meta.isexpr(sig, :call) && !isempty(sig.args) ? first(sig.args) : nothing
+end
+"The name of the function `ex` defines a method of, as `method_name` gives it, if `ex` is a method definition."
+definition_name(ex) = ex isa Expr && (ex.head === :function || (ex.head === :(=) && signature(first(ex.args)))) ?
+    method_name(first(ex.args)) : nothing
+
+"The names an assignment's left-hand side binds, typed or destructured."
+assignees(lhs) = lhs isa Symbol ? Symbol[lhs] : Meta.isexpr(lhs, :(::)) ? assignees(first(lhs.args)) :
+    Meta.isexpr(lhs, :tuple) ? reduce(vcat, (assignees(arg) for arg in lhs.args); init=Symbol[]) : Symbol[]
+typed_assignee(lhs) = Meta.isexpr(lhs, :(::)) || (Meta.isexpr(lhs, :tuple) && any(typed_assignee, lhs.args))
+
+"Names `ex` declares `global` without declaring their types."
+function global_names!(names::Set{Symbol}, ex)
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return names
+    ex.head === :global && foreach(ex.args) do arg
+        arg isa Symbol ? push!(names, arg) : Meta.isexpr(arg, :(=)) && union!(names, assignees(first(arg.args)))
+    end
+    foreach(arg -> global_names!(names, arg), ex.args)
+    return names
+end
+
+const TOPLEVEL_HEADS = (:using, :import, :export, :public, :module, :macro, :struct, :abstract, :primitive)
+const TOPLEVEL_MACROS = (Symbol("@enum"), Symbol("@generated"))
+
+"""
+Whether `ex` holds what only top-level code may: imports and exports, definitions of types,
+modules and macros, generated functions, global constants, globals with declared types, and
+methods of functions that are not local, such as `Base.show(io::IO, ::T) = …`, `(::T)(x) = …`
+or those of a name declared `global`. A local scope at top level defines these globally, a
+function body cannot hold them.
+"""
+function toplevel_only(ex, globals::Set{Symbol}=global_names!(Set{Symbol}(), ex))
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return false
+    ex.head in TOPLEVEL_HEADS && return true
+    ex.head === :macrocall && macro_name(ex) in TOPLEVEL_MACROS && return true
+    ex.head === :global && any(ex.args) do arg
+        arg isa Expr && (arg.head in (:const, :(::), :function) ||
+            (arg.head === :(=) && (signature(first(arg.args)) || typed_assignee(first(arg.args)))))
+    end && return true
+    ex.head === :const && any(arg -> Meta.isexpr(arg, :global) ||
+        any(in(globals), Meta.isexpr(arg, :(=)) ? assignees(first(arg.args)) : assignees(arg)), ex.args) && return true
+    ex.head === :(=) && typed_assignee(first(ex.args)) && any(in(globals), assignees(first(ex.args))) && return true
+    name = definition_name(ex)
+    (name isa Symbol ? name in globals : name !== nothing) && return true
+    return any(arg -> toplevel_only(arg, globals), ex.args)
+end
 
 const TEST_MACROS = Set(Symbol.(["@testset", "@test", "@test_throws", "@test_broken", "@test_skip", "@test_logs",
                                  "@test_warn", "@test_nowarn", "@test_deprecated", "@inferred"]))
+"Logging macros, which evaluate their arguments in a `let` block of their own."
+const LOGGING_MACROS = Set(Symbol.(["@debug", "@info", "@warn", "@error", "@logmsg"]))
+"Macros that expand to a value where they stand, the same in a function."
+const VALUE_MACROS = Set(Symbol.(["@__DIR__", "@__FILE__", "@__MODULE__", "@__LINE__", "@isdefined", "@r_str",
+                                  "@raw_str", "@s_str", "@v_str", "@big_str"]))
+"The heads of the expressions JET analyzes in a closure, when their arguments allow."
+const THUNK_SAFE_HEADS = (LS.JET.THUNK_SAFE_TEST_CALL_HEADS..., LS.JET.THUNK_SAFE_TEST_CONTROL_HEADS...,
+                          LS.JET.THUNK_SAFE_TEST_LITERAL_HEADS..., LS.JET.THUNK_SAFE_TEST_TYPE_HEADS...)
 macro_name(ex) = (name = first(ex.args); name isa Symbol ? name :
     Meta.isexpr(name, :., 2) && last(name.args) isa QuoteNode ? last(name.args).value : nothing)
 
-"Whether code binds nothing where it stands: tests, whose bodies are local scopes, and what JET outlines."
+"""
+Whether `ex` is a local scope that defines a function under control flow inside it: a loop,
+`let` or `try` block, or a test set, whose body is a local scope already, as a closure's is,
+so JET can analyze it in one. A function directly in a local scope needs no control flow to
+be defined, nor does one in a `try` block of it.
+"""
+outlinable_scope(ex) = ex isa Expr && (ex.head in (:for, :while, :let, :try) ||
+    (ex.head === :macrocall && macro_name(ex) === Symbol("@testset"))) &&
+    any(arg -> controlled_function(arg; nested=true), ex.args)
+
+"""
+Whether code binds nothing where it stands: tests and logging, whose bodies and arguments
+are local scopes, loops, `let` and `try` blocks, and calls and control flow of these, of
+values and of what JET outlines.
+"""
 binds_nothing(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) ||
-    (ex.head === :macrocall ? macro_name(ex) in TEST_MACROS :
-     ex.head in (:block, :if, :elseif) ? all(binds_nothing, ex.args) : LS.JET.is_test_expression_thunk_safe(ex))
+    (ex.head === :macrocall ? any(names -> macro_name(ex) in names, (TEST_MACROS, LOGGING_MACROS, VALUE_MACROS)) :
+     ex.head in (:block, :if, :elseif) ? all(binds_nothing, ex.args) :
+     ex.head in (:for, :while, :let, :try) || (ex.head in THUNK_SAFE_HEADS && all(binds_nothing, ex.args)) ||
+     LS.JET.is_test_expression_thunk_safe(ex))
 
 """
 Whether `ex` is a conditional of tests that defines a function in a branch, such as a tier an
 environment variable enables. It binds nothing, so JET can analyze it in a closure of its own
 rather than define only the closures of the branch its condition takes.
 """
-outlinable_tests(ex) = Meta.isexpr(ex, :if) && binds_nothing(ex) && branch_function(ex) && !imports(ex)
+outlinable_tests(ex) = Meta.isexpr(ex, :if) && binds_nothing(ex) && controlled_function(ex)
+
+"""
+Whether the worker analyzes the top-level statement `ex` in a function of its own. Code that
+includes or evaluates code stays at top level, where JET follows it, as does what only
+top-level code may hold, and closures with typed parameters, since lowering would evaluate
+their types anyway.
+"""
+outlinable(ex) = ex isa Expr &&
+    (LS.JET.should_wrap_test_expression_in_thunk(ex) || outlinable_scope(ex) || outlinable_tests(ex)) &&
+    !stays(ex) && !typed_closure(ex) && !toplevel_only(ex)
 
 "The name tag of the functions the worker outlines top-level code into."
 const OUTLINED = :jetsweep_outlined
+"Whether `name` is that of a function the worker outlined top-level code into, or of its method."
+is_outlined(name::Symbol) = (text = String(name); startswith(text, "#$OUTLINED#") || startswith(text, "##$OUTLINED#"))
+
+symbols!(names::Set{Symbol}, ex) =
+    ex isa Symbol ? push!(names, ex) : ex isa Expr ? (foreach(arg -> symbols!(names, arg), ex.args); names) : names
+
+"""
+Symbols a method signature reads when the method is defined: argument types, `where` bounds
+and the return type, not argument names or default values.
+"""
+function signature_types!(names::Set{Symbol}, ex)
+    ex isa Expr || return names
+    if ex.head === :where
+        signature_types!(names, first(ex.args))
+        for bound in ex.args[2:end]
+            Meta.isexpr(bound, (:<:, :>:)) ? symbols!(names, last(bound.args)) :
+                Meta.isexpr(bound, :comparison) ? foreach(b -> symbols!(names, b), bound.args[[1, end]]) : nothing
+        end
+    elseif ex.head === :(::)
+        symbols!(names, last(ex.args))
+        length(ex.args) == 2 && signature_types!(names, first(ex.args))
+    elseif ex.head in (:call, :tuple, :parameters)
+        for argument in ex.args
+            Meta.isexpr(argument, :kw) && (argument = first(argument.args))
+            Meta.isexpr(argument, :...) && (argument = first(argument.args))
+            Meta.isexpr(argument, (:(::), :parameters, :curly)) && signature_types!(names, argument)
+        end
+    elseif ex.head === :curly
+        foreach(argument -> symbols!(names, argument), ex.args)
+    end
+    return names
+end
+
+"""
+Symbols the signatures of the named functions `ex` defines read, which lowering evaluates
+where the function holding them is defined.
+"""
+function signature_reads!(names::Set{Symbol}, ex)
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return names
+    definition_name(ex) === nothing || signature_types!(names, first(ex.args))
+    foreach(arg -> signature_reads!(names, arg), ex.args)
+    return names
+end
+
+"Names `ex` may bind, globally or locally: those it assigns, and the functions and types it defines."
+function may_bind!(names::Set{Symbol}, ex)
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return names
+    name = definition_name(ex)
+    if name !== nothing
+        name isa Symbol && push!(names, name)
+    elseif ex.head === :(=)
+        union!(names, assignees(first(ex.args)))
+    elseif ex.head in (:struct, :abstract, :primitive)
+        symbols!(names, ex.args[ex.head === :struct ? 2 : 1])
+    elseif ex.head === :macrocall && macro_name(ex) === Symbol("@enum")
+        symbols!(names, ex.args[3:end])
+    elseif ex.head in (:const, :global, :local)
+        union!(names, filter(arg -> arg isa Symbol, ex.args))
+    end
+    foreach(arg -> may_bind!(names, arg), ex.args)
+    return names
+end
+
+"The names of the functions the worker moves statements of top-level conditionals into."
+const MOVED = Set{Symbol}()
+
+"""
+`ex`, a top-level conditional, with each statement of its branches that `outlinable` accepts
+replaced by a call of a function `outlined` defines, as are those of conditionals among them.
+Those statements are top-level code too, but their conditional binds names, so it cannot be
+outlined itself. A statement stays where the signatures of its local functions read names the
+conditional may bind, or any name if it imports or includes code: lowering evaluates them
+where the function holding the statement is defined, before the conditional.
+"""
+function outline_statements(ex, outlined::Vector{Any},
+                            bound::Set{Symbol}=may_bind!(Set{Symbol}(), ex), opaque::Bool=stays(ex) || imports(ex))
+    Meta.isexpr(ex, (:if, :elseif)) &&
+        return Expr(ex.head, first(ex.args), (outline_statements(arg, outlined, bound, opaque) for arg in ex.args[2:end])...)
+    Meta.isexpr(ex, :block) || return ex
+    statements, line = Any[], nothing
+    for statement in ex.args
+        statement isa LineNumberNode && (line = statement)
+        reads = signature_reads!(Set{Symbol}(), statement)
+        if outlinable(statement) && (isempty(reads) || (!opaque && isdisjoint(reads, bound)))
+            name = gensym(OUTLINED)
+            push!(MOVED, name)
+            push!(outlined, Expr(:function, Expr(:call, name), Expr(:block, filter(!isnothing, Any[line, statement])...)))
+            statement = Expr(:call, name)
+        else
+            statement = outline_statements(statement, outlined, bound, opaque)
+        end
+        push!(statements, statement)
+    end
+    return Expr(:block, statements...)
+end
 
 # JET analyzes any top-level expression it can outline the same way, such as
 # `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`, and
-# loops and `let` blocks. Closures with typed parameters stay, since lowering would evaluate
-# their types anyway.
+# local scopes, and conditionals of tests. A conditional that binds names, such as a test
+# driver's selection of its test files, or a tier that defines what its tests use, has its
+# statements outlined instead, into functions defined before it, so that what they define
+# needs no condition: the tests of a branch its condition does not take are analyzed too.
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
-        (should_wrap_test_expression_in_thunk(x) || $outlinable_scope(x) || $outlinable_tests(x)) && !$stays(x) &&
-            !$typed_closure(x) || return x
-        thunk = gensym($(QuoteNode(OUTLINED)))
-        return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), Expr(:block, x)), Expr(:call, thunk)))
+        if $outlinable(x)
+            thunk = gensym($(QuoteNode(OUTLINED)))
+            return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), Expr(:block, x)), Expr(:call, thunk)))
+        end
+        isexpr(x, :if) || return x
+        outlined = Any[]
+        x = $outline_statements(x, outlined)
+        return isempty(outlined) ? x : Expr(:block, outlined..., x)
     end
 end)
 
@@ -147,7 +339,7 @@ end)
 Core.eval(LS.Analyzer, quote
     function report_failing_test!(analyzer::LSAnalyzer, sv::CC.InferenceState, argtypes::Vector{Any})
         def = sv.linfo.def
-        def isa Module || (def isa Method && startswith(String(def.name), $("#$OUTLINED#"))) || return false
+        def isa Module || (def isa Method && $is_outlined(def.name)) || return false
         length(argtypes) == 2 || return false
         value = CC.widenconditional(argtypes[2])
         if value isa Const && value.val === false
@@ -175,6 +367,182 @@ Core.eval(LS.Analyzer, quote
         end
         @static JETLS_DEV_MODE && assert_valid_report_stack(report, stack, "display")
         return stack
+    end
+end)
+
+"""
+The global that the statement at `pc` of lowered code `code` defines, if it does: a constant
+or global it assigns, or a function it creates.
+"""
+function definition(code::Vector{Any}, pc::Int)
+    stmt = code[pc]
+    Meta.isexpr(stmt, :method, 1) && return only(stmt.args) isa GlobalRef ? only(stmt.args) : nothing
+    Meta.isexpr(stmt, :call, 4) || return nothing
+    f, mod, name = stmt.args[1], stmt.args[2], stmt.args[3]
+    f in (GlobalRef(Core, :declare_const), GlobalRef(Core, :setglobal!), Core.declare_const, Core.setglobal!) ||
+        return nothing
+    mod isa GlobalRef && isdefinedglobal(mod.mod, mod.name) && (mod = getglobal(mod.mod, mod.name))
+    return mod isa Module && name isa QuoteNode && name.value isa Symbol ? GlobalRef(mod, name.value) : nothing
+end
+
+"The globals that the code of `frame` defines on every path to its statement `pc`."
+function defined_globals(frame, pc::Int=frame.currpc)
+    CC = LS.JET.CC
+    code, cfg = frame.src.code, frame.cfg
+    block = CC.block_for_inst(cfg, pc)
+    domtree = nothing
+    globals = Set{GlobalRef}()
+    for i in eachindex(code)
+        gr = i == pc ? nothing : definition(code, i)
+        (gr === nothing || gr in globals) && continue
+        b = CC.block_for_inst(cfg, i)
+        if b == block
+            i < pc && push!(globals, gr)
+        else
+            domtree === nothing && (domtree = CC.construct_domtree(cfg))
+            CC.dominates(domtree, b, block) && push!(globals, gr)
+        end
+    end
+    return globals
+end
+
+"For each function the worker moved statements of a conditional into, the globals defined on every path to its call."
+const CALLED = Dict{Symbol,Set{GlobalRef}}()
+const CALLED_LOCK = ReentrantLock()
+
+"""
+Record the globals defined on every path to the call of `f`, a function holding a statement
+the worker moved out of a conditional, in top-level code `frame`, which defines `f` before
+the conditional and calls it in it: at its last load, whether inference reaches it or not.
+"""
+function called!(frame, f::GlobalRef)
+    @lock CALLED_LOCK haskey(CALLED, f.name) && return nothing
+    code = frame.src.code
+    pc = findlast(stmt -> stmt == f || (Meta.isexpr(stmt, :(=), 2) && stmt.args[2] == f), code)
+    globals = defined_globals(frame, something(pc, frame.currpc))
+    @lock CALLED_LOCK CALLED[f.name] = globals
+    return nothing
+end
+
+mentions(ex, name::Symbol) =
+    ex isa GlobalRef ? ex.name === name : ex isa Expr && any(arg -> mentions(arg, name), ex.args)
+
+"Whether `frame` infers top-level code: at top level, or in a function the worker outlined it into."
+toplevel_code(frame) = LS.JET.istoplevelframe(frame) || (def = frame.linfo.def; def isa Method && is_outlined(def.name))
+
+"The name of the closure type whose method `frame` infers, if it does."
+function closure_name(frame)
+    def = frame.linfo.def
+    def isa Method || return nothing
+    sig = Base.unwrap_unionall(def.sig)
+    sig isa DataType && !isempty(sig.parameters) && LS.is_closure_type(sig.parameters[1]) || return nothing
+    return Base.unwrap_unionall(sig.parameters[1]).name.name
+end
+
+"""
+The frame of top-level code that `frame` runs code of: `frame` itself, or the frame calling the
+closure `frame` infers, if its code defines it, as the closure runs where that code calls it.
+"""
+function toplevel_frame(frame)
+    CC = LS.JET.CC
+    toplevel_code(frame) && return frame
+    name = closure_name(frame)
+    name === nothing && return nothing
+    parent = CC.frame_parent(frame)
+    while parent isa CC.InferenceState
+        toplevel_code(parent) && return any(stmt -> mentions(stmt, name), parent.src.code) ? parent : nothing
+        parent = CC.frame_parent(parent)
+    end
+    return nothing
+end
+
+"""
+Whether the global `gr`, which `frame` reads, is defined there because top-level code defines
+it on every path to the read: the top-level code `frame` runs code of, or the code before the
+call of the function holding a statement the worker moved out of a conditional.
+"""
+function defined(frame, gr::GlobalRef)
+    top = toplevel_frame(frame)
+    top === nothing && return false
+    gr in defined_globals(top) && return true
+    def = top.linfo.def
+    def isa Method || return false
+    globals = @lock CALLED_LOCK get(CALLED, def.name, nothing)
+    return globals !== nothing && gr in globals
+end
+
+"Whether `gr` is a constant that JET defines as a placeholder in the world of `frame`."
+function placeholder(gr::GlobalRef, frame)
+    CC = LS.JET.CC
+    partition = Base.lookup_binding_partition(frame.world.this, gr)
+    return CC.is_defined_const_binding(CC.binding_kind(partition)) &&
+        CC.partition_restriction(partition) isa LS.JET.AbstractBindingState
+end
+
+"Reports added from `n` on that `gr` is not defined."
+undefined_reports(reports, n::Int, gr::GlobalRef) =
+    [i for i in n+1:length(reports) if reports[i] isa LS.Analyzer.UndefVarErrorReport && reports[i].var == gr]
+
+# Lowering puts a `:latestworld` after each constant, global declaration, definition and
+# import, and before each closure it constructs. Inference reads globals after one as `Any`
+# and records no assignment to them, since the world may have changed. JET ignores one it
+# evaluates, but not one it leaves unevaluated, as after an unevaluated `const`: so it lost
+# whatever followed in the same statement, such as the later constants of `const A, B = f()`
+# or of a conditional, which it reported undefined, and every report after a closure in a
+# loop. JET analyzes a statement in the world its evaluation left, and records itself the
+# bindings of what it leaves unevaluated, so a world update changes nothing it knows.
+#
+# The code JET analyzes after such a statement now meets imprecisions of its own, which this
+# override corrects at loads of globals, each a statement of its own: correcting them in
+# JET's load of a binding, which all of inference calls, would recompile all of inference in
+# each worker. JET records a constant or global that a conditional assigns as one that may be
+# undefined, as it is where code that runs later reads it, but not where top-level code reads
+# it after defining it, as `const B = f(A)` does after `const A = g()` in the same branch; nor
+# does it record functions and types that a branch it does not take defines, so it reported
+# them undefined, even where they are defined, and analyzed nothing after that in the branch.
+# Where top-level code defines a global on every path to a read, the read finds it defined,
+# as what JET knows of it, or as any value if JET knows nothing of it. This holds for the code
+# the worker outlines too, top-level code in a function of its own, and for the closures
+# top-level code defines, which run where it calls them; and code moved out of a conditional
+# finds what the conditional defines before the call of the function holding it. And JET defines a constant it leaves unevaluated
+# as a placeholder holding what it knows of the value, inferring its loads as that, with the
+# effects of a constant's load: so inference would evaluate a call that reads one natively,
+# as of `name() = NAME` once `const NAME = f()` is inferred as `Any`, and get the placeholder
+# itself, for which the function it is passed to then reports a method error. A load of a
+# placeholder is not consistent, so no such call is evaluated.
+Core.eval(LS.JET, quote
+    function CC.abstract_eval_basic_statement(analyzer::ToplevelAbstractAnalyzer, @nospecialize(stmt),
+            sstate::StatementState, frame::InferenceState, result::Union{Nothing,Future{RTEffects}})
+        toplevel = istoplevelframe(frame)
+        isexpr(stmt, :latestworld) && toplevel &&
+            return CC.AbstractEvalBasicStatementResult(nothing, Any, nothing, nothing, nothing, #=saw_latestworld=#false)
+        lhs = isexpr(stmt, :(=), 2) ? stmt.args[1] : nothing
+        load = lhs === nothing ? stmt : stmt.args[2]
+        load isa GlobalRef && result === nothing ||
+            return @invoke CC.abstract_eval_basic_statement(analyzer::AbstractAnalyzer, stmt::Any,
+                sstate::StatementState, frame::InferenceState, result::Union{Nothing,Future{RTEffects}})
+        toplevel && load.name in $MOVED && $called!(frame, load)
+        reports = get_reports(analyzer, frame.result)
+        n = length(reports)
+        ret = @invoke CC.abstract_eval_basic_statement(analyzer::AbstractAnalyzer, stmt::Any,
+            sstate::StatementState, frame::InferenceState, result::Union{Nothing,Future{RTEffects}})
+        if length(reports) > n
+            undefined = $undefined_reports(reports, n, load)
+            if !isempty(undefined) && $defined(frame, load)
+                deleteat!(reports, undefined)
+                if ret isa CC.AbstractEvalBasicStatementResult && ret.rt === Union{}
+                    changes = lhs isa SlotNumber ? CC.StateUpdate(lhs, CC.VarState(Any, false)) : ret.changes
+                    ret = CC.AbstractEvalBasicStatementResult(Any, ret.exct, CC.generic_getglobal_effects, changes,
+                                                              ret.refinements, ret.currsaw_latestworld)
+                end
+            end
+        end
+        if ret isa CC.AbstractEvalBasicStatementResult && ret.effects isa CC.Effects && $placeholder(load, frame)
+            (; rt, exct, effects, changes, refinements, currsaw_latestworld) = ret
+            effects = CC.Effects(effects; consistent=CC.ALWAYS_FALSE)
+            ret = CC.AbstractEvalBasicStatementResult(rt, exct, effects, changes, refinements, currsaw_latestworld)
+        end
+        return ret
     end
 end)
 

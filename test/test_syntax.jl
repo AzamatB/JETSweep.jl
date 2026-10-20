@@ -913,6 +913,100 @@ end
     @test !JETSweep._outlined(:(if ready; @time foreach(x -> x, 1:2); end))
     @test syntax_patterns("const ON = get(ENV, \"X\", \"\") == \"1\"\nif ON\n    @testset \"t\" begin\n        foreach(x -> x, 1:2)\n    end\nend\n") ==
           String[]
+    # Logging binds nothing, nor do loops, `let` and `try` blocks, whose bodies are local
+    # scopes, nor values such as `@__FILE__`.
+    @test JETSweep._outlined(:(if ON; @testset "t" begin; foreach(x -> x, 1:2); end; else; @info "skipped"; end))
+    @test JETSweep._outlined(:(if ON; f(); let n = g(); @testset "t" begin; ready && map(x -> x, n); end; end; end))
+    @test JETSweep._outlined(:(if ON; for n in 1:2; try; foreach(x -> x + n, 1:2); catch; end; end; end))
+    @test JETSweep._outlined(:(if abspath(PROGRAM_FILE) == @__FILE__; let a = ARGS[1]; open(io -> write(io, a), a); end; end))
+    @test !JETSweep._outlined(:(if ON; @time foreach(x -> x, 1:2); else; @info "skipped"; end))
+    # A local scope defines types and imports globally, as in a function it cannot.
+    @test !JETSweep._outlined(:(if ON; let; struct S end; ready && map(x -> x, 1:2); end; end))
+    @test !JETSweep._outlined(:(if ON; let; @enum E a; ready && map(x -> x, 1:2); end; end))
+    @test !JETSweep._outlined(:(for x in xs; if ready; map(y -> y, x); end; abstract type A end; end))
+    # So it does what else only top-level code may hold: methods of functions that are not
+    # local, global constants and typed globals, exports and generated functions.
+    for code in ["Base.show(io::IO, ::Foo) = print(io, \"F\")", "function Base.:+(a::Foo, b::Foo)\n    a\nend",
+                 "(::Callable)(x) = x", "(c::Callable)(x::T) where {T} = x", "Wrap{T}(x::T) where {T} = 1",
+                 "global handler(x) = x", "global function handler(x)\n    x\nend", "global f\nf(x) = x",
+                 "global const LIMIT = 3", "const global LIMIT = 3", "global counter::Int = 0", "global n\nn::Int = 1",
+                 "global m\nconst m = 1", "export thing", "@generated g(x) = :x", "Base.@generated g(x) = :x",
+                 "@doc \"shown\" Base.show(io::IO, ::Foo) = 1", "Base.@kwdef struct K\n    a::Int = 1\nend",
+                 "import Statistics: mean"]
+        @test !JETSweep._outlined(Meta.parse("@testset \"t\" begin\n$code\nfor x in xs\n    ready && map(y -> y, x)\nend\nend"))
+        @test !JETSweep._outlined(Meta.parse("try\n$code\nready && map(y -> y, xs)\ncatch\nend"))
+    end
+    # Local functions, global assignments and quoted code do not.
+    for code in ["show(io::IO, x::Foo) = 1", "f(x) = x\nf(1)", "global total = 0", "x::Int = 1",
+                 "ex = :(Base.show(io::IO, ::Foo) = 1)", "function local_function end"]
+        @test JETSweep._outlined(Meta.parse("@testset \"t\" begin\n$code\nfor x in xs\n    ready && map(y -> y, x)\nend\nend"))
+    end
+    # Code that evaluates code stays at top level however it names `@eval`.
+    @test !JETSweep._outlined(:(for n in ns; ready && map(x -> x, n); Base.@eval f() = 1; end))
+    # A test set is a local scope too, outlined where it defines a function under control
+    # flow, a loop's as well as a branch's; one directly in it needs none, nor does one in a
+    # `try` block of it.
+    @test JETSweep._outlined(:(@testset "t" begin; if ready; foreach(x -> x, xs); end; end))
+    @test JETSweep._outlined(:(@testset "t" begin; for (f, n) in ((() -> v + 1, 1),); @test f() > n; end; end))
+    @test JETSweep._outlined(Meta.parse("Test.@testset \"t\" for v in vs\n    try\n        map(x -> x + v, xs)\n    catch\n    end\nend"))
+    @test !JETSweep._outlined(:(@testset "t" begin; f = () -> v + 1; @test f() > 1; end))
+    @test !JETSweep._outlined(:(@testset "t" begin; if ready; map(x -> x, xs); end; using Statistics; end))
+    @test !JETSweep._outlined(:(@testset "t" include("t.jl")))
+    # So are `let` and `try` blocks at top level, and loops, whose own bodies need none.
+    @test JETSweep._outlined(:(let; try; for (f, n) in ((() -> v + 1, 1),); f(); end; catch; end; end))
+    @test JETSweep._outlined(:(try; v = g(); for (f, n) in ((() -> v + 1, 1),); f(); end; catch; end))
+    @test !JETSweep._outlined(:(for v in vs; try; map(x -> x + v, xs); catch; end; end))
+    @test !JETSweep._outlined(:(@testset "t" begin; xs = items(); try; foreach(x -> x + xs[1], 1:2); catch; end; end))
+    @test !JETSweep._outlined(:(try; map(x -> x, xs); catch; end))
+    # Functions a top-level `try` block defines are local, closures, so they need no values.
+    @test syntax_patterns("const ON = get(ENV, \"X\", \"\") == \"1\"\ntry\n    ON && (h(x) = x)\ncatch\nend\n") == String[]
+    # Statements of a conditional that binds names are outlined as they would be standing
+    # alone, so the closures in them need no condition, and those of a test set none of its
+    # own; what the conditional defines still needs it, as do the closures it does not outline.
+    code = """
+        const ON = get(ENV, "X", "") == "1"
+        if ON
+            x = 1
+            @testset "t" begin
+                if get(ENV, "Y", "") == "1"
+                    foreach(y -> y, 1:2)
+                end
+            end
+        end
+        """
+    @test syntax_patterns(code) == String[]
+    @test syntax_patterns(replace(code, "x = 1" => "helper() = 1")) == ["const ON = get(ENV, \"X\", \"\") == \"1\""]
+    code = """
+        const ON = get(ENV, "X", "") == "1"
+        if ON
+            x = 1
+        else
+            begin
+                y = 2
+                ready || foreach(z -> z, 1:2)
+            end
+        end
+        """
+    @test syntax_patterns(code) == String[]
+    @test syntax_patterns("const ON = get(ENV, \"X\", \"\") == \"1\"\nif ON\n    x = 1\nelse\n    foreach(y -> y, 1:2)\nend\n") ==
+          ["const ON = get(ENV, \"X\", \"\") == \"1\""]
+    # A statement moved out of the conditional is defined before it, so the types that the
+    # signatures of its local functions read must not be what the conditional may define.
+    code = """
+        const ON = get(ENV, "X", "") == "1"
+        if ON
+            x = 1
+            @testset "t" begin
+                unbox(b::Vector{Int}; scale::Float64=1.0) = b
+                if get(ENV, "Y", "") == "1"
+                    foreach(y -> y, 1:2)
+                end
+            end
+        end
+        """
+    @test syntax_patterns(code) == String[]
+    @test syntax_patterns(replace(code, "x = 1" => "Item = Int", "Vector{Int}" => "Vector{Item}")) ==
+          ["const ON = get(ENV, \"X\", \"\") == \"1\""]
     # Loop and `let` bodies are local scopes already, unless they import.
     @test JETSweep._outlined(:(for (name, entries) in deps; if haskey(m, name); all(e -> e, entries); end; end))
     @test JETSweep._outlined(:(let r = slow(); if r > 0; g(x) = x + 1; end; end))
@@ -1118,6 +1212,54 @@ end
     @test syntax_patterns("const N = compute()\ng(::Val{N}) = 1\n") == String[]
     # Includes inside functions run only when called, so nothing selects them statically.
     @test syntax_patterns("const FILES = list_tests()\nrun(f) = include(f)\nforeach(run, FILES)\n") == String[]
+end
+
+@testset "concretization_patterns evaluates the conditions of early exits that control includes" begin
+    selection = """
+        const FILES = ["test_a.jl", "test_guards.jl"]
+        const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)
+        const ORIGINAL = filter(==("test_guards.jl"), RUN)
+        const OTHER = filter(!=("test_guards.jl"), RUN)
+        """
+    run, original, other = ["const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)",
+                            "const ORIGINAL = filter(==(\"test_guards.jl\"), RUN)",
+                            "const OTHER = filter(!=(\"test_guards.jl\"), RUN)"]
+    patterns(loop) = syntax_patterns(selection * loop)[2:end]
+    # A test driver skips what another phase runs, as DispatchCheckup's `original=` files.
+    @test patterns("""
+        @testset "suite" begin
+            for file in RUN
+                file in ORIGINAL && get(ENV, "DISPATCH_CHECKUP", "") == "checked" && continue
+                include(file)
+            end
+        end
+        """) == [run, original]
+    @test patterns("for file in RUN\n    if file in ORIGINAL\n        continue\n    end\n    include(file)\nend\n") ==
+          patterns("for file in RUN\n    file in ORIGINAL || continue\n    include(file)\nend\n") == [run, original]
+    # Every condition on the way to the exit counts, as a `break` does for every iteration and a
+    # `return` for what follows it anywhere in the statement.
+    @test patterns("for file in RUN\n    if file in OTHER\n        file in ORIGINAL && continue\n    end\n    include(file)\nend\n") ==
+          [run, original, other]
+    @test patterns("for file in RUN\n    include(file)\n    file in ORIGINAL && break\nend\n") == [run, original]
+    @test patterns("for file in RUN\n    for o in OTHER\n        o in ORIGINAL && return\n    end\n    include(file)\nend\n") ==
+          [run, original, other]
+    # A `continue` controls what follows it, and a `break` in an inner loop only that loop.
+    @test patterns("for file in RUN\n    include(file)\n    file in ORIGINAL && continue\nend\n") == [run]
+    @test patterns("for file in RUN\n    for o in OTHER\n        o in ORIGINAL && break\n    end\n    include(file)\nend\n") == [run]
+    @test patterns("for file in RUN\n    foreach(f -> f in ORIGINAL && return, OTHER)\n    include(file)\nend\n") == [run]
+    # A `@goto` may skip what follows it, as a `return` may.
+    @test patterns("for file in RUN\n    file in ORIGINAL && @goto skip\n    include(file)\n    @label skip\nend\n") ==
+          [run, original]
+    # A `return` in a macro that runs its code in a task ends only the task, so its condition,
+    # which may need what the analysis cannot run, is left alone; one in a test set or timing skips.
+    for task in ("@async", "Threads.@spawn", "@task")
+        @test patterns("@sync for file in RUN\n    $task begin\n        file in ORIGINAL && return\n    end\n    include(file)\nend\n") ==
+              [run]
+        @test patterns("for file in RUN\n    $task begin\n        file in ORIGINAL && @goto skip\n        @label skip\n    end\n    include(file)\nend\n") ==
+              [run]
+    end
+    @test patterns("for file in RUN\n    @testset \"t\" begin\n        file in ORIGINAL && return\n    end\n    include(file)\nend\n") ==
+          patterns("for file in RUN\n    @time file in ORIGINAL && return\n    include(file)\nend\n") == [run, original]
 end
 
 @testset "includes resolve through path constants other files define" begin

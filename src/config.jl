@@ -1,4 +1,4 @@
-"A `[[context]]` table: settings for units whose entry matches a root-relative glob."
+"A `[[context]]` table: settings for units whose entry matches a glob, relative to the configuration's `directory`."
 struct ContextRule
     match::String
     pattern::Regex
@@ -14,11 +14,16 @@ end
 "Settings from a `.JETSweep.toml`: extra exclusions and per-unit context overrides."
 struct Config
     file::String
+    """
+    The directory the globs are relative to: the file's when the swept directory is in it, as
+    for a sweep of part of a workspace, else the swept directory. It holds every swept path.
+    """
+    directory::String
     exclude::Vector{String}
     contexts::Vector{ContextRule}
 end
 
-Config() = Config("", String[], ContextRule[])
+Config() = Config("", "", String[], ContextRule[])
 
 function _strings(value, key::String, file::String)
     value isa Vector && all(item -> item isa String, value) ||
@@ -32,12 +37,13 @@ _absolute(base::String, path::String) = (path = normpath(abspath(base, path)); l
 """
     read_config(root, file="") -> Config
 
-Read `file`, or `root/.JETSweep.toml` when it exists. `exclude` patterns follow the
-`--exclude` rules; each `match` is a glob a unit's entry path, relative to `root`, must
-match whole. `project`, `setup` and `jetls_config` are paths relative to the file; `setup`
-applies to tests and scripts, not to package, extension and orphan analyses, which load the
-package itself. When several `[[context]]` tables match a unit, each key a later table sets
-overrides it, except `env`, whose variables merge.
+Read `file`, or `root/.JETSweep.toml` when it exists. `project`, `setup` and `jetls_config`
+are paths relative to the file. Globs are relative to the file's directory when `root` is in
+it, else to `root`: `exclude` patterns follow the `--exclude` rules there, and each `match` is
+a glob a unit's entry path must match whole. `setup` applies to tests and scripts, not to
+package, extension and orphan analyses, which load the package itself. When several
+`[[context]]` tables match a unit, each key a later table sets overrides it, except `env`,
+whose variables merge.
 
 ```toml
 exclude = ["vendor", "**/generated/*.jl"]
@@ -55,10 +61,14 @@ function read_config(root::AbstractString, file::AbstractString="")
     explicit = !isempty(file)
     file = explicit ? abspath(file) : joinpath(root, ".JETSweep.toml")
     isfile(file) || (explicit ? throw(ArgumentError("configuration file does not exist: $file")) : return Config())
+    # Globs match real paths, as discovery finds them.
+    file = joinpath(realpath(dirname(file)), basename(file))
     data = TOML.parsefile(file)
     unknown = setdiff(keys(data), ("exclude", "context"))
     isempty(unknown) || throw(ArgumentError("$file: unknown keys $(join(sort!(collect(unknown)), ", "))"))
     base = dirname(file)
+    root = ispath(root) ? realpath(root) : abspath(root)
+    directory = _within(root, base) ? base : root
     exclude = _strings(get(data, "exclude", String[]), "exclude", file)
     tables = get(data, "context", Any[])
     tables isa Vector && all(table -> table isa AbstractDict, tables) ||
@@ -92,5 +102,5 @@ function read_config(root::AbstractString, file::AbstractString="")
         ContextRule(match, _glob(match), Set{String}(keys(table)), project, setup,
                     _strings(get(table, "args", String[]), "args", file), Dict{String,String}(env), jetls_config)
     end
-    return Config(file, exclude, contexts)
+    return Config(file, directory, exclude, contexts)
 end

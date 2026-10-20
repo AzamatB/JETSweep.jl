@@ -414,6 +414,53 @@ end
     end
 end
 
+@testset "a path dependency's dependencies come from its project, not from a dependent's manifest" begin
+    _environments_sandbox() do root, envs
+        printf, random = "de0858da-6303-5e67-8744-51eddeeeb8d7", "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+        unicode = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
+        # The dependency imports Random now; its dependent's manifest was resolved when it imported Printf.
+        _, switched_uuid = _environments_package(root, "SwitchedHelper"; deps=Dict("Random" => random),
+                                                 body="using Random\nvalue() = 42")
+        parent, _ = _environments_package(root, "LaggingParent"; deps=Dict("SwitchedHelper" => switched_uuid),
+            sources=Dict("SwitchedHelper" => Dict("path" => "../SwitchedHelper")),
+            body="using SwitchedHelper\nvalue() = SwitchedHelper.value()")
+        _environments_seed(joinpath(parent, "Manifest.toml"),
+            _environments_entry("SwitchedHelper", switched_uuid; path="../SwitchedHelper",
+                                deps=Dict("Printf" => UUID(printf))),
+            _environments_entry("Printf", printf; version=v"1.11.0", deps=Dict("Unicode" => UUID(unicode))),
+            _environments_entry("Unicode", unicode; version=v"1.11.0"))
+        before = _environments_snapshot(root)
+        environment = _environments_prepare(_environments_context(parent), joinpath(envs, "switched"))
+        @test environment == _environments_ready(joinpath(envs, "switched"))
+        @test _environments_snapshot(root) == before
+        @test _environments_manifest(environment)[UUID(switched_uuid)].deps == Dict("Random" => UUID(random))
+        @test _environments_run(environment, "using LaggingParent; print(LaggingParent.value())") == "42"
+    end
+end
+
+@testset "an environment's inputs are known before it is prepared, wherever they are" begin
+    _environments_sandbox() do root, envs
+        printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+        # A sweep of one repository excludes its siblings; their files are inputs all the same.
+        helper, helper_uuid = _environments_package(joinpath(root, "sibling"), "InputHelper")
+        nested, nested_uuid = _environments_package(joinpath(root, "sibling"), "InputNested")
+        _environments_write(joinpath(helper, "Project.toml"), merge(TOML.parsefile(joinpath(helper, "Project.toml")),
+            Dict("deps" => Dict("InputNested" => nested_uuid), "sources" => Dict("InputNested" => Dict("path" => "../InputNested")))))
+        parent, _ = _environments_package(joinpath(root, "swept"), "InputParent"; deps=Dict("InputHelper" => helper_uuid),
+            sources=Dict("InputHelper" => Dict("path" => "../../sibling/InputHelper")), workspace=Dict("projects" => ["test"]))
+        # A member of the parent's workspace, which Pkg resolves with it.
+        _environments_write(joinpath(parent, "test", "Project.toml"), Dict("deps" => Dict("Printf" => printf)))
+        inputs = JETSweep._environment_inputs(_environments_context(parent))
+        @test joinpath(parent, "Project.toml") in inputs
+        @test joinpath(parent, "Manifest.toml") in inputs
+        @test joinpath(parent, "LocalPreferences.toml") in inputs
+        @test joinpath(parent, "test", "Project.toml") in inputs
+        @test joinpath(helper, "Project.toml") in inputs
+        @test joinpath(nested, "Project.toml") in inputs
+        @test !(joinpath(helper, "Manifest.toml") in inputs)
+    end
+end
+
 @testset "explicit sources override stale manifest locations" begin
     _environments_sandbox() do root, envs
         helper, helper_uuid = _environments_package(root, "ChosenHelper")
@@ -453,6 +500,138 @@ end
         for url in ("https://example.invalid/R.jl", "git@example.invalid:org/R.jl.git", "file:///srv/R.jl")
             @test JETSweep._source(Dict("url" => url), parent) == Dict("url" => url)
         end
+    end
+end
+
+@testset "preparations side by side clone a shared Git source once, and make a broken clone again" begin
+    git = Sys.which("git")::String
+    _environments_sandbox() do root, envs
+        repository = joinpath(root, "SharedRepository")
+        _, shared_uuid = _environments_package(repository, "SharedTool")
+        revision = LibGit2.with(repo -> _environments_commit(repo, "Fixture"), LibGit2.init(repository))
+        url = "file://" * repository
+        sharers = [first(_environments_package(root, "Sharer$i"; deps=Dict("SharedTool" => shared_uuid),
+                       sources=Dict("SharedTool" => Dict("url" => url, "rev" => revision, "subdir" => "SharedTool"))))
+                   for i in 1:3]
+        # A Git whose clones get their objects after a while, so that clones started together overlap,
+        # as first clones over a network do. Pkg uses the Git command line when asked to.
+        bin = mkpath(joinpath(root, "bin"))
+        write(joinpath(bin, "git"), """
+            #!/bin/sh
+            if [ "\$1" = clone ]; then shift; exec '$git' clone -u 'sleep 3; git-upload-pack' "\$@"; fi
+            exec '$git' "\$@"
+            """)
+        chmod(joinpath(bin, "git"), 0o755)
+        # Each depot is empty but for the clones it gets; the user's depots provide the registries and analyzer.
+        depots(depot) = join([depot; DEPOT_PATH], ':')
+        prepared(sharer, name) = JETSweep._prepare(_environments_context(sharer), joinpath(envs, name), SweepOptions())
+        depot = mkpath(joinpath(root, "depot"))
+        environments = withenv("JULIA_DEPOT_PATH" => depots(depot), "JULIA_PKG_USE_CLI_GIT" => "true",
+                               "PATH" => bin * ':' * ENV["PATH"]) do
+            asyncmap(i -> prepared(sharers[i], "sharer$i"), eachindex(sharers))
+        end
+        @test [environment.status for environment in environments] == [:ready, :ready, :ready]
+        @test all(environment -> isempty(environment.message), environments)
+        clone = joinpath(depot, "clones", string(hash(url)))
+        @test JETSweep._valid_clone(clone)
+        @test filter(name -> startswith(name, basename(clone) * "."), readdir(dirname(clone))) == []
+
+        # A clone that a killed preparation left half made, with Git's placeholder HEAD, is made again.
+        depot = mkpath(joinpath(root, "killed"))
+        broken = joinpath(depot, "clones", string(hash(url)))
+        run(`$git init --quiet --bare $broken`)
+        write(joinpath(broken, "HEAD"), "ref: refs/heads/.invalid\n")
+        @test !JETSweep._valid_clone(broken)
+        environment = withenv(() -> prepared(sharers[1], "repaired"), "JULIA_DEPOT_PATH" => depots(depot))
+        @test environment == _environments_ready(joinpath(envs, "repaired", "env"))
+        @test JETSweep._valid_clone(broken)
+        @test withenv(() -> _environments_run(environment, "using Sharer1, SharedTool; print(SharedTool.value())"),
+                      "JULIA_DEPOT_PATH" => depots(depot)) == "42"
+    end
+end
+
+@testset "a clone is broken if a clone stopped before it ended, not if its HEAD names a missing branch" begin
+    git = Sys.which("git")::String
+    mktempdir() do root
+        clone(name) = joinpath(root, name)
+        run(`$git init --quiet --bare $(clone("empty"))`)   # as libgit2 begins a clone
+        run(`$git init --quiet --bare $(clone("placeholder"))`)
+        write(joinpath(clone("placeholder"), "HEAD"), "ref: refs/heads/.invalid\n")   # as Git begins one
+        mkpath(clone("directory"))
+        source = clone("source")
+        run(`$git init --quiet --initial-branch=main $source`)
+        run(`$git -C $source -c user.name=fixture -c user.email=fixture@example.invalid commit --quiet --allow-empty -m Fixture`)
+        # A remote created with another default branch than the one it has.
+        run(`$git clone --quiet --bare $source $(clone("dangling"))`)
+        write(joinpath(clone("dangling"), "HEAD"), "ref: refs/heads/master\n")
+        @test !JETSweep._valid_clone(clone("empty"))
+        @test !JETSweep._valid_clone(clone("placeholder"))
+        @test !JETSweep._valid_clone(clone("directory"))
+        @test !JETSweep._valid_clone(clone("missing"))
+        @test JETSweep._valid_clone(clone("dangling"))
+        @test JETSweep._valid_clone(source)
+    end
+end
+
+@testset "a clone stays locked while its holder blocks, until it dies, and then serves its waiters in turn" begin
+    git = Sys.which("git")::String
+    _environments_sandbox() do root, envs
+        repository, uuid = _environments_package(root, "LockedTool")
+        run(`$git init --quiet $repository`)
+        run(`$git -C $repository add -A`)
+        run(`$git -C $repository -c user.name=fixture -c user.email=fixture@example.invalid commit --quiet -m Fixture`)
+        tree, url = readchomp(`$git -C $repository rev-parse 'HEAD^{tree}'`), "file://" * repository
+        depot = mkpath(joinpath(root, "depot"))
+        clone = joinpath(depot, "clones", uuid)
+        # What a killed process can leave: a clone Git had begun, and a clone being made aside.
+        run(`$git init --quiet --bare $clone`)
+        write(joinpath(clone, "HEAD"), "ref: refs/heads/.invalid\n")
+        mkpath(joinpath(clone * ".partial", "objects"))
+        script(name, code) = (write(joinpath(root, name), code); joinpath(root, name))
+        # Preparation workers have no interactive thread: a holder that blocks in a call, as
+        # libgit2 does while it clones, runs nothing else, so it cannot refresh a lock.
+        start(file) = open(addenv(JETSweep.julia_command(file, String[]; project=dirname(JETSweep.tool_project()), threads=1),
+                                  "JULIA_DEPOT_PATH" => join([depot; DEPOT_PATH], ':')), "r")
+        holder = start(script("holder.jl", """
+            using JETSweep
+            JETSweep._lock_clone($(repr(clone)))
+            println("locked")
+            flush(stdout)
+            ccall(:sleep, Cuint, (Cuint,), 600)
+            """))
+        waiters = [start(script("waiter$i.jl", """
+            using JETSweep, Pkg
+            JETSweep.lock_clones!()
+            println("waiting")
+            flush(stdout)
+            Pkg.Operations.install_git(stdout, Base.UUID($(repr(uuid))), "LockedTool", Base.SHA1($(repr(tree))),
+                                       Set([$(repr(url))]), $(repr(joinpath(root, "installed$i"))))
+            println("installed, holding ", collect(keys(JETSweep._CLONE_LOCKS)))
+            Pkg.activate(; temp=true, io=devnull)
+            Pkg.Types.handle_repo_add!(Pkg.Types.Context(io=stdout), Pkg.Types.PackageSpec(repo=Pkg.Types.GitRepo(source=$(repr(url)))))
+            println("added, holding ", collect(keys(JETSweep._CLONE_LOCKS)))
+            """)) for i in 1:2]
+        guard = Timer(_ -> foreach(process -> kill(process, Base.SIGKILL), [holder; waiters]), 300)
+        try
+            @test readline(holder) == "locked"
+            @test all(waiter -> readline(waiter) == "waiting", waiters)
+            sleep(5)
+            @test all(process_running, waiters)
+            kill(holder, Base.SIGKILL)
+            outputs = read.(waiters, String)
+            @test all(success, waiters)
+            @test all(output -> occursin("installed, holding String[]\n", output) &&
+                                occursin("added, holding String[]\n", output), outputs)
+            # One waiter made the clone again, and the other found it made.
+            @test count(output -> occursin("Cloning [$uuid] LockedTool", output), outputs) == 1
+            @test count(output -> occursin("Cloning git-repo", output), outputs) == 1
+        finally
+            close(guard)
+        end
+        @test JETSweep._valid_clone(clone)
+        @test all(i -> isfile(joinpath(root, "installed$i", "src", "LockedTool.jl")), 1:2)
+        # Neither locks nor clones made aside are left.
+        @test sort!(readdir(dirname(clone))) == sort!(["CACHEDIR.TAG", uuid, basename(Pkg.Types.add_repo_cache_path(url))])
     end
 end
 

@@ -47,8 +47,8 @@ jetsweep --exclude vendor --exclude '**/generated/*.jl' DIRECTORY
 | `--timeout SECONDS` | Time limit per analysis or environment, 0 for none (default 1800). JETLS's own limit on evaluating each top-level statement, which counts compilation and so grows with load, is 300 s instead of its editor default of 10 s, unless `.JETLSConfig.toml` sets `full_analysis.concretization_timeout`. |
 | `--gpus auto\|none\|LIST` | GPUs assigned round-robin through `CUDA_VISIBLE_DEVICES` (default `auto`: the visible devices). |
 | `--output DIRECTORY` | Report directory, new or empty (default `DIRECTORY/.jetsweep/TIMESTAMP`, or `TIMESTAMP-2` and so on if another sweep has it). |
-| `--config FILE` | Configuration file (default `DIRECTORY/.JETSweep.toml`, if present). |
-| `--exclude GLOB` | Skip matching paths; repeatable. A pattern with `/` inside, or starting with `/` or `./`, matches the path relative to `DIRECTORY`; any other pattern matches a path segment. |
+| `--config FILE` | Configuration file (default `DIRECTORY/.JETSweep.toml`, if present). A workspace's configuration applies to a sweep of one of its directories as to the whole workspace, whose packages that sweep's code still finds. |
+| `--exclude GLOB` | Skip matching paths; repeatable. A pattern with `/` inside, or starting with `/` or `./`, matches the path relative to `DIRECTORY`; any other pattern matches a path segment. Excluded packages are not analyzed, but code that loads them still finds them. |
 | `--include-ignored`, `--tracked-only` | Include files Git ignores; include only files Git tracks. |
 | `--offline` | Resolve environments among the package versions already installed, and download nothing. |
 | `--plan` | Write the inventory and the analysis plan without analyzing. |
@@ -63,7 +63,13 @@ unless Git tracks files inside them, so editor and tool state stays out while, f
 a JLL package's tracked `.pkg` scripts stay in. Directories a `CACHEDIR.TAG` marks as caches
 are skipped, tracked or not; JETSweep tags its report directories so, and a later sweep does
 not analyze one that `--output` put inside the directory. Symlinks are not followed: inside
-the root they only alias what discovery reaches anyway, or what it excludes. The files are
+the root they only alias what discovery reaches anyway, or what it excludes. Paths that
+`--exclude` and the configuration exclude are not analyzed, but the packages of excluded
+directories stay available, without their sources or metadata problems, so that code
+loading them finds them, as it would without the exclusion; so do those of the rest of the
+configuration's directory when `DIRECTORY` is part of it. Discovery walks those directories
+for their packages, reading only directory entries, unless they are hidden, caches or
+dependencies, or Git ignores them. The files are
 then grouped into analysis units, each covering its entry file and the files it includes:
 
 | Unit | Entry | Analysis |
@@ -103,12 +109,26 @@ working directory, files read) are evaluated only where JETLS needs them, with `
 the analyzed file: in the arguments of `include` and `eval` calls, in
 definition signatures, and in conditions that define closures or choose imports. And since
 JETLS always evaluates `include` and `eval` calls, and under JETSweep `include_string` calls
-too, whatever their arguments need is evaluated,
-side effects or not, as a test driver's selection of its files is. A value that code left
-unevaluated may change, as `push!` or an indexed assignment does, is not evaluated from there
+too, whatever their arguments need is evaluated, side effects or not, as a test driver's
+selection of its files is, and so is what decides whether they run: the conditions around
+them, and those of a `continue`, `break`, `return` or `@goto` that may skip them, as of
+`file in SKIPPED && continue` before `include(file)`, or of a `break` after it, which decides
+whether later iterations run. A `return` or `@goto` in a macro other than `@testset`,
+`@sync`, `@static`, `@inbounds`, `@views`, `@lock` and the timing macros skips nothing there,
+since the macro may run it in a function of its own, as `@async` and `Threads.@spawn` do.
+A value that code left unevaluated may change, as `push!` or an indexed assignment does, is not evaluated from there
 on, and neither is a name the file rebinds, even one Base defines. JETLS matches these
 statements as patterns, in which names such as `x_` and `@__DIR__` are wildcards, so a
 statement whose pattern would also match another statement of its file is not evaluated.
+
+Every constant JETLS leaves unevaluated is bound to its type, also each of a statement such
+as `const MODE, OUT = parse_arguments(ARGS)` and of a conditional, which JETLS by itself can
+leave undefined. And top-level code that reads a global its statement defines on every path
+before the read finds it defined: as the type JETLS knows of it, or as an unknown value if
+JETLS did not evaluate the definition, as for the functions and types of a branch the
+analysis does not take. JETLS by itself reports such a read as possibly or wholly undefined,
+and analyzes nothing after a read it finds undefined. Code that runs later, such as a
+function body, may still find a global that a conditional assigns undefined.
 
 JETSweep extends one JETLS rule. To define a closure in a branch, JETLS evaluates the
 branch's condition, and with it everything the condition depends on: in a test set, the
@@ -117,12 +137,25 @@ branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, inside a closure of it
 JETSweep treats generators and comprehensions alike, as in
 `@test r.ok && [a.b for a in r.items] == [1]`, which would otherwise run the whole test set in
 JETLS's interpreter; any other top-level expression that assigns nothing, as in
-`lock === nothing || atexit(() -> close(lock))`; loops and `let` blocks, whose bodies are
-local scopes already, unless they import packages, which only top-level code can; and
-conditionals of tests, such as a tier an environment variable enables, which bind nothing
-either, so their tests are analyzed whatever the condition. Code that
-includes or evaluates code stays at top level, where JETLS follows it, as do closures whose
-parameters declare types, since Julia evaluates those types where the closure stands.
+`lock === nothing || atexit(() -> close(lock))`; loops, `let` and `try` blocks and test sets,
+whose bodies are local scopes already, where they define a function under control flow, in a
+branch or loop inside them, which JETLS would run, with the values the function captures, to
+define it; and conditionals of tests, such as a tier an environment variable enables, whose
+other branch may log, as in `else @info "skipped" end`, which bind nothing either, so their
+tests are analyzed whatever the condition. A conditional that binds names, such as a test
+driver's selection of its files or a tier that defines what its tests use, has those
+statements of its branches analyzed in functions of their own, defined before it and called
+where the statements stand, so that the tests of a branch its condition does not take are
+analyzed too. They find what their branch defines before them defined, as an unknown value
+where the analysis did not take the branch. A statement whose local functions declare
+argument types that the conditional may define, or any types if it includes or imports code,
+stays in it, since Julia evaluates those types where the function holding the statement is
+defined. Code that includes or evaluates code stays at top level, where JETLS follows it, as
+does what only top-level code may hold, which a local scope at top level defines globally:
+imports, exports, type definitions, methods of functions that are not local, such as
+`Base.show(io::IO, x::T) = …`, generated functions, global constants and globals with declared
+types; and closures whose parameters declare types, since Julia evaluates those types where
+the closure stands.
 JETLS analyzes top-level code and test sets as fail-fast, except test sets that specify
 `failfast=false` or have a custom type and those nested in them, which it analyzes as
 declared. So code after a `@test` that always fails is not analyzed, except in those test
@@ -146,16 +179,31 @@ extension triggers, `[sources]`, workspaces, compat bounds and effective prefere
 the analyzer resolved alongside, so that packages both use, such as Revise, have one version.
 Existing manifests seed the resolution, keeping locked versions where they are consistent;
 when they are not, the environment is re-resolved and the units' notes say what changed.
+As in Pkg, a path dependency depends on what its project declares, whatever a manifest
+recorded of it.
 Scripts and tests that import packages their projects do not declare, because they run
 with another project active or rely on their workspace, get those packages added: packages
-of the workspace from their directories, others from the registry. If they cannot all be
-added, the environment gets those of the workspace alone, or failing that none; the units'
-notes name the packages added and those left out. Modules the tree defines that are not
-packages, as scripts load through `LOAD_PATH`, are not looked up. With
+of the workspace from their directories, excluded ones too, others from the registry.
+Where several packages of the workspace have the name, the first of these that has it
+decides: the packages the sweep analyzes, those of the configuration's directory it leaves
+out, and those the configuration excludes, as a fixture's copy of a package may be; two
+there leave the name to the registry. If
+they cannot all be added, the environment gets those of the workspace alone, or failing that
+none; the units' notes name the packages added and those left out. Modules the tree defines
+that are not packages, as scripts load through `LOAD_PATH`, are not looked up. With
 `--offline`, resolution considers installed versions only. Each environment is then
 precompiled once for all its units; packages that fail to precompile, or that a timeout
-leaves without package images, load from source. Original projects, manifests, preferences
-and sources are never written, and package build scripts never run.
+leaves without package images, load from source. Preparations run side by side, but take
+turns with each Git clone in the depot, which Pkg makes and fetches into without a lock: a
+preparation locks a clone while Pkg installs a package from it, makes a new clone aside and
+moves it into place once complete, and makes a clone again that another process left
+broken. If a project, manifest or preference file of the projects an environment combines
+or of their workspace roots, the project file of another member of those workspaces, or
+the project file of one of its path dependencies changes once its preparation has started,
+the environment is prepared again before its next unit starts, and a unit that did not
+complete, other than one that ran out of time, runs again in the new one if they changed
+while it ran; their notes name the files. Original projects, manifests, preferences and
+sources are never written, and package build scripts never run.
 
 The scheduler prepares environments first, then starts the longest analyses, as measured by
 the latest report in `DIRECTORY/.jetsweep` if the same JETSweep version wrote it, or
@@ -177,14 +225,21 @@ concretization patterns apply. JETSweep prepares environments itself, so it sets
 defaults `full_analysis.concretization_timeout` as `--timeout` describes.
 
 An optional `.JETSweep.toml` at the root adds exclusions and context for units that need it,
-such as scripts that expect arguments or a different environment. `exclude` patterns follow
-the `--exclude` rules. Each `match` is a glob that a unit's entry path, relative to the root,
-must match whole, and must select at least one planned unit; `project`, `setup` and
-`jetls_config` are paths relative to the configuration file. `setup` files are included
-before the entry of a test or script; package, extension and orphan analyses load the
-package itself, so their units do not apply `setup`, and note so. When several tables match
-a unit, each key a later table sets overrides earlier ones, except `env`, whose variables
-merge. Follow-up units inherit the context and settings of the unit they follow.
+such as scripts that expect arguments or a different environment. `project`, `setup` and
+`jetls_config` are paths relative to the configuration file. Its globs are relative to its
+directory when `DIRECTORY` is in it, and to `DIRECTORY` otherwise, as for a configuration
+kept elsewhere: `exclude` patterns follow the `--exclude` rules there, and each `match` is a
+glob that a unit's entry path must match whole. So a workspace's configuration, given with
+`--config`, applies to a sweep of one of its directories as it does to the whole workspace,
+and that sweep's code finds the packages of the rest of the workspace. Each `match` must
+select a planned unit, or, where `--exclude` or a narrower `DIRECTORY` leaves out what it selects, a
+unit of the full sweep, of the configuration's directory without `--exclude`, and the summary
+notes the context; a `match` that selects no unit of the full sweep either is an error.
+`setup` files are included before the entry of a test or script; package, extension and
+orphan analyses load the package itself, so their units do not apply `setup`, and note so.
+When several tables match a unit, each key a later table sets overrides earlier ones, except
+`env`, whose variables merge. Follow-up units inherit the context and settings of the unit
+they follow.
 
 ```toml
 exclude = ["vendor", "**/generated/*.jl"]
@@ -201,10 +256,12 @@ jetls_config = "tools/.JETLSConfig.toml"
 ## Reports
 
 The report directory contains `report.toml` (every unit's status, reasons, notes, timing and
-log, and the deduplicated diagnostics), `summary.txt` (the diagnostics as `file:line:column`
-with messages, every incomplete unit with its reasons, notes and log, and the files no
-complete analysis covered), the inventory and plan, each unit's and environment's request,
-result and log, and the `CACHEDIR.TAG` that keeps sweeps and backups out of it. A unit whose
+log, the plan's notes, and the deduplicated diagnostics), `summary.txt` (the diagnostics as
+`file:line:column` with messages, the plan's notes, every incomplete unit with its reasons,
+notes and log, and the files no complete analysis covered), the inventory (with the packages
+it leaves out but keeps available, by tier) and plan, each
+unit's and environment's request, result and log, and the `CACHEDIR.TAG` that keeps sweeps
+and backups out of it. A unit whose
 environment is unavailable never runs; its log is the environment's, if preparation logged
 anything. The terminal summary groups incomplete units by cause.
 Lines and columns count from 1, columns in UTF-16 code units as LSP positions do; a

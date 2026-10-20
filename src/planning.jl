@@ -113,7 +113,8 @@ Partition the inventory into analysis units:
   own scripts use its test environment;
 - extension sources no extension includes, with the package's bindings in scope.
 
-Includes are found by parsing, without executing any code.
+Includes are found by parsing, without executing any code. `config`'s `[[context]]` tables
+apply to the units they select; [`sweep`](@ref) checks that each selects one.
 """
 function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String,Syntax}=source_syntax(inventory))::Vector{Unit}
     root = inventory.root
@@ -196,20 +197,28 @@ function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String
         end
     end
     sort!(units; by=unit -> (unit.entry, unit.extension))
-    return _imports!(_configure(units, config, root), syntax, inventory)
+    return _imports!(_configure(units, config), syntax, inventory)
 end
 
 """
 Give the contexts of scripts and tests the packages their files import without their
 projects declaring them, as code does that runs with another project active or relies on
 its workspace: packages of the workspace from their directories, others from the registry.
+Where several packages of the workspace have a name, the first tier that has it decides: the
+packages the sweep analyzes, then those of the configuration's directory it leaves out, then those
+the configuration excludes, as a fixture's copy of a package may be. Several packages of that
+tier leave the name to the registry.
 """
 function _imports!(units::Vector{Unit}, syntax::Dict{String,Syntax}, inventory::Inventory)
-    names = [project.name for project in inventory.projects if ispackage(project)]
-    workspace = Dict(project.name => project.dir for project in inventory.projects
-                     if ispackage(project) && count(==(project.name), names) == 1)
+    workspace = Dict{String,String}()
+    for tier in [[filter(ispackage, inventory.projects)]; inventory.available]
+        names = [project.name for project in tier]
+        for project in tier
+            get!(workspace, project.name, count(==(project.name), names) == 1 ? project.dir : "")
+        end
+    end
     # Other modules the tree defines, loaded through `LOAD_PATH`, say, are not packages to look up.
-    defined = setdiff(Set(name for facts in values(syntax) for name in facts.modules), names)
+    defined = setdiff(Set(name for facts in values(syntax) for name in facts.modules), keys(workspace))
     available = union(Set(readdir(Sys.STDLIB)), ("Base", "Core", "Main"), defined)
     imported = Dict{Context,Set{String}}()
     for unit in units
@@ -241,13 +250,14 @@ function _packages(source::Source, projects::Dict{String,Project})
     return owner === nothing || isempty(owner.name) ? Dict{String,Project}() : Dict(owner.name => owner)
 end
 
-function _configure(units::Vector{Unit}, config::Config, root::String)
+"Whether `rule` of `config` selects the unit whose entry is `entry`."
+_selects(rule::ContextRule, config::Config, entry::String) = occursin(rule.pattern, _slash(relpath(entry, config.directory)))
+
+function _configure(units::Vector{Unit}, config::Config)
     for rule in config.contexts
-        matched = false
         set(key, value, current) = key in rule.keys ? value : current
         for (i, unit) in pairs(units)
-            occursin(rule.pattern, _slash(relpath(unit.entry, root))) || continue
-            matched = true
+            _selects(rule, config, unit.entry) || continue
             context = unit.context
             "project" in rule.keys && (context = Context(rule.project, context.owner, context.test, context.triggers))
             current = unit.overrides
@@ -261,7 +271,6 @@ function _configure(units::Vector{Unit}, config::Config, root::String)
             units[i] = Unit(unit.id, unit.kind, unit.entry, context, unit.expected, unit.driver,
                             unit.extension, overrides, notes)
         end
-        matched || throw(ArgumentError("$(config.file): [[context]] match $(repr(rule.match)) selects no unit"))
     end
     return units
 end
