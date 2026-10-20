@@ -233,6 +233,103 @@ end
                 @test r.ok && [a.b for a in r.items] == [1]
             end
             """)
+        # Tiers whose other branch logs, or whose tests stand in a `let` block, are analyzed
+        # whatever their conditions.
+        write(joinpath(root, "tiers.jl"), """
+            using Test
+            if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                @testset "logged" begin
+                    foreach(x -> println(x), 1:2)
+                    sin("logged")
+                end
+            else
+                @info "skipped"
+            end
+            if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                println("setup")
+                let n = 2
+                    @testset "scoped" begin
+                        foreach(x -> println(x + n), 1:n)
+                        cos("scoped")
+                    end
+                end
+            end
+            """)
+        # Nor do closures under control flow in a test set make JETLS run its statements or
+        # leave them undefined.
+        write(joinpath(root, "testsets.jl"), """
+            using Test
+            const RAN = joinpath(@__DIR__, "testsets.marker")
+            items() = (touch(RAN); [1, 2])
+            @testset "a branch" begin
+                if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                    foreach(x -> println(x), 1:2)
+                    sin("branch")
+                end
+            end
+            @testset "closures of the test set's values in a loop" begin
+                xs = items()
+                for (f, n) in ((() -> xs[1] + 1, 1), (() -> xs[2] + 1, 2))
+                    try
+                        @test f() > n
+                    finally
+                        nothing
+                    end
+                end
+                tan("loop")
+            end
+            """)
+        # A conditional that binds names, as a driver's selection of its files does, has its
+        # test sets analyzed by themselves, whichever branch runs.
+        write(joinpath(root, "driver.jl"), """
+            using Test
+            if !isempty(ARGS)
+                include(ARGS[1])
+            else
+                helper(x) = x + 1
+                @testset "all" begin
+                    @test helper(1) == 2
+                    if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                        foreach(x -> println(x), 1:2)
+                        sin("tier")
+                    end
+                end
+            end
+            if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                tiered() = 1
+                @testset "untaken" begin
+                    if isempty(ARGS)
+                        foreach(x -> println(x), 1:2)
+                        cos("untaken")
+                    end
+                end
+            end
+            """)
+        # The constants of a statement JETLS leaves unevaluated are all bound, also after a
+        # closure in a loop, with what JETLS knows of them; and code after it is analyzed.
+        write(joinpath(root, "constants.jl"), """
+            parsed(args) = (isempty(args) ? "mode" : args[1], "out.json")
+            const MODE, OUT = parsed(ARGS)
+            out() = sin(OUT)
+            const CONTRACT_ONLY = get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+            if !CONTRACT_ONLY
+                const ROOT = joinpath(@__DIR__, MODE)
+                const LANE = isempty(MODE) ? "default" : MODE
+                const REPORTS = string(ROOT, "/", LANE)
+            end
+            reports() = REPORTS
+            report_count() = reports() + 1
+            untyped() = Base.inferencebarrier(1)::Any
+            const VALUE = untyped()
+            value() = VALUE
+            use_value() = sin(value())
+            let
+                for x in 1:2
+                    f = y -> y + x
+                end
+                tan("after the loop")
+            end
+            """)
         output = joinpath(root, ".jetsweep", "report")
         io = IOBuffer()
         result = integration_sweep(root, output; io, fail_on=:none)
@@ -260,6 +357,19 @@ end
         @test status("arguments.jl") in (:clean, :findings)
         @test status("selection.jl") === :clean
         @test status("outlined.jl") === :clean && !isfile(joinpath(root, "ran.marker"))
+        unit(name) = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, name))
+        errors(name) = sort!([f.line for f in unit(name).findings if f.code == "inference/method-error"])
+        undefined(name) = [f for f in unit(name).findings if occursin("undef-global-var", f.code)]
+        @test errors("tiers.jl") == [5, 15] && isempty(undefined("tiers.jl"))
+        @test errors("testsets.jl") == [7, 19] && isempty(undefined("testsets.jl"))
+        @test !isfile(joinpath(root, "testsets.marker"))
+        # JETLS finds what a branch it does not take defines undefined there, but not in its tests.
+        @test errors("driver.jl") == [10, 19] && [f.line for f in undefined("driver.jl")] == [15]
+        @test errors("constants.jl") == [3, 11, 20]
+        # Code that runs later may find the conditional's constants undefined, the statement
+        # that assigns them not.
+        @test [(f.line, f.severity) for f in undefined("constants.jl")] == [(10, 3)]
+        @test !any(f -> occursin("AbstractBindingState", f.message), unit("constants.jl").findings)
         @test status("locked.jl") === :findings && !isfile(joinpath(root, "acquired.marker"))
         @test status("bootstrap.jl") === :findings
         @test status("main_check.jl") === :findings

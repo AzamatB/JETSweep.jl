@@ -66,55 +66,124 @@ function typed_closure(ex)
     return any(typed_closure, ex.args)
 end
 
-"Whether `ex` defines a function, anonymous or local, in a branch, whose condition JET would evaluate."
-function branch_function(ex, conditional::Bool=false)
+"""
+Whether `ex` defines a function, anonymous or local, under control flow: in a branch, whose
+condition JET would evaluate to define it, or, with `nested`, in a loop or `try` block too,
+whose control flow and captured values JET may run to define it there.
+"""
+function controlled_function(ex, controlled::Bool=false; nested::Bool=false)
     ex isa Expr && !(ex.head in (:quote, :inert)) || return false
-    (ex.head in (:->, :function, :generator) || (ex.head === :(=) && signature(first(ex.args)))) && return conditional
-    ex.head in (:if, :elseif, :&&, :||) &&
-        return branch_function(first(ex.args), conditional) || any(arg -> branch_function(arg, true), ex.args[2:end])
-    return any(arg -> branch_function(arg, conditional), ex.args)
+    (ex.head in (:->, :function, :generator) || (ex.head === :(=) && signature(first(ex.args)))) && return controlled
+    if ex.head in (:if, :elseif, :&&, :||)
+        return controlled_function(first(ex.args), controlled; nested) ||
+            any(arg -> controlled_function(arg, true; nested), ex.args[2:end])
+    end
+    nested && ex.head in (:for, :while, :try) && return any(arg -> controlled_function(arg, true; nested), ex.args)
+    return any(arg -> controlled_function(arg, controlled; nested), ex.args)
 end
 signature(ex) = ex isa Expr && (ex.head === :call || (ex.head in (:where, :(::)) && signature(first(ex.args))))
 imports(ex) = ex isa Expr && !(ex.head in (:quote, :inert)) && (ex.head in (:using, :import) || any(imports, ex.args))
-
-"""
-Whether `ex` is a loop or `let` block that defines a function in a branch. Its body is a
-local scope already, as a closure's is, so JET can analyze it in one; only imports, which
-must stand at top level, keep it there.
-"""
-outlinable_scope(ex) = ex isa Expr && ex.head in (:for, :while, :let) && branch_function(ex) && !imports(ex)
+"Whether `ex` defines a type, which a local scope at top level defines globally."
+defines_type(ex) = ex isa Expr && !(ex.head in (:quote, :inert)) &&
+    (ex.head in (:struct, :abstract, :primitive) || (ex.head === :macrocall && macro_name(ex) === Symbol("@enum")) ||
+     any(defines_type, ex.args))
 
 const TEST_MACROS = Set(Symbol.(["@testset", "@test", "@test_throws", "@test_broken", "@test_skip", "@test_logs",
                                  "@test_warn", "@test_nowarn", "@test_deprecated", "@inferred"]))
+"Logging macros, which evaluate their arguments in a `let` block of their own."
+const LOGGING_MACROS = Set(Symbol.(["@debug", "@info", "@warn", "@error", "@logmsg"]))
+"Macros that expand to a value where they stand, the same in a function."
+const VALUE_MACROS = Set(Symbol.(["@__DIR__", "@__FILE__", "@__MODULE__", "@__LINE__", "@isdefined", "@r_str",
+                                  "@raw_str", "@s_str", "@v_str", "@big_str"]))
+"The heads of the expressions JET analyzes in a closure, when their arguments allow."
+const THUNK_SAFE_HEADS = (LS.JET.THUNK_SAFE_TEST_CALL_HEADS..., LS.JET.THUNK_SAFE_TEST_CONTROL_HEADS...,
+                          LS.JET.THUNK_SAFE_TEST_LITERAL_HEADS..., LS.JET.THUNK_SAFE_TEST_TYPE_HEADS...)
 macro_name(ex) = (name = first(ex.args); name isa Symbol ? name :
     Meta.isexpr(name, :., 2) && last(name.args) isa QuoteNode ? last(name.args).value : nothing)
 
-"Whether code binds nothing where it stands: tests, whose bodies are local scopes, and what JET outlines."
+"""
+Whether `ex` is a local scope that defines a function under control flow inside it: a loop,
+`let` or `try` block, or a test set, whose body is a local scope already, as a closure's is,
+so JET can analyze it in one. A function directly in a loop or test set needs no control flow
+to be defined.
+"""
+outlinable_scope(ex) = ex isa Expr && (ex.head in (:for, :while, :let, :try) ||
+    (ex.head === :macrocall && macro_name(ex) === Symbol("@testset"))) &&
+    any(arg -> controlled_function(arg; nested=true), ex.args)
+
+"""
+Whether code binds nothing where it stands: tests and logging, whose bodies and arguments
+are local scopes, loops, `let` and `try` blocks, and calls and control flow of these, of
+values and of what JET outlines.
+"""
 binds_nothing(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) ||
-    (ex.head === :macrocall ? macro_name(ex) in TEST_MACROS :
-     ex.head in (:block, :if, :elseif) ? all(binds_nothing, ex.args) : LS.JET.is_test_expression_thunk_safe(ex))
+    (ex.head === :macrocall ? any(names -> macro_name(ex) in names, (TEST_MACROS, LOGGING_MACROS, VALUE_MACROS)) :
+     ex.head in (:block, :if, :elseif) ? all(binds_nothing, ex.args) :
+     ex.head in (:for, :while, :let, :try) || (ex.head in THUNK_SAFE_HEADS && all(binds_nothing, ex.args)) ||
+     LS.JET.is_test_expression_thunk_safe(ex))
 
 """
 Whether `ex` is a conditional of tests that defines a function in a branch, such as a tier an
 environment variable enables. It binds nothing, so JET can analyze it in a closure of its own
 rather than define only the closures of the branch its condition takes.
 """
-outlinable_tests(ex) = Meta.isexpr(ex, :if) && binds_nothing(ex) && branch_function(ex) && !imports(ex)
+outlinable_tests(ex) = Meta.isexpr(ex, :if) && binds_nothing(ex) && controlled_function(ex)
+
+"""
+Whether the worker analyzes the top-level statement `ex` in a function of its own. Code that
+includes or evaluates code stays at top level, where JET follows it, as do imports and type
+definitions, which bind globals only there, and closures with typed parameters, since
+lowering would evaluate their types anyway.
+"""
+outlinable(ex) = ex isa Expr &&
+    (LS.JET.should_wrap_test_expression_in_thunk(ex) || outlinable_scope(ex) || outlinable_tests(ex)) &&
+    !stays(ex) && !typed_closure(ex) && !imports(ex) && !defines_type(ex)
 
 "The name tag of the functions the worker outlines top-level code into."
 const OUTLINED = :jetsweep_outlined
 
+"""
+`ex`, a top-level conditional, with each statement of its branches that `outlinable` accepts
+replaced by a call of a function `outlined` defines, as are those of conditionals among them.
+Those statements are top-level code too, but their conditional binds names, so it cannot be
+outlined itself.
+"""
+function outline_statements(ex, outlined::Vector{Any})
+    Meta.isexpr(ex, (:if, :elseif)) &&
+        return Expr(ex.head, first(ex.args), (outline_statements(arg, outlined) for arg in ex.args[2:end])...)
+    Meta.isexpr(ex, :block) || return ex
+    statements, line = Any[], nothing
+    for statement in ex.args
+        statement isa LineNumberNode && (line = statement)
+        if outlinable(statement)
+            name = gensym(OUTLINED)
+            push!(outlined, Expr(:function, Expr(:call, name), Expr(:block, filter(!isnothing, Any[line, statement])...)))
+            statement = Expr(:call, name)
+        else
+            statement = outline_statements(statement, outlined)
+        end
+        push!(statements, statement)
+    end
+    return Expr(:block, statements...)
+end
+
 # JET analyzes any top-level expression it can outline the same way, such as
 # `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`, and
-# loops and `let` blocks. Closures with typed parameters stay, since lowering would evaluate
-# their types anyway.
+# local scopes, and conditionals of tests. A conditional that binds names, such as a test
+# driver's selection of its test files, or a tier that defines what its tests use, has its
+# statements outlined instead, into functions defined before it, so that what they define
+# needs no condition: the tests of a branch its condition does not take are analyzed too.
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
-        (should_wrap_test_expression_in_thunk(x) || $outlinable_scope(x) || $outlinable_tests(x)) && !$stays(x) &&
-            !$typed_closure(x) || return x
-        thunk = gensym($(QuoteNode(OUTLINED)))
-        return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), Expr(:block, x)), Expr(:call, thunk)))
+        if $outlinable(x)
+            thunk = gensym($(QuoteNode(OUTLINED)))
+            return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), Expr(:block, x)), Expr(:call, thunk)))
+        end
+        isexpr(x, :if) || return x
+        outlined = Any[]
+        x = $outline_statements(x, outlined)
+        return isempty(outlined) ? x : Expr(:block, outlined..., x)
     end
 end)
 
@@ -147,7 +216,8 @@ end)
 Core.eval(LS.Analyzer, quote
     function report_failing_test!(analyzer::LSAnalyzer, sv::CC.InferenceState, argtypes::Vector{Any})
         def = sv.linfo.def
-        def isa Module || (def isa Method && startswith(String(def.name), $("#$OUTLINED#"))) || return false
+        def isa Module || (def isa Method && (startswith(String(def.name), $("#$OUTLINED#")) ||
+                                             startswith(String(def.name), $("##$OUTLINED#")))) || return false
         length(argtypes) == 2 || return false
         value = CC.widenconditional(argtypes[2])
         if value isa Const && value.val === false
@@ -175,6 +245,96 @@ Core.eval(LS.Analyzer, quote
         end
         @static JETLS_DEV_MODE && assert_valid_report_stack(report, stack, "display")
         return stack
+    end
+end)
+
+"Whether the statement at `pc` of `code` assigns the global `gr`, as a constant or not."
+function assigns(code::Vector{Any}, pc::Int, gr::GlobalRef)
+    stmt = code[pc]
+    Meta.isexpr(stmt, :call, 4) || return false
+    f, mod, name = stmt.args[1], stmt.args[2], stmt.args[3]
+    f in (GlobalRef(Core, :declare_const), GlobalRef(Core, :setglobal!), Core.declare_const, Core.setglobal!) ||
+        return false
+    mod isa GlobalRef && isdefinedglobal(mod.mod, mod.name) && (mod = getglobal(mod.mod, mod.name))
+    return mod === gr.mod && name isa QuoteNode && name.value === gr.name
+end
+
+"Whether top-level code `frame` has assigned `gr` on every path to the statement it is at."
+function assigned(frame, gr::GlobalRef)
+    CC = LS.JET.CC
+    code, cfg, pc = frame.src.code, frame.cfg, frame.currpc
+    block = CC.block_for_inst(cfg, pc)
+    domtree = nothing
+    for i in eachindex(code)
+        i != pc && assigns(code, i, gr) || continue
+        b = CC.block_for_inst(cfg, i)
+        if b == block
+            i < pc && return true
+        else
+            domtree === nothing && (domtree = CC.construct_domtree(cfg))
+            CC.dominates(domtree, b, block) && return true
+        end
+    end
+    return false
+end
+
+"Whether `gr` is a constant that JET defines as a placeholder in the world of `frame`."
+function placeholder(gr::GlobalRef, frame)
+    CC = LS.JET.CC
+    partition = Base.lookup_binding_partition(frame.world.this, gr)
+    return CC.is_defined_const_binding(CC.binding_kind(partition)) &&
+        CC.partition_restriction(partition) isa LS.JET.AbstractBindingState
+end
+
+"Reports added from `n` on that `gr` is not defined."
+undefined_reports(reports, n::Int, gr::GlobalRef) =
+    [i for i in n+1:length(reports) if reports[i] isa LS.Analyzer.UndefVarErrorReport && reports[i].var == gr]
+
+# Lowering puts a `:latestworld` after each constant, global declaration, definition and
+# import, and before each closure it constructs. Inference reads globals after one as `Any`
+# and records no assignment to them, since the world may have changed. JET ignores one it
+# evaluates, but not one it leaves unevaluated, as after an unevaluated `const`: so it lost
+# whatever followed in the same statement, such as the later constants of `const A, B = f()`
+# or of a conditional, which it reported undefined, and every report after a closure in a
+# loop. JET analyzes a statement in the world its evaluation left, and records itself the
+# bindings of what it leaves unevaluated, so a world update changes nothing it knows.
+#
+# The code JET analyzes after such a statement now meets two imprecisions of its own, which
+# this override corrects at loads of globals, each a statement of its own: correcting them in
+# JET's load of a binding, which all of inference calls, would recompile all of inference in
+# each worker. JET records a constant or global that a conditional assigns as one that may be
+# undefined, as it is where code that runs later reads it, but not where the statement that
+# assigns it reads it afterwards, as `const B = f(A)` does after `const A = g()` in the same
+# branch. And JET defines a constant it leaves unevaluated as a placeholder holding what it
+# knows of the value, inferring its loads as that, with the effects of a constant's load: so
+# inference would evaluate a call that reads one natively, as of `name() = NAME` once
+# `const NAME = f()` is inferred as `Any`, and get the placeholder itself, for which the
+# function it is passed to then reports a method error. A load of a placeholder is not
+# consistent, so no such call is evaluated.
+Core.eval(LS.JET, quote
+    function CC.abstract_eval_basic_statement(analyzer::ToplevelAbstractAnalyzer, @nospecialize(stmt),
+            sstate::StatementState, frame::InferenceState, result::Union{Nothing,Future{RTEffects}})
+        toplevel = istoplevelframe(frame)
+        isexpr(stmt, :latestworld) && toplevel &&
+            return CC.AbstractEvalBasicStatementResult(nothing, Any, nothing, nothing, nothing, #=saw_latestworld=#false)
+        load = isexpr(stmt, :(=), 2) ? stmt.args[2] : stmt
+        load isa GlobalRef && result === nothing ||
+            return @invoke CC.abstract_eval_basic_statement(analyzer::AbstractAnalyzer, stmt::Any,
+                sstate::StatementState, frame::InferenceState, result::Union{Nothing,Future{RTEffects}})
+        reports = toplevel ? get_reports(analyzer, frame.result) : nothing
+        n = reports === nothing ? 0 : length(reports)
+        ret = @invoke CC.abstract_eval_basic_statement(analyzer::AbstractAnalyzer, stmt::Any,
+            sstate::StatementState, frame::InferenceState, result::Union{Nothing,Future{RTEffects}})
+        if reports !== nothing && length(reports) > n
+            undefined = $undefined_reports(reports, n, load)
+            isempty(undefined) || !$assigned(frame, load) || deleteat!(reports, undefined)
+        end
+        if ret isa CC.AbstractEvalBasicStatementResult && ret.effects isa CC.Effects && $placeholder(load, frame)
+            (; rt, exct, effects, changes, refinements, currsaw_latestworld) = ret
+            effects = CC.Effects(effects; consistent=CC.ALWAYS_FALSE)
+            ret = CC.AbstractEvalBasicStatementResult(rt, exct, effects, changes, refinements, currsaw_latestworld)
+        end
+        return ret
     end
 end)
 

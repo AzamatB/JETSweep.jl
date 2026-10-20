@@ -913,6 +913,60 @@ end
     @test !JETSweep._outlined(:(if ready; @time foreach(x -> x, 1:2); end))
     @test syntax_patterns("const ON = get(ENV, \"X\", \"\") == \"1\"\nif ON\n    @testset \"t\" begin\n        foreach(x -> x, 1:2)\n    end\nend\n") ==
           String[]
+    # Logging binds nothing, nor do loops, `let` and `try` blocks, whose bodies are local
+    # scopes, nor values such as `@__FILE__`.
+    @test JETSweep._outlined(:(if ON; @testset "t" begin; foreach(x -> x, 1:2); end; else; @info "skipped"; end))
+    @test JETSweep._outlined(:(if ON; f(); let n = g(); @testset "t" begin; ready && map(x -> x, n); end; end; end))
+    @test JETSweep._outlined(:(if ON; for n in 1:2; try; foreach(x -> x + n, 1:2); catch; end; end; end))
+    @test JETSweep._outlined(:(if abspath(PROGRAM_FILE) == @__FILE__; let a = ARGS[1]; open(io -> write(io, a), a); end; end))
+    @test !JETSweep._outlined(:(if ON; @time foreach(x -> x, 1:2); else; @info "skipped"; end))
+    # A local scope defines types and imports globally, as in a function it cannot.
+    @test !JETSweep._outlined(:(if ON; let; struct S end; ready && map(x -> x, 1:2); end; end))
+    @test !JETSweep._outlined(:(if ON; let; @enum E a; ready && map(x -> x, 1:2); end; end))
+    @test !JETSweep._outlined(:(for x in xs; if ready; map(y -> y, x); end; abstract type A end; end))
+    # A test set is a local scope too, outlined where it defines a function under control
+    # flow, a loop's or `try` block's as well as a branch's; one directly in it needs none.
+    @test JETSweep._outlined(:(@testset "t" begin; if ready; foreach(x -> x, xs); end; end))
+    @test JETSweep._outlined(:(@testset "t" begin; for (f, n) in ((() -> v + 1, 1),); @test f() > n; end; end))
+    @test JETSweep._outlined(Meta.parse("Test.@testset \"t\" for v in vs\n    try\n        map(x -> x + v, xs)\n    catch\n    end\nend"))
+    @test !JETSweep._outlined(:(@testset "t" begin; f = () -> v + 1; @test f() > 1; end))
+    @test !JETSweep._outlined(:(@testset "t" begin; if ready; map(x -> x, xs); end; using Statistics; end))
+    @test !JETSweep._outlined(:(@testset "t" include("t.jl")))
+    # So are `let` and `try` blocks at top level, and loops, whose own bodies need none.
+    @test JETSweep._outlined(:(let; try; for (f, n) in ((() -> v + 1, 1),); f(); end; catch; end; end))
+    @test JETSweep._outlined(:(try; v = g(); for (f, n) in ((() -> v + 1, 1),); f(); end; catch; end))
+    @test JETSweep._outlined(:(for v in vs; try; map(x -> x + v, xs); catch; end; end))
+    @test !JETSweep._outlined(:(try; map(x -> x, xs); catch; end))
+    # Statements of a conditional that binds names are outlined as they would be standing
+    # alone, so the closures in them need no condition, and those of a test set none of its
+    # own; what the conditional defines still needs it, as do the closures it does not outline.
+    code = """
+        const ON = get(ENV, "X", "") == "1"
+        if ON
+            x = 1
+            @testset "t" begin
+                if get(ENV, "Y", "") == "1"
+                    foreach(y -> y, 1:2)
+                end
+            end
+        end
+        """
+    @test syntax_patterns(code) == String[]
+    @test syntax_patterns(replace(code, "x = 1" => "helper() = 1")) == ["const ON = get(ENV, \"X\", \"\") == \"1\""]
+    code = """
+        const ON = get(ENV, "X", "") == "1"
+        if ON
+            x = 1
+        else
+            begin
+                y = 2
+                ready || foreach(z -> z, 1:2)
+            end
+        end
+        """
+    @test syntax_patterns(code) == String[]
+    @test syntax_patterns("const ON = get(ENV, \"X\", \"\") == \"1\"\nif ON\n    x = 1\nelse\n    foreach(y -> y, 1:2)\nend\n") ==
+          ["const ON = get(ENV, \"X\", \"\") == \"1\""]
     # Loop and `let` bodies are local scopes already, unless they import.
     @test JETSweep._outlined(:(for (name, entries) in deps; if haskey(m, name); all(e -> e, entries); end; end))
     @test JETSweep._outlined(:(let r = slow(); if r > 0; g(x) = x + 1; end; end))
