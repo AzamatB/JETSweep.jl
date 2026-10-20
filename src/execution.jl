@@ -501,6 +501,26 @@ function _new_directory(parent::String, name::String)
 end
 
 """
+Notes on the `[[context]]` tables that select no planned unit, as is expected of a sweep that
+leaves out the files they select: with `--exclude`, or of a directory below the
+configuration's. A table that selects no unit of the full sweep either, of the configuration's
+directory without `--exclude`, is a mistake.
+"""
+function _unselected(config::Config, units::Vector{Unit}, root::String, options::SweepOptions, output::String)
+    unselected = filter(rule -> !any(unit -> _selects(rule, config, unit.entry), units), config.contexts)
+    isempty(unselected) && return String[]
+    whole = _within(root, _directory(config)) ? _directory(config) : root
+    full = whole == root && isempty(options.exclude) ? units :
+        plan(discover(whole; config, output, include_ignored=options.include_ignored, tracked_only=options.tracked_only))
+    for rule in unselected
+        any(unit -> _selects(rule, config, unit.entry), full) ||
+            throw(ArgumentError("$(config.file): [[context]] match $(repr(rule.match)) selects no unit"))
+    end
+    return ["$(config.file): [[context]] match $(repr(rule.match)) selects no unit of this sweep, " *
+            "which leaves out the files it selects" for rule in unselected]
+end
+
+"""
     sweep(root; options=SweepOptions(), io=stderr) -> SweepResult
 
 Discover, plan and analyze everything below `root`, writing a report directory. Every
@@ -521,23 +541,26 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     output = isempty(options.output) ? "" : abspath(options.output)
     isempty(output) || !ispath(output) || isdir(output) && isempty(readdir(output)) ||
         throw(ArgumentError("report directory must be new or empty: $output"))
-    inventory = discover(root; exclude=[config.exclude; options.exclude], output,
+    inventory = discover(root; exclude=options.exclude, config, output,
                          include_ignored=options.include_ignored, tracked_only=options.tracked_only)
     syntax = source_syntax(inventory)
     units = plan(inventory, config; syntax)
+    notes = _unselected(config, units, root, options, output)
     output = isempty(output) ? _new_directory(joinpath(root, ".jetsweep"), Libc.strftime("%Y%m%d-%H%M%S", time())) :
              mkpath(output)
     write_tag(output)
     write_inventory(joinpath(output, "inventory.toml"), inventory)
-    write_plan(joinpath(output, "plan.toml"), units, inventory.root)
+    write_plan(joinpath(output, "plan.toml"), units, inventory.root, notes)
     contexts = unique(unit.context for unit in units)
-    packages = count(ispackage, inventory.projects)
+    # Packages of excluded directories are not analyzed.
+    files = Set(source.path for source in inventory.sources)
+    packages = count(project -> ispackage(project) && project.entry in files, inventory.projects)
     println(io, "JETSweep: $(length(inventory.sources)) files, $packages packages, $(length(units)) units, ",
             "$(length(contexts)) environments")
     if options.plan_only
-        report_issues(io, inventory)
+        report_issues(io, inventory, notes)
         println(io, "Plan written to $output")
-        return SweepResult(root, output, inventory, units, UnitResult[], String[], time() - started,
+        return SweepResult(root, output, inventory, units, notes, UnitResult[], String[], time() - started,
                            isempty(inventory.issues) ? 0 : 2)
     end
     before = _snapshot(inventory, config)
@@ -600,11 +623,11 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
         return [_task(unit, previous) for unit in followups]
     end
     with_display(() -> _dispatch(step, [_task(context, members[context], previous) for context in contexts], options.jobs))
-    after = _snapshot(discover(root; exclude=[config.exclude; options.exclude], output,
+    after = _snapshot(discover(root; exclude=options.exclude, config, output,
                                include_ignored=options.include_ignored, tracked_only=options.tracked_only), config)
     changed = sort!([file for file in union(keys(before), keys(after)) if get(before, file, "") != get(after, file, "")])
     ordered = [results[unit.id] for unit in units]
-    summary = SweepResult(root, output, inventory, units, ordered, changed, time() - started,
+    summary = SweepResult(root, output, inventory, units, notes, ordered, changed, time() - started,
                           exit_code(inventory, ordered, changed, options.fail_on))
     write_report(summary; io)
     return summary

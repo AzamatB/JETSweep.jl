@@ -11,9 +11,9 @@ using SHA
 using TOML
 
 include("model.jl")
+include("config.jl")
 include("discovery.jl")
 include("syntax.jl")
-include("config.jl")
 include("planning.jl")
 include("environments.jl")
 include("processes.jl")

@@ -47,8 +47,8 @@ jetsweep --exclude vendor --exclude '**/generated/*.jl' DIRECTORY
 | `--timeout SECONDS` | Time limit per analysis or environment, 0 for none (default 1800). JETLS's own limit on evaluating each top-level statement, which counts compilation and so grows with load, is 300 s instead of its editor default of 10 s, unless `.JETLSConfig.toml` sets `full_analysis.concretization_timeout`. |
 | `--gpus auto\|none\|LIST` | GPUs assigned round-robin through `CUDA_VISIBLE_DEVICES` (default `auto`: the visible devices). |
 | `--output DIRECTORY` | Report directory, new or empty (default `DIRECTORY/.jetsweep/TIMESTAMP`, or `TIMESTAMP-2` and so on if another sweep has it). |
-| `--config FILE` | Configuration file (default `DIRECTORY/.JETSweep.toml`, if present). |
-| `--exclude GLOB` | Skip matching paths; repeatable. A pattern with `/` inside, or starting with `/` or `./`, matches the path relative to `DIRECTORY`; any other pattern matches a path segment. |
+| `--config FILE` | Configuration file (default `DIRECTORY/.JETSweep.toml`, if present). A workspace's configuration applies to a sweep of one of its directories as to the whole. |
+| `--exclude GLOB` | Skip matching paths; repeatable. A pattern with `/` inside, or starting with `/` or `./`, matches the path relative to `DIRECTORY`; any other pattern matches a path segment. Excluded packages are not analyzed, but code that loads them still finds them. |
 | `--include-ignored`, `--tracked-only` | Include files Git ignores; include only files Git tracks. |
 | `--offline` | Resolve environments among the package versions already installed, and download nothing. |
 | `--plan` | Write the inventory and the analysis plan without analyzing. |
@@ -63,7 +63,10 @@ unless Git tracks files inside them, so editor and tool state stays out while, f
 a JLL package's tracked `.pkg` scripts stay in. Directories a `CACHEDIR.TAG` marks as caches
 are skipped, tracked or not; JETSweep tags its report directories so, and a later sweep does
 not analyze one that `--output` put inside the directory. Symlinks are not followed: inside
-the root they only alias what discovery reaches anyway, or what it excludes. The files are
+the root they only alias what discovery reaches anyway, or what it excludes. Paths that
+`--exclude` and the configuration exclude are not analyzed, but the projects of excluded
+directories still count as the workspace's, without their sources or metadata problems, so
+that code loading their packages finds them, as it would without the exclusion. The files are
 then grouped into analysis units, each covering its entry file and the files it includes:
 
 | Unit | Entry | Analysis |
@@ -175,10 +178,10 @@ As in Pkg, a path dependency depends on what its project declares, whatever a ma
 recorded of it.
 Scripts and tests that import packages their projects do not declare, because they run
 with another project active or rely on their workspace, get those packages added: packages
-of the workspace from their directories, others from the registry. If they cannot all be
-added, the environment gets those of the workspace alone, or failing that none; the units'
-notes name the packages added and those left out. Modules the tree defines that are not
-packages, as scripts load through `LOAD_PATH`, are not looked up. With
+of the workspace from their directories, excluded ones too, others from the registry. If
+they cannot all be added, the environment gets those of the workspace alone, or failing that
+none; the units' notes name the packages added and those left out. Modules the tree defines
+that are not packages, as scripts load through `LOAD_PATH`, are not looked up. With
 `--offline`, resolution considers installed versions only. Each environment is then
 precompiled once for all its units; packages that fail to precompile, or that a timeout
 leaves without package images, load from source. Preparations run side by side, but take
@@ -213,14 +216,19 @@ concretization patterns apply. JETSweep prepares environments itself, so it sets
 defaults `full_analysis.concretization_timeout` as `--timeout` describes.
 
 An optional `.JETSweep.toml` at the root adds exclusions and context for units that need it,
-such as scripts that expect arguments or a different environment. `exclude` patterns follow
-the `--exclude` rules. Each `match` is a glob that a unit's entry path, relative to the root,
-must match whole, and must select at least one planned unit; `project`, `setup` and
-`jetls_config` are paths relative to the configuration file. `setup` files are included
-before the entry of a test or script; package, extension and orphan analyses load the
-package itself, so their units do not apply `setup`, and note so. When several tables match
-a unit, each key a later table sets overrides earlier ones, except `env`, whose variables
-merge. Follow-up units inherit the context and settings of the unit they follow.
+such as scripts that expect arguments or a different environment. Its paths and globs are
+relative to its directory: `exclude` patterns follow the `--exclude` rules there, each `match`
+is a glob that a unit's entry path must match whole, and `project`, `setup` and
+`jetls_config` are paths. So a workspace's configuration, given with `--config`, applies to a
+sweep of one of its directories as it does to the whole workspace. Each `match` must select a
+planned unit, or, where `--exclude` or a narrower `DIRECTORY` leaves out what it selects, a
+unit of the full sweep, of the configuration's directory without `--exclude`, and the summary
+notes the context; a `match` that selects no unit of the full sweep either is an error.
+`setup` files are included before the entry of a test or script; package, extension and
+orphan analyses load the package itself, so their units do not apply `setup`, and note so.
+When several tables match a unit, each key a later table sets overrides earlier ones, except
+`env`, whose variables merge. Follow-up units inherit the context and settings of the unit
+they follow.
 
 ```toml
 exclude = ["vendor", "**/generated/*.jl"]
@@ -237,10 +245,11 @@ jetls_config = "tools/.JETLSConfig.toml"
 ## Reports
 
 The report directory contains `report.toml` (every unit's status, reasons, notes, timing and
-log, and the deduplicated diagnostics), `summary.txt` (the diagnostics as `file:line:column`
-with messages, every incomplete unit with its reasons, notes and log, and the files no
-complete analysis covered), the inventory and plan, each unit's and environment's request,
-result and log, and the `CACHEDIR.TAG` that keeps sweeps and backups out of it. A unit whose
+log, the plan's notes, and the deduplicated diagnostics), `summary.txt` (the diagnostics as
+`file:line:column` with messages, the plan's notes, every incomplete unit with its reasons,
+notes and log, and the files no complete analysis covered), the inventory and plan, each
+unit's and environment's request, result and log, and the `CACHEDIR.TAG` that keeps sweeps
+and backups out of it. A unit whose
 environment is unavailable never runs; its log is the environment's, if preparation logged
 anything. The terminal summary groups incomplete units by cause.
 Lines and columns count from 1, columns in UTF-16 code units as LSP positions do; a

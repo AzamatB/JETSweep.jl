@@ -708,6 +708,53 @@ end
     end
 end
 
+@testset "A context that selects no unit is a mistake, unless the sweep leaves out what it selects" begin
+    mktempdir() do directory
+        root = realpath(directory)
+        check = execution_touch(joinpath(root, "Swept", "tools", "check.jl"), "include(\"lib.jl\")\n")
+        execution_touch(joinpath(root, "Swept", "tools", "lib.jl"))
+        execution_touch(joinpath(root, "Swept", "tools", "generated.jl"))
+        execution_touch(joinpath(root, "Other", "run.jl"))
+        config = execution_touch(joinpath(root, ".JETSweep.toml"), """
+            exclude = ["Swept/tools/generated.jl"]
+            [[context]]
+            match = "Swept/tools/check.jl"
+            args = ["--fast"]
+            [[context]]
+            match = "Other/run.jl"
+            args = ["--other"]
+            """)
+        n = Ref(0)
+        planned(directory=root; options...) = sweep(directory; io=devnull,
+            options=SweepOptions(; plan_only=true, output=joinpath(root, ".reports", string(n[] += 1)), options...))
+        args(result) = Dict(relpath(unit.entry, root) => unit.overrides.args for unit in result.units)
+        note = "$config: [[context]] match \"Other/run.jl\" selects no unit of this sweep, which leaves out the files it selects"
+        @test isempty(planned().notes)
+        @test args(planned()) == Dict("Swept/tools/check.jl" => ["--fast"], "Other/run.jl" => ["--other"])
+        # Excluding its files, or sweeping a directory without them with the configuration of the
+        # one above, whose paths and globs are relative to it, leaves a context nothing to select.
+        excluded = planned(exclude=["Other"])
+        narrower = planned(joinpath(root, "Swept"); config)
+        for result in (excluded, narrower)
+            @test result.notes == [note] && result.exit_code == 0
+            @test args(result) == Dict("Swept/tools/check.jl" => ["--fast"])
+            @test TOML.parsefile(joinpath(result.output, "plan.toml"))["notes"] == [note]
+        end
+        io = IOBuffer()
+        sweep(root; io, options=SweepOptions(plan_only=true, output=joinpath(root, ".reports", "io"), exclude=["Other"]))
+        @test occursin("\nNote: .JETSweep.toml: [[context]] match \"Other/run.jl\" selects no unit of this sweep", String(take!(io)))
+        # A context that selects no unit of the full sweep either is a mistake, also one that selects
+        # only a file that another unit covers or the configuration excludes.
+        for match in ("Other/absent.jl", "Swept/tools/lib.jl", "Swept/tools/generated.jl")
+            write(config, "exclude = [\"Swept/tools/generated.jl\"]\n[[context]]\nmatch = \"$match\"\n")
+            message = "ArgumentError: $config: [[context]] match $(repr(match)) selects no unit"
+            @test_throws message planned()
+            @test_throws message planned(exclude=["Swept"])
+            @test_throws message planned(joinpath(root, "Other"); config)
+        end
+    end
+end
+
 @testset "The units of an unavailable environment point to its log, if it has one" begin
     mktempdir() do output
         unit = execution_unit(execution_touch(joinpath(output, "root", "script.jl")); kind=:script)
@@ -732,7 +779,7 @@ execution_incomplete(name, status, reasons, notes=String[]; log="") =
 function execution_report(output, units, results)
     inventory = JETSweep.Inventory("/root", JETSweep.Project[], JETSweep.Source[], String[], String[])
     io = IOBuffer()
-    JETSweep.write_report(JETSweep.SweepResult("/root", output, inventory, units, results, String[], 1.0, 2); io)
+    JETSweep.write_report(JETSweep.SweepResult("/root", output, inventory, units, String[], results, String[], 1.0, 2); io)
     return String(take!(io)), read(joinpath(output, "summary.txt"), String)
 end
 

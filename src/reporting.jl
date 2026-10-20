@@ -27,8 +27,8 @@ function _unit_dict(unit::Unit)
         "jetls_config" => unit.overrides.jetls_config, "notes" => unit.notes)
 end
 
-write_plan(file::String, units::Vector{Unit}, root::String) =
-    _write_toml(file, Dict("root" => root, "units" => _unit_dict.(units)))
+write_plan(file::String, units::Vector{Unit}, root::String, notes::Vector{String}=String[]) =
+    _write_toml(file, Dict("root" => root, "notes" => notes, "units" => _unit_dict.(units)))
 
 function report_progress(io::IO, unit::Unit, result::UnitResult, done::Int, total::Int, root::String)
     detail = if !complete(result)
@@ -42,8 +42,10 @@ function report_progress(io::IO, unit::Unit, result::UnitResult, done::Int, tota
     flush(io)
 end
 
-report_issues(io::IO, inventory::Inventory) =
+function report_issues(io::IO, inventory::Inventory, notes::Vector{String}=String[])
     foreach(issue -> println(io, "Discovery issue: ", _relative(issue, inventory.root)), inventory.issues)
+    foreach(note -> println(io, "Note: ", _relative(note, inventory.root)), notes)
+end
 
 "Findings deduplicated across units, which can analyze the same file."
 function unique_findings(results::Vector{UnitResult})
@@ -77,7 +79,7 @@ function write_report(result::SweepResult; io::IO=stderr)
         "root" => root, "julia" => string(VERSION), "jetsweep" => string(pkgversion(@__MODULE__)),
         "seconds" => result.seconds, "exit_code" => result.exit_code,
         "files" => length(result.inventory.sources), "units" => length(result.units), "statuses" => statuses,
-        "discovery_issues" => result.inventory.issues, "changed_during_run" => result.changed,
+        "discovery_issues" => result.inventory.issues, "notes" => result.notes, "changed_during_run" => result.changed,
         "unanalyzed" => unanalyzed,
         "results" => [Dict("unit" => r.unit, "kind" => String(byid[r.unit].kind), "entry" => byid[r.unit].entry,
                            "status" => String(r.status), "seconds" => r.seconds, "findings" => length(r.findings),
@@ -123,7 +125,7 @@ function _summarize(io::IO, result::SweepResult, findings, statuses, severities,
     for (code, n) in first(sort!(collect(codes); by=last, rev=true), 10)
         println(io, "  ", lpad(n, 6), "  ", code)
     end
-    report_issues(io, result.inventory)
+    report_issues(io, result.inventory, result.notes)
     for file in result.changed
         println(io, "Changed during the run: ", _display(file, root))
     end

@@ -113,7 +113,8 @@ Partition the inventory into analysis units:
   own scripts use its test environment;
 - extension sources no extension includes, with the package's bindings in scope.
 
-Includes are found by parsing, without executing any code.
+Includes are found by parsing, without executing any code. `config`'s `[[context]]` tables
+apply to the units they select; [`sweep`](@ref) checks that each selects one.
 """
 function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String,Syntax}=source_syntax(inventory))::Vector{Unit}
     root = inventory.root
@@ -196,7 +197,7 @@ function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String
         end
     end
     sort!(units; by=unit -> (unit.entry, unit.extension))
-    return _imports!(_configure(units, config, root), syntax, inventory)
+    return _imports!(_configure(units, config), syntax, inventory)
 end
 
 """
@@ -241,13 +242,14 @@ function _packages(source::Source, projects::Dict{String,Project})
     return owner === nothing || isempty(owner.name) ? Dict{String,Project}() : Dict(owner.name => owner)
 end
 
-function _configure(units::Vector{Unit}, config::Config, root::String)
+"Whether `rule` of `config` selects the unit whose entry is `entry`."
+_selects(rule::ContextRule, config::Config, entry::String) = occursin(rule.pattern, _slash(relpath(entry, _directory(config))))
+
+function _configure(units::Vector{Unit}, config::Config)
     for rule in config.contexts
-        matched = false
         set(key, value, current) = key in rule.keys ? value : current
         for (i, unit) in pairs(units)
-            occursin(rule.pattern, _slash(relpath(unit.entry, root))) || continue
-            matched = true
+            _selects(rule, config, unit.entry) || continue
             context = unit.context
             "project" in rule.keys && (context = Context(rule.project, context.owner, context.test, context.triggers))
             current = unit.overrides
@@ -261,7 +263,6 @@ function _configure(units::Vector{Unit}, config::Config, root::String)
             units[i] = Unit(unit.id, unit.kind, unit.entry, context, unit.expected, unit.driver,
                             unit.extension, overrides, notes)
         end
-        matched || throw(ArgumentError("$(config.file): [[context]] match $(repr(rule.match)) selects no unit"))
     end
     return units
 end

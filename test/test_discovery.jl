@@ -284,6 +284,41 @@ end
     end
 end
 
+@testset "Excluded directories keep their projects, without their sources or issues (Git: $git)" for git in (false, true)
+    mktempdir() do directory
+        root = realpath(directory)
+        sibling = discovery_package(root, "Sibling", "Sibling")
+        discovery_write(sibling, "test/runtests.jl")
+        discovery_write(sibling, "vendor/Broken/Project.toml", "[deps\n")
+        # What discovery leaves out for another reason stays out.
+        discovery_package(sibling, "node_modules/Pruned", "Pruned")
+        discovery_package(sibling, ".state/Hidden", "Hidden")
+        discovery_package(sibling, "ignored/Ignored", "Ignored")
+        discovery_package(root, "Kept", "Kept")
+        if git
+            discovery_write(root, ".gitignore", "ignored/\n")
+            discovery_git(root)
+        end
+        inventory = discover(root; exclude=["Sibling"])
+        @test discovery_files(inventory) == ["Kept/src/Kept.jl"]
+        @test sort!([discovery_relative(inventory, p.dir) for p in inventory.projects]) ==
+              (git ? ["Kept", "Sibling", "Sibling/vendor/Broken"] : ["Kept", "Sibling", "Sibling/ignored/Ignored", "Sibling/vendor/Broken"])
+        @test JETSweep.ispackage(discovery_project_at(inventory, "Sibling"))
+        @test isempty(inventory.issues)
+        @test discovery_reasons(inventory) == Dict("Sibling" => "excluded by pattern")
+        # An excluded project file is left out with the rest.
+        inventory = discover(root; exclude=["Sibling/Project.toml"])
+        @test !any(p -> p.dir == sibling, inventory.projects)
+        @test discovery_placement(inventory)["Sibling/src/Sibling.jl"] == (:script, "", "")
+        # A configuration's patterns are relative to its directory.
+        config = JETSweep.Config(joinpath(root, ".JETSweep.toml"), ["Sibling/test", "Broken"], JETSweep.ContextRule[])
+        ignored = git ? String[] : ["ignored/Ignored/src/Ignored.jl"]
+        @test discovery_files(discover(sibling; config)) == [ignored; "src/Sibling.jl"]
+        @test discovery_files(discover(sibling; exclude=["Sibling/test"])) == [ignored; "src/Sibling.jl"; "test/runtests.jl"]
+        @test isempty(discover(sibling; config).issues) && !isempty(discover(sibling).issues)
+    end
+end
+
 @testset "JETSweep._glob" begin
     matches(pattern, path) = occursin(JETSweep._glob(pattern), path)
     @test matches("*.jl", "a.jl") && !matches("*.jl", "a/b.jl") && !matches("*.jl", "a.jlx")

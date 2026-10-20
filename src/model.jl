@@ -138,6 +138,8 @@ struct SweepResult
     output::String
     inventory::Inventory
     units::Vector{Unit}
+    "Planning observations about the sweep as a whole, such as contexts that select no unit of it."
+    notes::Vector{String}
     results::Vector{UnitResult}
     changed::Vector{String}
     seconds::Float64

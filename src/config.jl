@@ -1,4 +1,4 @@
-"A `[[context]]` table: settings for units whose entry matches a root-relative glob."
+"A `[[context]]` table: settings for units whose entry matches a glob, relative to the configuration's directory."
 struct ContextRule
     match::String
     pattern::Regex
@@ -20,6 +20,9 @@ end
 
 Config() = Config("", String[], ContextRule[])
 
+"The directory a configuration's paths and globs are relative to: its file's, or `\"\"` without one."
+_directory(config::Config) = isempty(config.file) ? "" : dirname(config.file)
+
 function _strings(value, key::String, file::String)
     value isa Vector && all(item -> item isa String, value) ||
         throw(ArgumentError("$file: `$key` must be an array of strings"))
@@ -32,12 +35,12 @@ _absolute(base::String, path::String) = (path = normpath(abspath(base, path)); l
 """
     read_config(root, file="") -> Config
 
-Read `file`, or `root/.JETSweep.toml` when it exists. `exclude` patterns follow the
-`--exclude` rules; each `match` is a glob a unit's entry path, relative to `root`, must
-match whole. `project`, `setup` and `jetls_config` are paths relative to the file; `setup`
-applies to tests and scripts, not to package, extension and orphan analyses, which load the
-package itself. When several `[[context]]` tables match a unit, each key a later table sets
-overrides it, except `env`, whose variables merge.
+Read `file`, or `root/.JETSweep.toml` when it exists. Its paths and globs are relative to
+its directory: `exclude` patterns follow the `--exclude` rules there, each `match` is a glob
+a unit's entry path must match whole, and `project`, `setup` and `jetls_config` are paths.
+`setup` applies to tests and scripts, not to package, extension and orphan analyses, which
+load the package itself. When several `[[context]]` tables match a unit, each key a later
+table sets overrides it, except `env`, whose variables merge.
 
 ```toml
 exclude = ["vendor", "**/generated/*.jl"]
@@ -55,6 +58,8 @@ function read_config(root::AbstractString, file::AbstractString="")
     explicit = !isempty(file)
     file = explicit ? abspath(file) : joinpath(root, ".JETSweep.toml")
     isfile(file) || (explicit ? throw(ArgumentError("configuration file does not exist: $file")) : return Config())
+    # Globs match real paths, as discovery finds them.
+    file = joinpath(realpath(dirname(file)), basename(file))
     data = TOML.parsefile(file)
     unknown = setdiff(keys(data), ("exclude", "context"))
     isempty(unknown) || throw(ArgumentError("$file: unknown keys $(join(sort!(collect(unknown)), ", "))"))
