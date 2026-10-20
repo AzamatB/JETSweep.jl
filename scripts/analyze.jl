@@ -84,6 +84,23 @@ must stand at top level, keep it there.
 """
 outlinable_scope(ex) = ex isa Expr && ex.head in (:for, :while, :let) && branch_function(ex) && !imports(ex)
 
+const TEST_MACROS = Set(Symbol.(["@testset", "@test", "@test_throws", "@test_broken", "@test_skip", "@test_logs",
+                                 "@test_warn", "@test_nowarn", "@test_deprecated", "@inferred"]))
+macro_name(ex) = (name = first(ex.args); name isa Symbol ? name :
+    Meta.isexpr(name, :., 2) && last(name.args) isa QuoteNode ? last(name.args).value : nothing)
+
+"Whether code binds nothing where it stands: tests, whose bodies are local scopes, and what JET outlines."
+binds_nothing(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) ||
+    (ex.head === :macrocall ? macro_name(ex) in TEST_MACROS :
+     ex.head in (:block, :if, :elseif) ? all(binds_nothing, ex.args) : LS.JET.is_test_expression_thunk_safe(ex))
+
+"""
+Whether `ex` is a conditional of tests that defines a function in a branch, such as a tier an
+environment variable enables. It binds nothing, so JET can analyze it in a closure of its own
+rather than define only the closures of the branch its condition takes.
+"""
+outlinable_tests(ex) = Meta.isexpr(ex, :if) && binds_nothing(ex) && branch_function(ex) && !imports(ex)
+
 "The name tag of the functions the worker outlines top-level code into."
 const OUTLINED = :jetsweep_outlined
 
@@ -94,8 +111,8 @@ const OUTLINED = :jetsweep_outlined
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
-        (should_wrap_test_expression_in_thunk(x) || $outlinable_scope(x)) && !$stays(x) && !$typed_closure(x) ||
-            return x
+        (should_wrap_test_expression_in_thunk(x) || $outlinable_scope(x) || $outlinable_tests(x)) && !$stays(x) &&
+            !$typed_closure(x) || return x
         thunk = gensym($(QuoteNode(OUTLINED)))
         return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), Expr(:block, x)), Expr(:call, thunk)))
     end

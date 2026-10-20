@@ -80,7 +80,8 @@ Test drivers commonly choose their test files at run time, as in
 follow. Each such test file therefore gets its own unit, analyzed after a prelude of what the
 drivers set up before including it: imports, definitions, and the constants, modules and
 conditional definitions, as in `@static if`, that the test file refers to, copied with their
-original source text; selection logic the test file does not depend on is left out. An
+original source text, also from the branch of a top-level conditional that includes it;
+selection logic the test file does not depend on is left out. An
 analysis stop in the prelude is reported at the driver's line it copies, whose diagnostic the
 driver's own analysis reports. The drivers' own analyses evaluate the selection and skip
 including the files analyzed separately. A test file analyzed by itself is fail-fast
@@ -116,8 +117,10 @@ branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, inside a closure of it
 JETSweep treats generators and comprehensions alike, as in
 `@test r.ok && [a.b for a in r.items] == [1]`, which would otherwise run the whole test set in
 JETLS's interpreter; any other top-level expression that assigns nothing, as in
-`lock === nothing || atexit(() -> close(lock))`; and loops and `let` blocks, whose bodies are
-local scopes already, unless they import packages, which only top-level code can. Code that
+`lock === nothing || atexit(() -> close(lock))`; loops and `let` blocks, whose bodies are
+local scopes already, unless they import packages, which only top-level code can; and
+conditionals of tests, such as a tier an environment variable enables, which bind nothing
+either, so their tests are analyzed whatever the condition. Code that
 includes or evaluates code stays at top level, where JETLS follows it, as do closures whose
 parameters declare types, since Julia evaluates those types where the closure stands.
 JETLS analyzes top-level code and test sets as fail-fast, except test sets that specify

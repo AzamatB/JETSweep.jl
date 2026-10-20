@@ -203,24 +203,26 @@ Top-level statements of a file with their expressions and source text. `blocks` 
 function _statements(file::String; modules::Bool=false, blocks::Bool=true)
     text = read(file, String)
     tree = JS.parseall(JS.SyntaxNode, text; filename=file, ignore_errors=true)
-    statements = Tuple{JS.SyntaxNode,Any}[]
-    function flatten(node)
-        kind = JS.kind(node)
-        if kind == JS.K"toplevel" || (blocks && kind == JS.K"block")
-            foreach(flatten, JS.children(node))
-        elseif modules && kind == JS.K"module"
-            foreach(flatten, JS.children(last(JS.children(node))))
-        elseif kind != JS.K"error"
-            ex = try
-                Expr(node)
-            catch
-                nothing
-            end
-            ex === nothing || push!(statements, (node, ex))
+    return text, _flatten!(Tuple{JS.SyntaxNode,Any}[], tree; modules, blocks)
+end
+
+"Push the statements `node` holds, with their expressions, onto `statements`."
+function _flatten!(statements::Vector{Tuple{JS.SyntaxNode,Any}}, node::JS.SyntaxNode; modules::Bool=false,
+                   blocks::Bool=true)
+    kind = JS.kind(node)
+    if kind == JS.K"toplevel" || (blocks && kind == JS.K"block")
+        foreach(child -> _flatten!(statements, child; modules, blocks), JS.children(node))
+    elseif modules && kind == JS.K"module"
+        foreach(child -> _flatten!(statements, child; modules, blocks), JS.children(last(JS.children(node))))
+    elseif kind != JS.K"error"
+        ex = try
+            Expr(node)
+        catch
+            nothing
         end
+        ex === nothing || push!(statements, (node, ex))
     end
-    flatten(tree)
-    return text, statements
+    return statements
 end
 
 _source_text(node::JS.SyntaxNode, text::String) = String(codeunits(text)[JS.byte_range(node)])
@@ -624,8 +626,16 @@ function _outlined(ex)
             specs = spec isa Expr && spec.head === :filter ? spec.args[2:end] : Any[spec]
             all(s -> s isa Expr && s.head === :(=) && outlinable(last(s.args)), specs)
         end)
-    return ex isa Expr && (outlinable(ex) || _outlinable_scope(ex)) && !_stays(ex) && !_typed_closure(ex)
+    # Tests bind nothing where they stand, their bodies being local scopes, so neither does a
+    # conditional of them, such as a tier an environment variable enables.
+    tests(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) ||
+        (ex.head === :macrocall ? _macro_name(ex) in _TESTING_MACROS :
+         ex.head in (:block, :if, :elseif) ? all(tests, ex.args) : outlinable(ex))
+    conditional = ex isa Expr && ex.head === :if && tests(ex) && _branch_function(ex) && !_imports(ex)
+    return ex isa Expr && (outlinable(ex) || _outlinable_scope(ex) || conditional) && !_stays(ex) && !_typed_closure(ex)
 end
+
+const _TESTING_MACROS = union(_TEST_MACROS, Set(["@testset"]))
 
 "Whether `ex` is a loop or `let` block that defines a function in a branch, without imports, which must stand at top level."
 _outlinable_scope(ex::Expr) = ex.head in (:for, :while, :let) && _branch_function(ex) && !_imports(ex)
@@ -1029,8 +1039,25 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
     file in seen && return false
     push!(seen, file)
     text, nodes = _statements(file)
-    bindings = Dict{Symbol,String}()
+    return _driver_nodes!(statements, file, text, nodes, next, seen, packages, Dict{Symbol,String}())
+end
+
+function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text::String, nodes, next::String,
+                        seen::Set{String}, packages::Dict{String,Project}, bindings::Dict{Symbol,String})
+    # The include of `next`, or a run-time include, which may be of `next`, ends the setup.
+    function stops(ex)
+        for include in _nested_includes!(Expr[], ex)
+            path = _path(last(include.args), file, bindings, packages)
+            (path === nothing || normpath(dirname(file), path) == next) && return true
+        end
+        return false
+    end
     for (node, ex) in nodes
+        # A branch of a top-level conditional runs at top level too, so what it does before
+        # it reaches the include sets the included file up.
+        branch = _reaching_branch(node, ex, stops)
+        branch === nothing ||
+            return _driver_nodes!(statements, file, text, branch, next, seen, packages, bindings)
         # Top-level includes set up context, as helpers do. Included files run at top level
         # wherever the call is, but other includes are test files, except nested drivers
         # included inside a `@testset`, say.
@@ -1061,6 +1088,21 @@ function _driver_statements!(statements::Vector{_DriverStatement}, file::String,
         end
     end
     return false
+end
+
+"""
+The statements of the branch of the top-level conditional `ex`, parsed as `node`, that holds an
+include `stops` accepts, if any.
+"""
+function _reaching_branch(node::JS.SyntaxNode, ex, stops)
+    Meta.isexpr(ex, (:if, :elseif)) || return nothing
+    children = JS.children(node)
+    for i in 2:min(length(ex.args), length(children))
+        stops(ex.args[i]) || continue
+        Meta.isexpr(ex.args[i], :elseif) && return _reaching_branch(children[i], ex.args[i], stops)
+        return _flatten!(Tuple{JS.SyntaxNode,Any}[], children[i])
+    end
+    return nothing
 end
 
 "Whether `ex` runs a `using` of a whole module, as in `using Dates`, whose names are not known statically."
