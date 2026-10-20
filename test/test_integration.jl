@@ -279,8 +279,9 @@ end
                 tan("loop")
             end
             """)
-        # A conditional that binds names, as a driver's selection of its files does, has its
-        # test sets analyzed by themselves, whichever branch runs.
+        # A conditional that binds names, as a driver's selection of its files does, has the
+        # test sets in it that define closures under control flow analyzed by themselves,
+        # whichever branch runs, and finds what a branch defines defined after it.
         write(joinpath(root, "driver.jl"), """
             using Test
             if !isempty(ARGS)
@@ -330,6 +331,157 @@ end
                 tan("after the loop")
             end
             """)
+        # What only top-level code may hold keeps the local scope holding it at top level,
+        # however JETLS would analyze the closures in it there; code that evaluates code too.
+        write(joinpath(root, "toplevel.jl"), """
+            using Test
+            struct Shown end
+            let
+                struct Local
+                    x::Int
+                end
+                isempty(ARGS) || foreach(x -> println(x), ARGS)
+            end
+            use_local() = Local(1).x + "one"
+            @testset "methods of functions that are not local" begin
+                Base.show(io::IO, ::Shown) = print(io, "S")
+                global const LIMIT = 3
+                for x in [Shown()]
+                    x isa Shown && @test all(c -> c != 'x' && LIMIT > 0, sprint(show, x))
+                end
+                sin("shown")
+            end
+            try
+                global handler(x) = x + 1
+                for i in 1:2
+                    g = () -> i
+                end
+            catch
+            end
+            handler("one")
+            for name in (:alpha,)
+                name === :alpha && foreach(x -> x, 1:2)
+                Base.@eval generated() = 1
+            end
+            generated() + "one"
+            """)
+        # A test that always fails in a statement moved out of a conditional is reported, as at
+        # top level.
+        write(joinpath(root, "failing.jl"), """
+            using Test
+            if isempty(ARGS)
+                helper() = 1
+                for n in 1:2
+                    @test n
+                    n > 1 && foreach(x -> println(x), 1:n)
+                end
+            end
+            """)
+        # A condition on values such as `@__FILE__` binds nothing either.
+        write(joinpath(root, "program.jl"), """
+            if basename(@__FILE__) == "never.jl"
+                let n = 2
+                    foreach(x -> println(x + n), 1:n)
+                    sin("program")
+                end
+            end
+            """)
+        # Nor does a closure in a branch of a top-level `try` block make JETLS run the block.
+        write(joinpath(root, "tried.jl"), """
+            const TRIED = joinpath(@__DIR__, "tried.marker")
+            items() = (touch(TRIED); [1, 2])
+            try
+                xs = items()
+                isempty(xs) || foreach(x -> println(x), xs)
+                cos("tried")
+            catch
+            end
+            """)
+        # A statement whose local functions' signatures read what its conditional defines,
+        # or may include, stays in it, since a moved statement is defined before it.
+        write(joinpath(root, "typed.jl"), """
+            using Test
+            if isempty(ARGS)
+                struct Point
+                    x::Int
+                end
+                @testset "a typed helper of the branch's type" begin
+                    norm1(q::Point) = abs(q.x)
+                    for p in [Point(1)]
+                        p.x > 0 && foreach(y -> println(y), 1:2)
+                        @test norm1(p) == 1
+                    end
+                    sin("typed")
+                end
+            end
+            if isempty(ARGS)
+                include(joinpath(@__DIR__, "typed_types.txt"))
+                @testset "a typed helper of an included type" begin
+                    unbox(b::IncludedBox) = b.v
+                    for b in [IncludedBox(1)]
+                        b.v > 0 && foreach(y -> println(unbox(y)), [b])
+                    end
+                    cos("included")
+                end
+            end
+            if !isempty(ARGS)
+                selected() = 1
+                @testset "a typed helper of Base types" begin
+                    twice(x::Float64) = 2x
+                    if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                        foreach(y -> println(twice(y)), [1.0])
+                    end
+                    tan("based")
+                end
+            end
+            """)
+        write(joinpath(root, "typed_types.txt"), "struct IncludedBox\n    v::Int\nend\n")
+        # The tests of a tier not taken find what the tier defines before them, closures in
+        # them too, and its code after a definition is analyzed.
+        write(joinpath(root, "untaken.jl"), """
+            using Test
+            if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
+                struct GPUThing
+                    n::Int
+                end
+                gpu_helper(t) = t.n + 1
+                const GPU_N = 4
+                thing = GPUThing(GPU_N)
+                sin("after the definitions")
+                @testset "tests of what the tier defines" begin
+                    for n in 1:GPU_N
+                        @test all(y -> gpu_helper(GPUThing(y)) > 0, 1:n)
+                        n > 1 && foreach(x -> println(gpu_helper(thing)), 1:n)
+                    end
+                    cos("untaken")
+                end
+            end
+            """)
+        # Outlined code finds defined what top-level code defined before it, a test set's own
+        # code or its branch's; code that runs later may find a global undefined.
+        write(joinpath(root, "defined.jl"), """
+            using Test
+            compute() = [1, 2]
+            if isempty(ARGS)
+                const N = parse(Int, "3")
+                data = compute()
+                helper() = 1
+                @testset "reads what the branch defined before" begin
+                    for i in 1:N
+                        i > 1 && foreach(y -> println(y), data)
+                    end
+                    sin("branch")
+                end
+            end
+            @testset "reads what the test set assigned" begin
+                global RESULT = compute()
+                for i in 1:2
+                    @test all(x -> x > 0, RESULT)
+                end
+                cos("test set")
+            end
+            total() = sum(RESULT)
+            """)
         output = joinpath(root, ".jetsweep", "report")
         io = IOBuffer()
         result = integration_sweep(root, output; io, fail_on=:none)
@@ -363,13 +515,20 @@ end
         @test errors("tiers.jl") == [5, 15] && isempty(undefined("tiers.jl"))
         @test errors("testsets.jl") == [7, 19] && isempty(undefined("testsets.jl"))
         @test !isfile(joinpath(root, "testsets.marker"))
-        # JETLS finds what a branch it does not take defines undefined there, but not in its tests.
-        @test errors("driver.jl") == [10, 19] && [f.line for f in undefined("driver.jl")] == [15]
+        @test errors("driver.jl") == [10, 19] && isempty(undefined("driver.jl"))
         @test errors("constants.jl") == [3, 11, 20]
         # Code that runs later may find the conditional's constants undefined, the statement
         # that assigns them not.
         @test [(f.line, f.severity) for f in undefined("constants.jl")] == [(10, 3)]
         @test !any(f -> occursin("AbstractBindingState", f.message), unit("constants.jl").findings)
+        @test status("toplevel.jl") === :findings && errors("toplevel.jl") == [9, 16, 19, 30]
+        @test !any(f -> occursin("LIMIT", f.message) || occursin("generated", f.message), unit("toplevel.jl").findings)
+        @test any(f -> f.code == "inference/failing-test" && f.line == 5, unit("failing.jl").findings)
+        @test errors("program.jl") == [4] && isempty(undefined("program.jl"))
+        @test errors("tried.jl") == [6] && isempty(undefined("tried.jl")) && !isfile(joinpath(root, "tried.marker"))
+        @test status("typed.jl") === :findings && errors("typed.jl") == [12, 22, 32] && isempty(undefined("typed.jl"))
+        @test errors("untaken.jl") == [9, 15] && isempty(undefined("untaken.jl"))
+        @test errors("defined.jl") == [11, 19] && [(f.line, f.severity) for f in undefined("defined.jl")] == [(21, 3)]
         @test status("locked.jl") === :findings && !isfile(joinpath(root, "acquired.marker"))
         @test status("bootstrap.jl") === :findings
         @test status("main_check.jl") === :findings

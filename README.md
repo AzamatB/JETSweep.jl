@@ -90,10 +90,7 @@ test set.
 
 Script analysis evaluates definitions, imports and includes but not assignments, so a
 definition or `include` that needs an assigned value stops JETLS
-(`toplevel/missing-concretization`), and other code sees assigned values only as types. Every
-constant it leaves unevaluated is bound to its type, also each of a statement such as
-`const MODE, OUT = parse_arguments(ARGS)` and of a conditional, which JETLS by itself can
-leave undefined.
+(`toplevel/missing-concretization`), and other code sees assigned values only as types.
 JETSweep therefore lets JETLS evaluate the top-level statements of the files a unit loads
 that cannot have side effects: assignments of literals, paths and pure functions of names
 already bound, modules the file or its prelude imports among them, such as
@@ -113,6 +110,15 @@ on, and neither is a name the file rebinds, even one Base defines. JETLS matches
 statements as patterns, in which names such as `x_` and `@__DIR__` are wildcards, so a
 statement whose pattern would also match another statement of its file is not evaluated.
 
+Every constant JETLS leaves unevaluated is bound to its type, also each of a statement such
+as `const MODE, OUT = parse_arguments(ARGS)` and of a conditional, which JETLS by itself can
+leave undefined. And top-level code that reads a global its statement defines on every path
+before the read finds it defined: as the type JETLS knows of it, or as an unknown value if
+JETLS did not evaluate the definition, as for the functions and types of a branch the
+analysis does not take. JETLS by itself reports such a read as possibly or wholly undefined,
+and analyzes nothing after a read it finds undefined. Code that runs later, such as a
+function body, may still find a global that a conditional assigns undefined.
+
 JETSweep extends one JETLS rule. To define a closure in a branch, JETLS evaluates the
 branch's condition, and with it everything the condition depends on: in a test set, the
 test itself. So JETLS analyzes a `@test` expression that defines an anonymous function in a
@@ -122,16 +128,23 @@ JETSweep treats generators and comprehensions alike, as in
 JETLS's interpreter; any other top-level expression that assigns nothing, as in
 `lock === nothing || atexit(() -> close(lock))`; loops, `let` and `try` blocks and test sets,
 whose bodies are local scopes already, where they define a function under control flow, in a
-branch, loop or `try` block inside them, which JETLS would run, with the values the function
-captures, to define it; and conditionals of tests, such as a tier an environment variable
-enables, whose other branch may log, as in `else @info "skipped" end`, which bind nothing
-either, so their tests are analyzed whatever the condition. A conditional that binds names,
-such as a test driver's selection of its files or a tier that defines what its tests use, has
-those statements of its branches analyzed in functions of their own, so that the tests of a
-branch its condition does not take are analyzed too, if finding what that branch defines
-undefined. Code that includes or evaluates code stays at top level, where JETLS follows it, as
-do imports and type definitions, which a local scope at top level makes global, and closures
-whose parameters declare types, since Julia evaluates those types where the closure stands.
+branch or loop inside them, which JETLS would run, with the values the function captures, to
+define it; and conditionals of tests, such as a tier an environment variable enables, whose
+other branch may log, as in `else @info "skipped" end`, which bind nothing either, so their
+tests are analyzed whatever the condition. A conditional that binds names, such as a test
+driver's selection of its files or a tier that defines what its tests use, has those
+statements of its branches analyzed in functions of their own, defined before it and called
+where the statements stand, so that the tests of a branch its condition does not take are
+analyzed too. They find what their branch defines before them defined, as an unknown value
+where the analysis did not take the branch. A statement whose local functions declare
+argument types that the conditional may define, or any types if it includes or imports code,
+stays in it, since Julia evaluates those types where the function holding the statement is
+defined. Code that includes or evaluates code stays at top level, where JETLS follows it, as
+does what only top-level code may hold, which a local scope at top level defines globally:
+imports, exports, type definitions, methods of functions that are not local, such as
+`Base.show(io::IO, x::T) = …`, generated functions, global constants and globals with declared
+types; and closures whose parameters declare types, since Julia evaluates those types where
+the closure stands.
 JETLS analyzes top-level code and test sets as fail-fast, except test sets that specify
 `failfast=false` or have a custom type and those nested in them, which it analyzes as
 declared. So code after a `@test` that always fails is not analyzed, except in those test

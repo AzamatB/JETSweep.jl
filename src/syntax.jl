@@ -615,15 +615,14 @@ does a `@test` expression, so that the closures it defines need no evaluated con
 expression of calls and control flow, binding no names, that defines a function in a branch;
 a local scope, a loop, `let` or `try` block or a test set, that defines a function under control
 flow inside it; or a conditional of tests, which binds nothing either. Code that includes or
-evaluates code stays at top level, as do imports and type definitions, which bind globals only
-there, and closures whose parameters declare types. A generator's ranges stand outside its
-closure.
+evaluates code stays at top level, as does what only top-level code may hold, and closures
+whose parameters declare types. A generator's ranges stand outside its closure.
 """
 function _outlined(ex)
     ex isa Expr || return false
     conditional = ex.head === :if && _binds_nothing(ex) && _controlled_function(ex)
     return (_thunk_safe(ex) && _conditional_function(ex) || _outlinable_scope(ex) || conditional) &&
-        !_stays(ex) && !_typed_closure(ex) && !_imports(ex) && !_defines_type(ex)
+        !_stays(ex) && !_typed_closure(ex) && !_toplevel_only(ex)
 end
 
 "Whether JET can analyze expression `ex` in a closure: one of calls and control flow, binding no names."
@@ -671,18 +670,103 @@ _binds_nothing(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) ||
 
 """
 Whether `ex` is a loop, `let` or `try` block or test set that defines a function under control
-flow inside it. A function directly in a loop or test set needs none to be defined.
+flow inside it. A function directly in a local scope needs none to be defined, nor does one in
+a `try` block of it.
 """
 _outlinable_scope(ex::Expr) = (ex.head in (:for, :while, :let, :try) || _macro_name(ex) == "@testset") &&
     any(arg -> _controlled_function(arg; nested=true), ex.args)
 _imports(ex) = ex isa Expr && !(ex.head in (:quote, :inert)) && (ex.head in (:using, :import) || any(_imports, ex.args))
-"Whether `ex` defines a type, which a local scope at top level defines globally."
-_defines_type(ex) = ex isa Expr && !(ex.head in (:quote, :inert)) &&
-    (ex.head in (:struct, :abstract, :primitive) || _macro_name(ex) == "@enum" || any(_defines_type, ex.args))
+
+"""
+The name of the function a method definition's signature `sig` extends: a symbol for a
+function of its own, an expression for a qualified or callable one, `nothing` for an
+anonymous function.
+"""
+function _method_name(sig)
+    sig isa Symbol && return sig
+    while sig isa Expr && (sig.head === :where || (sig.head === :(::) && length(sig.args) == 2))
+        sig = first(sig.args)
+    end
+    return sig isa Expr && sig.head === :call && !isempty(sig.args) ? first(sig.args) : nothing
+end
+"The name of the function `ex` defines a method of, as `_method_name` gives it, if `ex` is a method definition."
+_definition_name(ex) = ex isa Expr && (ex.head === :function || (ex.head === :(=) && _signature(first(ex.args)))) ?
+    _method_name(first(ex.args)) : nothing
+_typed_assignee(lhs) = lhs isa Expr && (lhs.head === :(::) || (lhs.head === :tuple && any(_typed_assignee, lhs.args)))
+
+"Names `ex` declares `global` without declaring their types."
+function _declared_globals!(names::Set{Symbol}, ex)
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return names
+    if ex.head === :global
+        for arg in ex.args
+            arg isa Symbol ? push!(names, arg) :
+                arg isa Expr && arg.head === :(=) && union!(names, _assignees(first(arg.args)))
+        end
+    end
+    foreach(arg -> _declared_globals!(names, arg), ex.args)
+    return names
+end
+
+const _TOPLEVEL_HEADS = (:using, :import, :export, :public, :module, :macro, :struct, :abstract, :primitive)
+
+"""
+Whether `ex` holds what only top-level code may: imports and exports, definitions of types,
+modules and macros, generated functions, global constants, globals with declared types, and
+methods of functions that are not local, such as `Base.show(io::IO, ::T) = …`, `(::T)(x) = …`
+or those of a name declared `global`. A local scope at top level defines these globally, a
+function body cannot hold them.
+"""
+function _toplevel_only(ex, globals::Set{Symbol}=_declared_globals!(Set{Symbol}(), ex))
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return false
+    ex.head in _TOPLEVEL_HEADS && return true
+    _macro_name(ex) in ("@enum", "@generated") && return true
+    ex.head === :global && any(ex.args) do arg
+        arg isa Expr && (arg.head in (:const, :(::), :function) ||
+            (arg.head === :(=) && (_signature(first(arg.args)) || _typed_assignee(first(arg.args)))))
+    end && return true
+    ex.head === :const && any(ex.args) do arg
+        arg isa Expr && arg.head === :global ||
+            any(in(globals), arg isa Expr && arg.head === :(=) ? _assignees(first(arg.args)) : _assignees(arg))
+    end && return true
+    ex.head === :(=) && _typed_assignee(first(ex.args)) && any(in(globals), _assignees(first(ex.args))) && return true
+    name = _definition_name(ex)
+    (name isa Symbol ? name in globals : name !== nothing) && return true
+    return any(arg -> _toplevel_only(arg, globals), ex.args)
+end
+
+"""
+Symbols the signatures of the named functions `ex` defines read, which lowering evaluates
+where the function holding them is defined.
+"""
+function _signature_reads!(names::Set{Symbol}, ex)
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return names
+    _definition_name(ex) === nothing || _signature_types!(names, first(ex.args))
+    foreach(arg -> _signature_reads!(names, arg), ex.args)
+    return names
+end
+
+"Names `ex` may bind, globally or locally: those it assigns, and the functions and types it defines."
+function _may_bind!(names::Set{Symbol}, ex)
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return names
+    name = _definition_name(ex)
+    if name !== nothing
+        name isa Symbol && push!(names, name)
+    elseif ex.head === :(=)
+        union!(names, _assignees(first(ex.args)))
+    elseif ex.head in (:struct, :abstract, :primitive)
+        _symbols!(names, ex.args[ex.head === :struct ? 2 : 1])
+    elseif _macro_name(ex) == "@enum"
+        foreach(arg -> _symbols!(names, arg), ex.args[3:end])
+    elseif ex.head in (:const, :global, :local)
+        union!(names, (arg for arg in ex.args if arg isa Symbol))
+    end
+    foreach(arg -> _may_bind!(names, arg), ex.args)
+    return names
+end
 
 """
 Whether `ex` defines a function, anonymous or local, in a branch, or with `nested` in a loop
-or `try` block too.
+too.
 """
 function _controlled_function(ex, controlled::Bool=false; nested::Bool=false)
     ex isa Expr && !(ex.head in (:quote, :inert)) || return false
@@ -690,7 +774,7 @@ function _controlled_function(ex, controlled::Bool=false; nested::Bool=false)
     ex.head in (:if, :elseif, :&&, :||) &&
         return _controlled_function(first(ex.args), controlled; nested) ||
             any(arg -> _controlled_function(arg, true; nested), ex.args[2:end])
-    nested && ex.head in (:for, :while, :try) && return any(arg -> _controlled_function(arg, true; nested), ex.args)
+    nested && ex.head in (:for, :while) && return any(arg -> _controlled_function(arg, true; nested), ex.args)
     return any(arg -> _controlled_function(arg, controlled; nested), ex.args)
 end
 
@@ -806,13 +890,23 @@ JETLS evaluates whatever they need. Assignments in `ex` that these names depend 
 function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
     # Closures in an outlined expression's branches need no conditions.
     whole = forced || _outlined(ex)
+    # A conditional the worker does not outline has the statements of its branches that it
+    # would outline standing alone moved out of it, before it, unless their typed local
+    # functions may need what it defines: names it binds, or any when it imports or includes.
+    conditional = !whole && ex isa Expr && ex.head === :if
+    bound = conditional ? _may_bind!(Set{Symbol}(), ex) : Set{Symbol}()
+    opaque = conditional && (_stays(ex) || _imports(ex))
+    function moved(part)
+        _outlined(part) || return false
+        reads = _signature_reads!(Set{Symbol}(), part)
+        return isempty(reads) || (!opaque && isdisjoint(reads, bound))
+    end
     direct = Set{Symbol}()
     locals = Pair{Set{Symbol},Set{Symbol}}[]
     needs!(parts, controls) =
         (foreach(part -> _evaluated_symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
-    # Functions defined in loops, `let` and `try` blocks are local: closures. A conditional
-    # the worker does not outline has the statements of its branches that it would outline
-    # standing alone outlined, so the closures in those need no conditions either.
+    # Functions defined in loops, `let` and `try` blocks are local: closures. The closures in
+    # statements moved out of a conditional need no conditions either.
     function visit(ex, controls::Vector{Any}, branches::Vector{Any}, scoped::Bool, forced::Bool, toplevel::Bool=false)
         ex isa Expr || return
         head = ex.head
@@ -824,7 +918,7 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
                 controls, branches = [controls; condition], [branches; condition]
             end
             for part in parts
-                outlined = forced || head === :block && _outlined(part)
+                outlined = forced || head === :block && moved(part)
                 visit(part, controls, branches, scoped, outlined,
                       !outlined && Meta.isexpr(part, head === :block ? (:if, :block) : (:elseif, :block)))
             end
@@ -871,7 +965,7 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
             foreach(arg -> visit(arg, controls, branches, scoped, forced), ex.args)
         end
     end
-    visit(ex, Any[], Any[], false, whole, !whole && Meta.isexpr(ex, :if))
+    visit(ex, Any[], Any[], false, whole, conditional)
     changed = true
     while changed
         changed = false
