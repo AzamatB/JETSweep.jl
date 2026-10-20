@@ -147,6 +147,27 @@ end
             """)
         write(joinpath(root, "skipping_a.txt"), "skipped_a() = 1 + \"a\"\n")
         write(joinpath(root, "skipping_b.txt"), "skipped_b() = 2 + \"b\"\n")
+        write(joinpath(root, "jumping.jl"), """
+            const FILES = ["skipping_a.txt", "skipping_b.txt"]
+            const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)
+            const ORIGINAL = filter(==("skipping_b.txt"), RUN)
+            for file in RUN
+                file in ORIGINAL && get(ENV, "DISPATCH_CHECKUP", "") == "checked" && @goto skip
+                include(file)
+                @label skip
+            end
+            """)
+        # A `return` in a task ends only the task, so what decides it is not run.
+        write(joinpath(root, "tasked.jl"), """
+            const FILES = ["skipping_a.txt"]
+            const DONE = (touch(joinpath(@__DIR__, "tasked.marker")); error("needs a cluster"))
+            @sync for file in FILES
+                @async begin
+                    file in DONE && return
+                end
+                include(file)
+            end
+            """)
         # A script loads a package of its workspace that no project of it declares.
         mkpath(joinpath(root, "Sibling", "src"))
         write(joinpath(root, "Sibling", "Project.toml"),
@@ -527,6 +548,9 @@ end
         undefined(name) = [f for f in unit(name).findings if occursin("undef-global-var", f.code)]
         @test status("skipping.jl") === :findings &&
               sort!([basename(f.file) for f in unit("skipping.jl").findings]) == ["skipping_a.txt", "skipping_b.txt"]
+        @test status("jumping.jl") === :findings &&
+              sort!([basename(f.file) for f in unit("jumping.jl").findings]) == ["skipping_a.txt", "skipping_b.txt"]
+        @test status("tasked.jl") === :findings && !isfile(joinpath(root, "tasked.marker"))
         @test errors("tiers.jl") == [5, 15] && isempty(undefined("tiers.jl"))
         @test errors("testsets.jl") == [7, 19] && isempty(undefined("testsets.jl"))
         @test !isfile(joinpath(root, "testsets.marker"))

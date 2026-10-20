@@ -882,22 +882,31 @@ function _type_symbols!(names::Set{Symbol}, ex::Expr)
     return names
 end
 
+"Macros that run their code where they stand, so that a `return` or `@goto` in it leaves the code around them."
+const _INLINE_MACROS = Set(["@testset", "@sync", "@static", "@time", "@timev", "@timed", "@elapsed", "@allocated",
+                            "@allocations", "@inbounds", "@views", "@lock"])
+
 """
 Push the conditions under which statement `ex` exits early with one of `exits` onto
 `conditions`, as `file in SKIPPED` of `file in SKIPPED && continue`: those of the branches
-and loops around each exit that leaves `ex`. A `break` or `continue` in a loop of `ex` leaves
-only that loop, and code in functions exits nothing.
+and loops around each exit that leaves `ex`. A `@goto` counts as a `return`, since it may
+jump out of any block or loop around it. A `break` or `continue` in a loop of `ex` leaves
+only that loop, and code in functions exits nothing, nor does a `return` or `@goto` in
+macros other than `_INLINE_MACROS`, which may wrap their code in a function, as `@async` does.
 """
 function _exits!(conditions::Vector{Any}, ex, exits::Tuple, path::Vector{Any}=Any[])
     ex isa Expr && !(ex.head in (:quote, :inert, :module)) && !_method(ex) || return conditions
     head = ex.head
-    if head in exits
+    if head in exits || (:return in exits && _macro_name(ex) == "@goto")
         append!(conditions, path)
     elseif head in (:if, :elseif, :&&, :||)
         _exits!(conditions, first(ex.args), exits, path)
         foreach(arg -> _exits!(conditions, arg, exits, [path; first(ex.args)]), ex.args[2:end])
     elseif head in (:for, :while)
         :return in exits && _exits!(conditions, last(ex.args), (:return,), [path; first(ex.args)])
+    elseif head === :macrocall
+        _macro_name(ex) in _INLINE_MACROS || (exits = filter(!=(:return), exits))
+        foreach(arg -> _exits!(conditions, arg, exits, path), ex.args[2:end])
     else
         foreach(arg -> _exits!(conditions, arg, exits, path), ex.args)
     end
@@ -910,8 +919,9 @@ arguments of `include` and `eval` calls, signatures of definitions, the control 
 these and around imports, and the conditions of branches that define closures, which JETLS
 evaluates to define them; with `forced`, only those of `include` and `eval` calls, which
 JETLS evaluates whatever they need. Assignments in `ex` that these names depend on count too.
-Control flow includes early exits: the conditions of a `continue`, `break` or `return` control
-what follows it, and those of a `break` or `return` every iteration of its loop.
+Control flow includes early exits: the conditions of a `continue`, `break`, `return` or
+`@goto` control what follows it, and those of a `break`, `return` or `@goto` every iteration
+of its loop.
 """
 function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
     # Closures in an outlined expression's branches need no conditions.
@@ -982,7 +992,7 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
             foreach(arg -> visit(arg, [controls; condition], [branches; condition], scoped, forced), ex.args[2:end])
         elseif head in (:for, :while)
             visit(first(ex.args), controls, branches, scoped, forced)
-            # A `break` or `return` decides whether the later iterations run.
+            # A `break`, `return` or `@goto` decides whether the later iterations run.
             body = _exits!([controls; first(ex.args)], last(ex.args), (:break, :return))
             visit(last(ex.args), body, branches, true, forced)
         elseif head === :let

@@ -1247,6 +1247,19 @@ end
     @test patterns("for file in RUN\n    include(file)\n    file in ORIGINAL && continue\nend\n") == [run]
     @test patterns("for file in RUN\n    for o in OTHER\n        o in ORIGINAL && break\n    end\n    include(file)\nend\n") == [run]
     @test patterns("for file in RUN\n    foreach(f -> f in ORIGINAL && return, OTHER)\n    include(file)\nend\n") == [run]
+    # A `@goto` may skip what follows it, as a `return` may.
+    @test patterns("for file in RUN\n    file in ORIGINAL && @goto skip\n    include(file)\n    @label skip\nend\n") ==
+          [run, original]
+    # A `return` in a macro that runs its code in a task ends only the task, so its condition,
+    # which may need what the analysis cannot run, is left alone; one in a test set or timing skips.
+    for task in ("@async", "Threads.@spawn", "@task")
+        @test patterns("@sync for file in RUN\n    $task begin\n        file in ORIGINAL && return\n    end\n    include(file)\nend\n") ==
+              [run]
+        @test patterns("for file in RUN\n    $task begin\n        file in ORIGINAL && @goto skip\n        @label skip\n    end\n    include(file)\nend\n") ==
+              [run]
+    end
+    @test patterns("for file in RUN\n    @testset \"t\" begin\n        file in ORIGINAL && return\n    end\n    include(file)\nend\n") ==
+          patterns("for file in RUN\n    @time file in ORIGINAL && return\n    include(file)\nend\n") == [run, original]
 end
 
 @testset "includes resolve through path constants other files define" begin

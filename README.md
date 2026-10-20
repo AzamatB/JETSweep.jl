@@ -108,10 +108,12 @@ definition signatures, and in conditions that define closures or choose imports.
 JETLS always evaluates `include` and `eval` calls, and under JETSweep `include_string` calls
 too, whatever their arguments need is evaluated, side effects or not, as a test driver's
 selection of its files is, and so is what decides whether they run: the conditions around
-them, and those of a `continue`, `break` or `return` that may skip them, as of
+them, and those of a `continue`, `break`, `return` or `@goto` that may skip them, as of
 `file in SKIPPED && continue` before `include(file)`, or of a `break` after it, which decides
-whether later iterations run. A value that code left
-unevaluated may change, as `push!` or an indexed assignment does, is not evaluated from there
+whether later iterations run. A `return` or `@goto` in a macro other than `@testset`,
+`@sync`, `@static`, `@inbounds`, `@views`, `@lock` and the timing macros skips nothing there,
+since the macro may run it in a function of its own, as `@async` and `Threads.@spawn` do.
+A value that code left unevaluated may change, as `push!` or an indexed assignment does, is not evaluated from there
 on, and neither is a name the file rebinds, even one Base defines. JETLS matches these
 statements as patterns, in which names such as `x_` and `@__DIR__` are wildcards, so a
 statement whose pattern would also match another statement of its file is not evaluated.
