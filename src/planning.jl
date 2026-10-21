@@ -67,6 +67,20 @@ function _test_context(owner::String)
     return Context(project, owner, true, Dict{String,String}())
 end
 
+"The path constants `file` defines, after those of the files it includes at top level, recorded in `exports`."
+function _exported!(exports::Dict{String,Dict{Symbol,String}}, syntax::Dict{String,Syntax}, file::String,
+                    seen::Set{String})
+    haskey(exports, file) && return exports[file]
+    (file in seen || !haskey(syntax, file)) && return Dict{Symbol,String}()
+    push!(seen, file)
+    bindings = Dict{Symbol,String}()
+    for include in syntax[file].includes
+        include.depth == 0 && include.followed && !isempty(include.target) &&
+            merge!(bindings, _exported!(exports, syntax, include.target, seen))
+    end
+    return exports[file] = merge!(bindings, syntax[file].bindings)
+end
+
 """
 The include facts of every inventoried source. An include that names a path through a
 constant another file defines, as `include(joinpath(LIBDIR, "x.jl"))` after including the
@@ -74,26 +88,14 @@ file that defines `LIBDIR`, resolves on a second pass.
 """
 function source_syntax(inventory::Inventory)
     projects = Dict(project.dir => project for project in inventory.projects)
-    parse(source; exports=Dict{String,Dict{Symbol,String}}()) =
-        parse_source(source.path, _packages(source, projects); exports)
-    syntax = Dict{String,Syntax}(source.path => parse(source) for source in inventory.sources)
+    syntax = Dict{String,Syntax}(source.path => parse_source(source.path, _packages(source, projects))
+                                 for source in inventory.sources)
     # The path constants a file defines, after those of the files it includes at top level.
     exports = Dict{String,Dict{Symbol,String}}()
-    function exported(file::String, seen::Set{String})
-        haskey(exports, file) && return exports[file]
-        (file in seen || !haskey(syntax, file)) && return Dict{Symbol,String}()
-        push!(seen, file)
-        bindings = Dict{Symbol,String}()
-        for include in syntax[file].includes
-            include.depth == 0 && include.followed && !isempty(include.target) &&
-                merge!(bindings, exported(include.target, seen))
-        end
-        return exports[file] = merge!(bindings, syntax[file].bindings)
-    end
-    foreach(file -> exported(file, Set{String}()), collect(keys(syntax)))
+    foreach(file -> _exported!(exports, syntax, file, Set{String}()), collect(keys(syntax)))
     for source in inventory.sources
         any(include -> isempty(include.target), syntax[source.path].includes) &&
-            (syntax[source.path] = parse(source; exports))
+            (syntax[source.path] = parse_source(source.path, _packages(source, projects); exports))
     end
     return syntax
 end

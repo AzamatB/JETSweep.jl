@@ -1,4 +1,4 @@
-using Test, JETSweep, Pkg, TOML, UUIDs, LibGit2
+using JETSweep, LibGit2, Pkg, TOML, Test, UUIDs
 
 function _environments_write(file, data)
     mkpath(dirname(file))
@@ -34,7 +34,7 @@ _environments_project(environment) = TOML.parsefile(joinpath(environment.dir, "P
 _environments_preferences(environment) = TOML.parsefile(joinpath(environment.dir, "LocalPreferences.toml"))
 _environments_manifest(environment) = Pkg.Types.read_manifest(joinpath(environment.dir, "Manifest.toml"))
 _environments_path(environment, uuid) =
-    abspath(environment.dir, _environments_manifest(environment)[UUID(uuid)].path)
+    abspath(environment.dir, something(_environments_manifest(environment)[UUID(uuid)].path))
 
 "The entry named `name` in the manifest of the project JETSweep, and so the analyzer, was loaded from."
 _environments_tool(name) =
@@ -59,7 +59,7 @@ function _environments_run(environment, code)
     return readchomp(addenv(command, "JULIA_LOAD_PATH" => "@:@stdlib"))
 end
 
-function _environments_commit(repository, message)
+function _environments_commit(repository::LibGit2.GitRepo, message)
     signature = LibGit2.Signature("JETSweep fixture", "fixture@example.invalid")
     LibGit2.add!(repository, "*")
     return string(LibGit2.commit(repository, message; author=signature, committer=signature))
@@ -143,8 +143,8 @@ end
 
 @testset "test context merges the test target and test/Project.toml" begin
     _environments_sandbox() do root, envs
-        extra, extra_uuid = _environments_package(root, "TargetHelper")
-        dedicated, dedicated_uuid = _environments_package(root, "DedicatedHelper")
+        _, extra_uuid = _environments_package(root, "TargetHelper")
+        _, dedicated_uuid = _environments_package(root, "DedicatedHelper")
         parent, parent_uuid = _environments_package(root, "TestedParent";
             extras=Dict("TargetHelper" => extra_uuid, "Test" => _environments_test_uuid()),
             targets=Dict("test" => ["TargetHelper", "Test"]),
@@ -176,7 +176,7 @@ end
 
 @testset "test projects named either way, inside or outside the package's workspace" begin
     _environments_sandbox() do root, envs
-        helper, helper_uuid = _environments_package(root, "TestOnlyHelper")
+        _, helper_uuid = _environments_package(root, "TestOnlyHelper")
         layouts = (("ConventionTested", "Project.toml", (;)), ("JuliaProjectTested", "JuliaProject.toml", (;)),
                    ("WorkspaceTested", "Project.toml", (; workspace=Dict("projects" => ["test"]))))
         for (name, file, fields) in layouts
@@ -203,7 +203,7 @@ end
 @testset "extension triggers become dependencies" begin
     _environments_sandbox() do root, envs
         first, first_uuid = _environments_package(root, "FirstTrigger")
-        second, second_uuid = _environments_package(root, "SecondTrigger")
+        _, second_uuid = _environments_package(root, "SecondTrigger")
         triggers = Dict("FirstTrigger" => first_uuid, "SecondTrigger" => second_uuid)
         parent, _ = _environments_package(root, "ExtendedParent"; weakdeps=triggers, extras=triggers,
             extensions=Dict("BothExt" => ["FirstTrigger", "SecondTrigger"]),
@@ -238,7 +238,7 @@ end
 
 @testset "script contexts use the nearest environment only" begin
     _environments_sandbox() do root, envs
-        owned, owned_uuid = _environments_package(root, "OwnedHelper")
+        _, owned_uuid = _environments_package(root, "OwnedHelper")
         _, script_uuid = _environments_package(root, "ScriptHelper")
         parent, _ = _environments_package(root, "ScriptOwner"; deps=Dict("OwnedHelper" => owned_uuid),
             sources=Dict("OwnedHelper" => Dict("path" => "../OwnedHelper")))
@@ -439,7 +439,7 @@ end
 end
 
 @testset "an environment's inputs are known before it is prepared, wherever they are" begin
-    _environments_sandbox() do root, envs
+    mktempdir() do root
         printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
         # A sweep of one repository excludes its siblings; their files are inputs all the same.
         helper, helper_uuid = _environments_package(joinpath(root, "sibling"), "InputHelper")
@@ -575,7 +575,7 @@ end
 
 @testset "a clone stays locked while its holder blocks, until it dies, and then serves its waiters in turn" begin
     git = Sys.which("git")::String
-    _environments_sandbox() do root, envs
+    mktempdir() do root
         repository, uuid = _environments_package(root, "LockedTool")
         run(`$git init --quiet $repository`)
         run(`$git -C $repository add -A`)
@@ -813,7 +813,8 @@ end
             # so preparation takes its re-resolve fallback and installs the new source tree.
             seed = _environments_manifest(normal)
             for entry in values(seed)
-                entry.path === nothing || (entry.path = abspath(normal.dir, entry.path))
+                path = entry.path
+                path === nothing || (entry.path = abspath(normal.dir, path))
             end
             Pkg.Types.write_manifest(seed, joinpath(parent, "Manifest.toml"))
             project_file = joinpath(dependency, "Project.toml")
@@ -839,7 +840,7 @@ end
             revise = _environments_tool("Revise")
             @test Pkg.Types.read_manifest(manifest_file)[revise.uuid].version == revise.version
             # Positive control: the installed build script really would have written the marker.
-            installed = Pkg.Operations.source_path(manifest_file, entry)
+            installed = something(Pkg.Operations.source_path(manifest_file, entry))
             Base.include(Module(:BuildGuardControl), joinpath(installed, "deps", "build.jl"))
             @test read(marker, String) == "build script executed"
         finally
@@ -869,6 +870,12 @@ end
         @test startswith(fallback.message, "Packages imported without being declared that could not be added: Broken (")
         @test occursin("Ghost", fallback.message)
         @test !haskey(_environments_project(fallback)["deps"], "Broken")
+
+        # So does one whose project is gone, for which the active project does not stand in.
+        gone = joinpath(root, "Gone")
+        vanished = _environments_prepare(context(Dict("Gone" => gone)), joinpath(envs, "vanished"))
+        @test vanished == JETSweep.Environment(:ready, joinpath(envs, "vanished"),
+            "Packages imported without being declared that could not be added: Gone (no Julia project at $gone).")
 
         # Registered packages that cannot be installed leave those of the workspace. Without
         # downloads, a registered package that is not installed cannot be.

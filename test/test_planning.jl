@@ -1,4 +1,4 @@
-using Test, JETSweep, TOML, UUIDs
+using JETSweep, TOML, Test, UUIDs
 
 const PLANNING_DATES = "ade2ca70-3891-5945-98fb-dc099432e06a"
 const PLANNING_TEST = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
@@ -613,7 +613,7 @@ end
         # Modules other files define, as `LOAD_PATH` finds them, are no packages to add.
         planning_file(root, "tools/Local.jl", "module Local\nend\n")
         runner = planning_file(root, "tools/run.jl", "push!(LOAD_PATH, @__DIR__)\nusing Local, Sibling\n")
-        inventory, units = planning_plan(root)
+        _, units = planning_plan(root)
         # Tests and the package's scripts share the test context, which gets the union.
         imports = Dict("Sibling" => sibling, "JSON" => "", "Unknown" => "")
         @test planning_unit(units, test).context.imports == imports

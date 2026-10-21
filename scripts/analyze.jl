@@ -10,6 +10,7 @@ module JETSweepWorker
 using JETLS, TOML
 
 const LS = Base.require(JETLS, :JETLSCore)
+const CC = LS.JET.CC
 
 # JET outlines a test expression into a thunk when it defines an anonymous function in a
 # conditional branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, because realizing a
@@ -166,8 +167,8 @@ outlinable_scope(ex) = ex isa Expr && (ex.head in (:for, :while, :let, :try) ||
 
 """
 Whether code binds nothing where it stands: tests and logging, whose bodies and arguments
-are local scopes, loops, `let` and `try` blocks, and calls and control flow of these, of
-values and of what JET outlines.
+are local scopes, but for values such as the exception `@test_throws` expects; loops, `let`
+and `try` blocks; and calls and control flow of these, of values and of what JET outlines.
 """
 binds_nothing(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) ||
     (ex.head === :macrocall ? any(names -> macro_name(ex) in names, (TEST_MACROS, LOGGING_MACROS, VALUE_MACROS)) :
@@ -331,11 +332,11 @@ Core.eval(LS.Interpreter, quote
     end
 end)
 
-# JETLS reports a `@test` that always fails only in top-level code, since a function body is
-# inferred for each specialization, for some of which a test may fail while it passes for
-# others. A function the worker outlines top-level code into has one, so its tests count too:
-# unless a test set is declared `failfast=false` or has a custom type, test sets are
-# fail-fast, so the code after such a test is not analyzed, as at top level.
+# JETLS reports a `@test` or `@test_throws` that always fails only in top-level code, since a
+# function body is inferred for each specialization, for some of which a test may fail while
+# it passes for others. A function the worker outlines top-level code into has one, so its
+# tests count too. Its test sets are fail-fast where they would be at top level, so the code
+# after such a `@test` is not analyzed there, as at top level.
 Core.eval(LS.Analyzer, quote
     function report_failing_test!(analyzer::LSAnalyzer, sv::CC.InferenceState, argtypes::Vector{Any})
         def = sv.linfo.def
@@ -343,13 +344,25 @@ Core.eval(LS.Analyzer, quote
         length(argtypes) == 2 || return false
         value = CC.widenconditional(argtypes[2])
         if value isa Const && value.val === false
-            add_new_report!(analyzer, sv.result, FailingTestReport(sv, Bool))
+            add_new_report!(analyzer, sv.result, FailingTestReport(sv, Bool, nothing))
             return true
         end
         t = CC.widenconst(value)
         t === Union{} && return false
         CC.hasintersect(t, Bool) && return false
-        add_new_report!(analyzer, sv.result, FailingTestReport(sv, t))
+        add_new_report!(analyzer, sv.result, FailingTestReport(sv, t, nothing))
+        return true
+    end
+    function report_failing_test_exception!(analyzer::LSAnalyzer, sv::CC.InferenceState, argtypes::Vector{Any})
+        def = sv.linfo.def
+        def isa Module || (def isa Method && $is_outlined(def.name)) || return false
+        length(argtypes) ≥ 3 || return false
+        expected = JET.matching_test_exception_type(argtypes[3])
+        expected === nothing && return false
+        exct = CC.typesubtract(CC.widenconst(argtypes[2]), JET.NoTestException,
+            CC.InferenceParams(analyzer).max_union_splitting)
+        (exct === Union{} || CC.hasintersect(exct, expected)) && return false
+        add_new_report!(analyzer, sv.result, FailingTestReport(sv, exct, (argtypes[3]::Const).val))
         return true
     end
 end)
@@ -372,11 +385,17 @@ end)
 
 """
 The global that the statement at `pc` of lowered code `code` defines, if it does: a constant
-or global it assigns, or a function it creates.
+or global it assigns, a function it creates, or the type of a closure, which lowering defines
+in a thunk of its own.
 """
 function definition(code::Vector{Any}, pc::Int)
     stmt = code[pc]
     Meta.isexpr(stmt, :method, 1) && return only(stmt.args) isa GlobalRef ? only(stmt.args) : nothing
+    if Meta.isexpr(stmt, :thunk, 1) && only(stmt.args) isa Core.CodeInfo
+        thunk = only(stmt.args).code
+        i = findfirst(i -> definition(thunk, i) !== nothing, eachindex(thunk))
+        return i === nothing ? nothing : definition(thunk, i)
+    end
     Meta.isexpr(stmt, :call, 4) || return nothing
     f, mod, name = stmt.args[1], stmt.args[2], stmt.args[3]
     f in (GlobalRef(Core, :declare_const), GlobalRef(Core, :setglobal!), Core.declare_const, Core.setglobal!) ||
@@ -386,8 +405,7 @@ function definition(code::Vector{Any}, pc::Int)
 end
 
 "The globals that the code of `frame` defines on every path to its statement `pc`."
-function defined_globals(frame, pc::Int=frame.currpc)
-    CC = LS.JET.CC
+function defined_globals(frame::CC.InferenceState, pc::Int=frame.currpc)
     code, cfg = frame.src.code, frame.cfg
     block = CC.block_for_inst(cfg, pc)
     domtree = nothing
@@ -415,7 +433,7 @@ Record the globals defined on every path to the call of `f`, a function holding 
 the worker moved out of a conditional, in top-level code `frame`, which defines `f` before
 the conditional and calls it in it: at its last load, whether inference reaches it or not.
 """
-function called!(frame, f::GlobalRef)
+function called!(frame::CC.InferenceState, f::GlobalRef)
     @lock CALLED_LOCK haskey(CALLED, f.name) && return nothing
     code = frame.src.code
     pc = findlast(stmt -> stmt == f || (Meta.isexpr(stmt, :(=), 2) && stmt.args[2] == f), code)
@@ -428,10 +446,10 @@ mentions(ex, name::Symbol) =
     ex isa GlobalRef ? ex.name === name : ex isa Expr && any(arg -> mentions(arg, name), ex.args)
 
 "Whether `frame` infers top-level code: at top level, or in a function the worker outlined it into."
-toplevel_code(frame) = LS.JET.istoplevelframe(frame) || (def = frame.linfo.def; def isa Method && is_outlined(def.name))
+toplevel_code(frame::CC.InferenceState) = LS.JET.istoplevelframe(frame) || (def = frame.linfo.def; def isa Method && is_outlined(def.name))
 
 "The name of the closure type whose method `frame` infers, if it does."
-function closure_name(frame)
+function closure_name(frame::CC.InferenceState)
     def = frame.linfo.def
     def isa Method || return nothing
     sig = Base.unwrap_unionall(def.sig)
@@ -443,8 +461,7 @@ end
 The frame of top-level code that `frame` runs code of: `frame` itself, or the frame calling the
 closure `frame` infers, if its code defines it, as the closure runs where that code calls it.
 """
-function toplevel_frame(frame)
-    CC = LS.JET.CC
+function toplevel_frame(frame::CC.InferenceState)
     toplevel_code(frame) && return frame
     name = closure_name(frame)
     name === nothing && return nothing
@@ -461,7 +478,7 @@ Whether the global `gr`, which `frame` reads, is defined there because top-level
 it on every path to the read: the top-level code `frame` runs code of, or the code before the
 call of the function holding a statement the worker moved out of a conditional.
 """
-function defined(frame, gr::GlobalRef)
+function defined(frame::CC.InferenceState, gr::GlobalRef)
     top = toplevel_frame(frame)
     top === nothing && return false
     gr in defined_globals(top) && return true
@@ -472,8 +489,7 @@ function defined(frame, gr::GlobalRef)
 end
 
 "Whether `gr` is a constant that JET defines as a placeholder in the world of `frame`."
-function placeholder(gr::GlobalRef, frame)
-    CC = LS.JET.CC
+function placeholder(gr::GlobalRef, frame::CC.InferenceState)
     partition = Base.lookup_binding_partition(frame.world.this, gr)
     return CC.is_defined_const_binding(CC.binding_kind(partition)) &&
         CC.partition_restriction(partition) isa LS.JET.AbstractBindingState
@@ -674,12 +690,9 @@ reached through its package, since it has no name to load it by.
 function orphan_entry(target::Module, file::String, package::String, extension::String)
     io = IOBuffer()
     println(io, "const Main = @__MODULE__\nimport ", package)
-    reference = package
-    if !isempty(extension)
-        # Evaluated, so that analysis knows the module.
-        println(io, "@eval const ", extension, " = Base.get_extension(", package, ", :", extension, ")")
-        reference = "." * extension
-    end
+    # Evaluated, so that analysis knows the module.
+    isempty(extension) || println(io, "@eval const ", extension, " = Base.get_extension(", package, ", :", extension, ")")
+    reference = isempty(extension) ? package : "." * extension
     path(m) = isdefined(target, nameof(m)) && getglobal(target, nameof(m)) === m ?
         "$reference.$(nameof(m))" : join(fullname(m), '.')
     for m in ccall(:jl_module_usings, Any, (Any,), target)
@@ -785,7 +798,8 @@ function original(file::String, line::Int)
     lines = readlines(file)
     marker = findlast(i -> occursin(MARKER, lines[i]), 1:min(line, length(lines)))
     marker === nothing && return nothing
-    source, start = match(MARKER, lines[marker])
+    found = match(MARKER, lines[marker])::RegexMatch
+    source, start = something(found[1]), something(found[2])
     # The statement ends where it parses to, before any include that follows the prelude.
     text = join(lines[marker+1:end], '\n')
     span = count('\n', text[1:prevind(text, last(Meta.parse(text, 1; raise=false)))])
@@ -830,14 +844,11 @@ function analyze(request, log::ErrorLog)
     try
         LS.start_signature_analysis_workers!(server)
         LS.start_analysis_worker!(server)
-        if target === nothing
-            uri = LS.filepath2uri(generated)
-            entry = LS.ScriptInEnvAnalysisEntry(environment, uri)
-        else
-            uri = LS.filepath2uri(request["entry"])
-            entry = LS.NewAnalysisEntry(Base.PkgId(target), environment)
-        end
-        LS.cache_file_info!(server, uri, 1, read(LS.uri2filepath(uri), String))
+        path = target === nothing ? generated : request["entry"]
+        uri = LS.filepath2uri(path)
+        entry = target === nothing ? LS.ScriptInEnvAnalysisEntry(environment, uri) :
+            LS.NewAnalysisEntry(Base.PkgId(target), environment)
+        LS.cache_file_info!(server, uri, 1, read(path, String))
         done = Base.Event()
         LS.schedule_analysis!(server, uri, entry, false; completion=done, notify_diagnostics=false, debounce=0.0)
         wait(done)

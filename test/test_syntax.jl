@@ -1,4 +1,4 @@
-using Test, JETSweep
+using JETSweep, Test
 
 const SyntaxInclude = JETSweep.Include
 
@@ -132,7 +132,7 @@ end
 @testset "prelude keeps conditional imports that can load" begin
     # A whole-module import binds names not known statically; the test file may use any.
     driver = "using Test\n@static if VERSION >= v\"1.0\"\n    using Dates\nend\nfor f in ARGS\n    include(f)\nend\n"
-    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "@test year(Date(2020, 1, 1)) == 2020\n") do text, dir
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "@test year(Date(2020, 1, 1)) == 2020\n") do text, _
         @test occursin("using Dates", text)
         loaded = Module()
         Core.eval(loaded, :(include_string(@__MODULE__, $text)))
@@ -144,7 +144,7 @@ h() = 1
 end
 @static if VERSION >= v\"1.0\"\n    using .Helpers: h\nend\n" *
              "for f in ARGS\n    include(f)\nend\n"
-    syntax_prelude("test/runtests.jl" => hidden, "test/target.jl" => "h()\n") do text, dir
+    syntax_prelude("test/runtests.jl" => hidden, "test/target.jl" => "h()\n") do text, _
         @test !occursin("using .Helpers", text)
         @test Core.eval(Module(), :(include_string(@__MODULE__, $text); true))
     end
@@ -153,7 +153,7 @@ h() = 1
 end
 @static if VERSION >= v\"1.0\"\n    using .Helpers: h\nend\n" *
             "for f in ARGS\n    include(f)\nend\n"
-    syntax_prelude("test/runtests.jl" => shown, "test/target.jl" => "h()\n") do text, dir
+    syntax_prelude("test/runtests.jl" => shown, "test/target.jl" => "h()\n") do text, _
         @test occursin("using .Helpers: h", text)
         loaded = Module()
         Core.eval(loaded, :(include_string(@__MODULE__, $text)))
@@ -175,7 +175,7 @@ end
             after() = 3
         end
         """
-    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "helper() + tiered()\n") do text, dir
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "helper() + tiered()\n") do text, _
         @test occursin("helper() = 1", text) && occursin("tiered() = 2", text)
         @test !occursin("after() = 3", text) && !occursin("run_selected", text)
     end
@@ -453,7 +453,7 @@ end
         Base.show(io::IO, ::Thing) = print(io, "thing")
         """
     # A module is kept where the target refers to it.
-    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "@test Inner.inner() == 1\n") do text, dir
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "@test Inner.inner() == 1\n") do text, _
         @test syntax_parses(text)
         @test syntax_imports(text) == syntax_imports(driver)
         @test syntax_names(text) == Set([:long_form, :short_form, :typed, :declared, Symbol("@twice"),
@@ -526,7 +526,7 @@ end
         foreach(((path, code),) -> syntax_write(dir, path, code), files)
         JETSweep.prelude_modules([joinpath(dir, "test/runtests.jl")], joinpath(dir, "test/target.jl"))
     end == Set([:Test])
-    syntax_prelude(files...) do text, dir
+    syntax_prelude(files...) do text, _
         names = syntax_names(text)
         @test syntax_parses(text)
         @test [:USED_BY_TARGET, :CHAIN_BASE, :CHAIN_TOP, :FOR_HELPER, :helper, :FOR_BODY, :body_helper,
@@ -581,7 +581,7 @@ end
         end
         """
     target = "@test static_helper(1) + if_helper(1) + uses_nested() == 9\n@test mixed_helper() == 7\n"
-    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => target) do text, dir
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => target) do text, _
         @test syntax_parses(text)
         @test occursin("@static if NEW", text) && occursin("const NEW", text)
         @test occursin("@eval begin\nif VERSION >= v\"1.0\"\n    if_helper(x) = x + 2", text)
@@ -640,7 +640,7 @@ end
              "test/conditional.jl" => "from_conditional() = 1\n",
              "test/function_only.jl" => "from_function() = 1\n",
              "test/loop_only.jl" => "from_loop() = 1\n")
-    syntax_prelude(files...) do text, dir
+    syntax_prelude(files...) do text, _
         names = syntax_names(text)
         @test syntax_parses(text)
         # A nested driver establishes context wherever it is included, as in a `@testset`;
@@ -655,7 +655,7 @@ end
     # A binding rebound to a run-time value no longer names the file it first did.
     rebound = "helpers = \"helpers.jl\"\nhelpers = readline()\ninclude(helpers)\n"
     syntax_prelude("test/runtests.jl" => rebound, "test/helpers.jl" => "from_helpers() = 1\n",
-                   "test/target.jl" => "") do text, dir
+                   "test/target.jl" => "") do text, _
         @test !(:from_helpers in syntax_names(text))
     end
 end
@@ -700,7 +700,7 @@ end
     driver = "module TestHelpers\ninclude(\"module_helpers.jl\")\nend\nusing .TestHelpers\n"
     files = ("test/runtests.jl" => driver, "test/target.jl" => "module_helper()\n",
              "test/module_helpers.jl" => "export module_helper\nmodule_helper() = 42\n")
-    syntax_prelude(files...) do text, dir
+    syntax_prelude(files...) do text, _
         sandbox = syntax_load(text)
         @test sandbox isa Module
         sandbox isa Module && @test syntax_call(syntax_value(sandbox, :TestHelpers), :module_helper) == 42
@@ -717,7 +717,7 @@ end
         const var"odd name" = 3
         keywords(x; k=1) = x + k
         """
-    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "") do text, dir
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "") do text, _
         @test syntax_parses(text)
         sandbox = syntax_load(text)
         @test sandbox isa Module
@@ -741,7 +741,7 @@ end
             x = 1
         end
         """
-    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "") do text, dir
+    syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "") do text, _
         @test syntax_parses(text)
         sandbox = syntax_load(text)
         @test sandbox isa Module
@@ -798,7 +798,7 @@ end
         end
         """
     files = ("test/runtests.jl" => driver, "test/test_alpha.jl" => target)
-    syntax_prelude(files...; target="test/test_alpha.jl") do text, dir
+    syntax_prelude(files...; target="test/test_alpha.jl") do text, _
         names = syntax_names(text)
         @test syntax_parses(text)
         @test syntax_imports(text) == syntax_imports(driver)
@@ -887,11 +887,22 @@ end
         if MEASURE
             using Statistics
         end
+        # And the conditions around deprecations of the module's own bindings, and their messages.
+        const LEGACY = get(ENV, "LEGACY", "") == "1"
+        if LEGACY
+            Base.deprecate(@__MODULE__, :old_name)
+        end
+        const OTHER = get(ENV, "OTHER", "") == "1"
+        OTHER && Base.deprecate(Base, :old_name)
+        const REPLACEMENT = string(:new_value, get(ENV, "SUFFIX", ""))
+        Base.@deprecate_binding old_value new_value false string(", use ", REPLACEMENT, " instead.")
         """
     @test syntax_patterns(code) == ["const LEVEL = isempty(ARGS) ? 1 : 2",
         "const ASKED = isempty(ARGS) ? split(get(ENV, \"TESTS\", \"\"), \",\"; keepempty=false) : ARGS",
         "const PICKED = isempty(ASKED) ? [\"a\"] : filter(f -> f in ASKED, [\"a\"])",
-        "const MEASURE = get(ARGS, 1, \"\") == \"--measure\"", "if MEASURE\n    using Statistics\nend"]
+        "const MEASURE = get(ARGS, 1, \"\") == \"--measure\"", "if MEASURE\n    using Statistics\nend",
+        "const LEGACY = get(ENV, \"LEGACY\", \"\") == \"1\"",
+        "const REPLACEMENT = string(:new_value, get(ENV, \"SUFFIX\", \"\"))"]
 end
 
 @testset "concretization_patterns follows what JETLS outlines, includes and imports" begin

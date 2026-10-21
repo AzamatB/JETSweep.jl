@@ -1,4 +1,4 @@
-using Test, JETSweep, TOML
+using JETSweep, TOML, Test
 
 const INTEGRATION_FIXTURE = joinpath(@__DIR__, "fixtures", "workspace")
 
@@ -211,6 +211,14 @@ end
             for item in readdir(sin("four"))
                 # The header is reported where it stands.
                 isdir(item) && foreach(x -> println(x), item)
+            end
+            for n in 1:2
+                @test_throws ArgumentError parse(Int, n)
+                n > 1 && foreach(x -> println(x), 1:n)
+            end
+            for n in 1:2
+                n > 1 && foreach(x -> println(x), 1:n)
+                @test 1 == 2
             end
             """)
         # A script runs as the program, so a check for that holds as it would.
@@ -471,7 +479,7 @@ end
             """)
         write(joinpath(root, "typed_types.txt"), "struct IncludedBox\n    v::Int\nend\n")
         # The tests of a tier not taken find what the tier defines before them, closures in
-        # them too, and its code after a definition is analyzed.
+        # them too, and its code after a definition is analyzed, after a closure too.
         write(joinpath(root, "untaken.jl"), """
             using Test
             if get(ENV, "JETSWEEP_TIER_NEVER_SET", "") == "1"
@@ -481,6 +489,7 @@ end
                 gpu_helper(t) = t.n + 1
                 const GPU_N = 4
                 thing = GPUThing(GPU_N)
+                println(map(x -> gpu_helper(thing) + x, 1:GPU_N))
                 sin("after the definitions")
                 @testset "tests of what the tier defines" begin
                     for n in 1:GPU_N
@@ -566,7 +575,7 @@ end
         @test errors("program.jl") == [4] && isempty(undefined("program.jl"))
         @test errors("tried.jl") == [6] && isempty(undefined("tried.jl")) && !isfile(joinpath(root, "tried.marker"))
         @test status("typed.jl") === :findings && errors("typed.jl") == [12, 22, 32] && isempty(undefined("typed.jl"))
-        @test errors("untaken.jl") == [9, 15] && isempty(undefined("untaken.jl"))
+        @test errors("untaken.jl") == [10, 16] && isempty(undefined("untaken.jl"))
         @test errors("defined.jl") == [11, 19] && [(f.line, f.severity) for f in undefined("defined.jl")] == [(21, 3)]
         @test status("locked.jl") === :findings && !isfile(joinpath(root, "acquired.marker"))
         @test status("bootstrap.jl") === :findings
@@ -574,8 +583,12 @@ end
         @test status("loop.jl") === :findings
         inside = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "inside.jl"))
         @test issubset([2, 7, 10, 15], [f.line for f in inside.findings if f.code == "inference/method-error"])
-        # A test that always fails is reported in outlined code as at top level.
+        # A test that always fails, false or not a `Bool`, is reported in outlined code as at top
+        # level, a `@test_throws` too, but not what its expression throws.
         @test any(f -> f.code == "inference/failing-test" && f.line == 12, inside.findings)
+        @test any(f -> f.code == "inference/failing-test" && f.line == 20, inside.findings)
+        @test any(f -> f.code == "inference/failing-test" && f.line == 25, inside.findings)
+        @test !any(f -> f.code == "inference/method-error" && f.line == 20, inside.findings)
         @test status("Preluded/test/wrapped.jl") === :incomplete
         @test reasons("Preluded/test/wrapped.jl") == reasons("Preluded/test/runtests.jl")
         @test any(reason -> occursin("Preluded/test/runtests.jl:5 [toplevel/error]", reason),

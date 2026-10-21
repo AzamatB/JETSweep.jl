@@ -1,8 +1,8 @@
-using Test, JETSweep, TOML
+using JETSweep, TOML, Test
 
 execution_context(name) = JETSweep.Context("/execution/$name", "", false, Dict{String,String}())
 execution_task(name, weight=1, priority=(0, 0)) = JETSweep._Task(weight, priority, execution_context(name))
-execution_name(task) = basename(task.work.project)
+execution_name(task) = basename((task.work::JETSweep.Context).project)
 
 "Dispatch `tasks`, recording start and end events and the peak clamped weight in use."
 function execution_trace(tasks, capacity; followups=Dict{String,Vector{JETSweep._Task}}(), pause=0.02)
@@ -99,7 +99,7 @@ function execution_alive(pid::Integer)
     catch
         return false
     end
-    return split(stat[findlast(')', stat)+1:end])[1] != "Z"
+    return split(stat[something(findlast(')', stat))+1:end])[1] != "Z"
 end
 
 execution_sh(script, args...) = Cmd(["/bin/sh", "-c", script, "sh", args...])
@@ -217,11 +217,11 @@ end
             println(join(ARGS, '|'))
             println(Base.JLOptions().check_bounds)
             """)
-        command = withenv("JULIA_PROJECT" => directory) do
+        probe = withenv("JULIA_PROJECT" => directory) do
             JETSweep.julia_command(script, ["x", "y z"]; project=directory, threads=2)
         end
         log = joinpath(directory, "probe.log")
-        @test JETSweep.run_worker(command, log, 300.0) == (code=0, timed_out=false)
+        @test JETSweep.run_worker(probe, log, 300.0) == (code=0, timed_out=false)
         # Default code generation (check_bounds 0) even when this process runs `--check-bounds=yes`.
         @test readlines(log) == ["2 0", "@:@stdlib", "unset", "x|y z", "0"]
     end
@@ -299,10 +299,10 @@ end
     @test options.include_ignored && options.tracked_only && options.plan_only
     @test !options.instantiate
     @test options.fail_on === :warning
-    directory, options = JETSweep.parse_arguments(["workspace"])
+    directory, parsed = JETSweep.parse_arguments(["workspace"])
     @test directory == "workspace"
     defaults = SweepOptions()
-    @test all(name -> getfield(options, name) == getfield(defaults, name), fieldnames(SweepOptions))
+    @test all(name -> getfield(parsed, name) == getfield(defaults, name), fieldnames(SweepOptions))
     @test JETSweep.parse_arguments(["--gpus=none", "workspace"])[2].gpus == ["none"]
     options = JETSweep.parse_arguments(["--fail-on=none", "--timeout=0", "workspace"])[2]
     @test options.fail_on === :none && options.timeout === 0.0
@@ -352,6 +352,9 @@ function execution_capture(f)
     end
 end
 
+"The directory of the JETSweep package under test."
+const EXECUTION_PACKAGE = pkgdir(JETSweep)::String
+
 @testset "Command-line entry point" begin
     for arguments in (["--help"], ["-h"])
         code, out, err = execution_capture(() -> JETSweep.main(arguments))
@@ -360,20 +363,15 @@ end
         @test startswith(out, "jetsweep — ")
         @test isempty(err)
     end
-    code, out, err = execution_capture(() -> JETSweep.main(["--version"]))
-    @test code == 0
-    @test out == "JETSweep $(pkgversion(JETSweep))\n"
-    @test isempty(err)
-    code, out, err = execution_capture(() -> JETSweep.main(["a", "b"]))
-    @test code == 2
-    @test isempty(out)
-    @test err == "jetsweep: ArgumentError: give exactly one directory; see `jetsweep --help`\n"
+    @test execution_capture(() -> JETSweep.main(["--version"])) == (0, "JETSweep $(pkgversion(JETSweep))\n", "")
+    @test execution_capture(() -> JETSweep.main(["a", "b"])) ==
+          (2, "", "jetsweep: ArgumentError: give exactly one directory; see `jetsweep --help`\n")
     mktempdir() do directory
         missing = joinpath(directory, "missing")
-        code, out, err = execution_capture(() -> JETSweep.main(["--plan", missing]))
+        code, _, err = execution_capture(() -> JETSweep.main(["--plan", missing]))
         @test code == 2
         @test occursin("not a directory: $missing", err)
-        code, out, err = execution_capture(() -> JETSweep.main(["--jobs=0", directory]))
+        code, _, err = execution_capture(() -> JETSweep.main(["--jobs=0", directory]))
         @test code == 2
         @test occursin("jobs must be positive", err)
         @test isempty(readdir(directory))
@@ -381,13 +379,13 @@ end
     # A checkout that was never instantiated lacks the analyzer: a run fails before writing
     # anything, saying how to instantiate it. A plan needs no analyzer.
     mktempdir() do tool
-        cp(joinpath(pkgdir(JETSweep), "Project.toml"), joinpath(tool, "Project.toml"))
+        cp(joinpath(EXECUTION_PACKAGE, "Project.toml"), joinpath(tool, "Project.toml"))
         loaded = JETSweep._LOADED_PROJECT[]
         JETSweep._LOADED_PROJECT[] = joinpath(tool, "Project.toml")
         try
             mktempdir() do directory
                 write(joinpath(directory, "script.jl"), "f() = 1\n")
-                code, out, err = execution_capture(() -> JETSweep.main([directory]))
+                code, _, err = execution_capture(() -> JETSweep.main([directory]))
                 @test code == 2
                 @test err == "jetsweep: JETSweep's project $tool is not instantiated; run " *
                              "`julia --project=$tool -e 'using Pkg; Pkg.instantiate()'` first\n"
@@ -404,8 +402,8 @@ end
 @testset "only the analyzer needs to be installed" begin
     # Packages of JETSweep's environment that the analyzer does not depend on may be missing.
     mktempdir() do tool
-        cp(joinpath(pkgdir(JETSweep), "Project.toml"), joinpath(tool, "Project.toml"))
-        manifest = TOML.parsefile(joinpath(pkgdir(JETSweep), "Manifest.toml"))
+        cp(joinpath(EXECUTION_PACKAGE, "Project.toml"), joinpath(tool, "Project.toml"))
+        manifest = TOML.parsefile(joinpath(EXECUTION_PACKAGE, "Manifest.toml"))
         manifest["deps"]["NeverInstalled"] = [Dict{String,Any}("uuid" => "6a1a2b3c-4d5e-4f60-8a71-92b3c4d5e6f7",
                                                                "version" => "1.0.0", "git-tree-sha1" => repeat("ab", 20))]
         open(io -> TOML.print(io, manifest), joinpath(tool, "Manifest.toml"), "w")
@@ -477,7 +475,7 @@ execution_unit(entry; kind=:test, expected=[entry], setup=String[], jetls_config
 "A sweep of `root` in which `unit`'s entry statically includes its other expected files."
 function execution_sweep(unit, root, output)
     inventory = JETSweep.Inventory(root, JETSweep.Project[], JETSweep.Source[], [JETSweep.Project[], JETSweep.Project[]], String[], String[])
-    dynamic = isfile(unit.entry) ? filter(i -> isempty(i.target), JETSweep.parse_source(unit.entry).includes) : []
+    dynamic = isfile(unit.entry) ? filter(i -> isempty(i.target), JETSweep.parse_source(unit.entry).includes) : JETSweep.Include[]
     includes = [dynamic; [JETSweep.Include(file, 1, true) for file in unit.expected if file != unit.entry]]
     syntax = Dict(unit.entry => JETSweep.Syntax(includes, String[]))
     return JETSweep._Sweep(inventory, output, SweepOptions(), syntax, Dict{String,JETSweep.Unit}(),
@@ -594,7 +592,7 @@ const EXECUTION_USER_JETLS = """
 
         # Package analysis evaluates all top-level code itself; an orphan's script analysis does not.
         package = execution_touch(joinpath(root, "Pkg", "src", "Pkg.jl"), "module Pkg\nconst N = 1\nend\n")
-        base, data = execution_jetls(execution_unit(package; kind=:package), root)
+        _, data = execution_jetls(execution_unit(package; kind=:package), root)
         @test execution_patterns(data) == [("const C_ = v_", "")]
         _, data = execution_jetls(execution_unit(package; kind=:orphan), root)
         @test execution_patterns(data)[2:end] == [("const N = 1", "Pkg/src/Pkg.jl")]
@@ -728,7 +726,7 @@ end
 @testset "A context that selects no unit is a mistake, unless the sweep leaves out what it selects" begin
     mktempdir() do directory
         root = realpath(directory)
-        check = execution_touch(joinpath(root, "Swept", "tools", "check.jl"), "include(\"lib.jl\")\n")
+        execution_touch(joinpath(root, "Swept", "tools", "check.jl"), "include(\"lib.jl\")\n")
         execution_touch(joinpath(root, "Swept", "tools", "lib.jl"))
         execution_touch(joinpath(root, "Swept", "tools", "generated.jl"))
         execution_touch(joinpath(root, "Other", "run.jl"))

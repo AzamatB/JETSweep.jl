@@ -15,7 +15,7 @@ code and so on — and says plainly which analyses could not complete, and why.
 
 ## Install
 
-JETSweep requires Julia 1.13. It uses JETLS 2026.10.18, pinned to that release's commit
+JETSweep requires Julia 1.13. It uses JETLS 2026.10.21, pinned to that release's commit
 because the analysis entry points it drives are internal to JETLS, and JETLS's Revise-based
 package analysis, which only its development mode enables. JETLS releases leave out the
 Revise that mode loads, so JETSweep adds it. JETSweep's own environment has a Revise 3
@@ -91,12 +91,13 @@ selection logic the test file does not depend on is left out. An
 analysis stop in the prelude is reported at the driver's line it copies, whose diagnostic the
 driver's own analysis reports. The drivers' own analyses evaluate the selection and skip
 including the files analyzed separately. A test file analyzed by itself is fail-fast
-top-level code, as below, even when its driver includes it in a `failfast=false` or custom
-test set.
+top-level code, as below, even when its driver includes it in a test set that is not, such as
+one with `failfast=false`.
 
-Script analysis evaluates definitions, imports and includes but not assignments, so a
-definition or `include` that needs an assigned value stops JETLS
-(`toplevel/missing-concretization`), and other code sees assigned values only as types.
+Script analysis evaluates definitions, imports, includes and the deprecations of bindings,
+as `@deprecate_binding` declares them, but not assignments, so any of these that needs an
+assigned value stops JETLS (`toplevel/missing-concretization`), and other code sees assigned
+values only as types.
 JETSweep therefore lets JETLS evaluate the top-level statements of the files a unit loads
 that cannot have side effects: assignments of literals, paths and pure functions of names
 already bound, modules the file or its prelude imports among them, such as
@@ -106,8 +107,9 @@ conditionals made only of these, definitions and imports, such as
 
 Values that depend on how and where the program runs (`ARGS`, `ENV`, `PROGRAM_FILE`, the
 working directory, files read) are evaluated only where JETLS needs them, with `PROGRAM_FILE`
-the analyzed file: in the arguments of `include` and `eval` calls, in
-definition signatures, and in conditions that define closures or choose imports. And since
+the analyzed file: in the arguments of `include` and `eval` calls, in definition signatures
+and `@deprecate_binding` messages, and in conditions that define closures or choose imports
+or deprecations. And since
 JETLS always evaluates `include` and `eval` calls, and under JETSweep `include_string` calls
 too, whatever their arguments need is evaluated, side effects or not, as a test driver's
 selection of its files is, and so is what decides whether they run: the conditions around
@@ -156,13 +158,15 @@ imports, exports, type definitions, methods of functions that are not local, suc
 `Base.show(io::IO, x::T) = …`, generated functions, global constants and globals with declared
 types; and closures whose parameters declare types, since Julia evaluates those types where
 the closure stands.
-JETLS analyzes top-level code and test sets as fail-fast, except test sets that specify
-`failfast=false` or have a custom type and those nested in them, which it analyzes as
-declared. So code after a `@test` that always fails is not analyzed, except in those test
-sets, and JETLS reports such a test only in top-level code; JETSweep reports it in the code it
-outlines too. JETLS drops what it finds in code without line information, which the closures
-it outlines `@test` expressions into are; JETSweep reports it at the nearest line that has
-some, the test's.
+JETLS analyzes top-level code and test sets as fail-fast, except test sets that name their
+type, even `DefaultTestSet`, and those nested in them, and test sets that specify `failfast` as
+anything but a literal `true`, such as `failfast=false`, which those nested in them inherit
+unless they specify `failfast=true`. So code after a `@test` that always fails is not
+analyzed, except in those test sets. JETLS reports such a test, and a `@test_throws` whose
+expression it infers to throw only exceptions other than the one expected, only in top-level
+code; JETSweep reports them in the code it outlines too. JETLS drops what it finds in code
+without line information, which the closures it outlines `@test` expressions into are;
+JETSweep reports it at the nearest line that has some, the test's.
 
 Files a finished analysis does not reach, such as package files loading leaves out or files
 after an analysis stop, get follow-up units of their own, in the same context: a package's

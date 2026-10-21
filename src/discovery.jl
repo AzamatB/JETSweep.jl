@@ -266,10 +266,13 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], config
         end
     end
 
+    # The directories left to walk, with the repository each is in and its tier.
+    pending = Tuple{String,Union{Nothing,_Git},Int}[]
+
     # A directory the sweep leaves out, at `tier` 1, or that the configuration excludes, at 2,
     # is walked for its projects alone, with what goes wrong there left unreported: its
     # packages are still those of the workspace.
-    function walk(directory::String, git::Union{Nothing,_Git}, tier::Int=0)
+    function walk(directory::String, git::Union{Nothing,_Git}, tier::Int)
         reported = tier == 0 ? issues : String[]
         # Directory entries tell links and directories apart without a `stat` of each path,
         # which matters in large excluded trees.
@@ -300,9 +303,9 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], config
             if reason !== nothing
                 tier == 0 && push!(excluded, "$path ($reason)")
                 patterned > 0 && isdirectory && omission(path, name, git, isdirectory, hidden, String[]) === nothing &&
-                    walk(path, git, max(tier, patterned))
+                    push!(pending, (path, git, max(tier, patterned)))
             elseif isdirectory
-                walk(path, git, tier)
+                push!(pending, (path, git, tier))
             elseif tier == 0 && endswith(name, ".jl")
                 push!(files, path)
             elseif name in _PROJECT_FILES
@@ -317,8 +320,11 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], config
     end
 
     try
-        walk(root, repository(root, issues))
-        isempty(workspace) || walk(workspace, repository(workspace, String[]), 1)
+        push!(pending, (root, repository(root, issues), 0))
+        isempty(workspace) || push!(pending, (workspace, repository(workspace, String[]), 1))
+        while !isempty(pending)
+            walk(pop!(pending)...)
+        end
     finally
         foreach(close, repositories)
     end

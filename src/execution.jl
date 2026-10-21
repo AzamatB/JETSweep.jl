@@ -21,17 +21,17 @@ cannot starve. `step` returns follow-up tasks. An interrupt stops every worker a
 function _dispatch(step, tasks::Vector{_Task}, capacity::Int)
     queue = sort(tasks; by=task -> task.priority)
     condition = Threads.Condition()
-    used, running = 0, 0
+    used, running = Ref(0), Ref(0)
     failure = Ref{Any}(nothing)
     try
         @lock condition while true
             # Ctrl-C interrupts whichever task is current, usually one waiting for its worker.
             failure[] isa InterruptException && throw(failure[])
-            while !isempty(queue) && failure[] === nothing && used + min(first(queue).weight, capacity) <= capacity
+            while !isempty(queue) && failure[] === nothing && used[] + min(first(queue).weight, capacity) <= capacity
                 task = popfirst!(queue)
                 weight = min(task.weight, capacity)
-                used += weight
-                running += 1
+                used[] += weight
+                running[] += 1
                 @async begin
                     followups = _Task[]
                     try
@@ -40,8 +40,8 @@ function _dispatch(step, tasks::Vector{_Task}, capacity::Int)
                         failure[] = err isa InterruptException ? err : CapturedException(err, catch_backtrace())
                     end
                     @lock condition begin
-                        used -= weight
-                        running -= 1
+                        used[] -= weight
+                        running[] -= 1
                         for followup in followups
                             index = searchsortedfirst(queue, followup; by=task -> task.priority)
                             insert!(queue, index, followup)
@@ -50,7 +50,7 @@ function _dispatch(step, tasks::Vector{_Task}, capacity::Int)
                     end
                 end
             end
-            running == 0 && (isempty(queue) || failure[] !== nothing) && break
+            running[] == 0 && (isempty(queue) || failure[] !== nothing) && break
             wait(condition)
         end
     catch
@@ -140,7 +140,8 @@ function _environment_inputs(context::Context)
         imports = filter(((_, directory),) -> !isempty(directory), context.imports)
         project, _ = _scratch_project(Context(context.project, context.owner, context.test, context.triggers, imports), envs)
         for entry in values(_refresh_paths!(_seed_manifest(envs), project, envs))
-            entry.path === nothing || append!(files, joinpath.(entry.path, _PROJECT_FILES))
+            path = entry.path
+            path === nothing || append!(files, joinpath.(path, _PROJECT_FILES))
         end
     catch err
         err isa InterruptException && rethrow()
@@ -152,9 +153,13 @@ end
 function _add_resolved_inputs!(inputs::Dict{String,String}, environment::Environment)
     manifest = joinpath(environment.dir, "Manifest.toml")
     ready(environment) && isfile(manifest) || return inputs
-    for entry in values(Pkg.Types.read_manifest(manifest)), name in (entry.path === nothing ? () : _PROJECT_FILES)
-        file = joinpath(abspath(environment.dir, entry.path), name)
-        get!(() -> _digest(file), inputs, file)
+    for entry in values(Pkg.Types.read_manifest(manifest))
+        path = entry.path
+        path === nothing && continue
+        for name in _PROJECT_FILES
+            file = joinpath(abspath(environment.dir, path), name)
+            get!(() -> _digest(file), inputs, file)
+        end
     end
     return inputs
 end
@@ -347,9 +352,9 @@ _notes(unit::Unit, environment::Environment) =
 function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Union{Nothing,String})
     if !ready(environment)
         # The unit never runs; what preparation logged, if anything, tells why.
-        log = joinpath(_environment_directory(sweep.output, unit.context), "log.txt")
+        preparation_log = joinpath(_environment_directory(sweep.output, unit.context), "log.txt")
         return UnitResult(unit.id, :unavailable, Finding[], String[], ["environment unavailable: " * environment.message],
-                          copy(unit.notes), 0.0, filesize(log) > 0 ? log : "")
+                          copy(unit.notes), 0.0, filesize(preparation_log) > 0 ? preparation_log : "")
     end
     directory = joinpath(sweep.output, "units", unit.id)
     mkpath(directory)
@@ -538,16 +543,16 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
     started = time()
     root = realpath(root)
     config = read_config(root, options.config)
-    output = isempty(options.output) ? "" : abspath(options.output)
-    isempty(output) || !ispath(output) || isdir(output) && isempty(readdir(output)) ||
-        throw(ArgumentError("report directory must be new or empty: $output"))
-    inventory = discover(root; exclude=options.exclude, config, output,
+    requested = isempty(options.output) ? "" : abspath(options.output)
+    isempty(requested) || !ispath(requested) || isdir(requested) && isempty(readdir(requested)) ||
+        throw(ArgumentError("report directory must be new or empty: $requested"))
+    inventory = discover(root; exclude=options.exclude, config, output=requested,
                          include_ignored=options.include_ignored, tracked_only=options.tracked_only)
     syntax = source_syntax(inventory)
     units = plan(inventory, config; syntax)
-    notes = _unselected(config, units, root, options, output)
-    output = isempty(output) ? _new_directory(joinpath(root, ".jetsweep"), Libc.strftime("%Y%m%d-%H%M%S", time())) :
-             mkpath(output)
+    notes = _unselected(config, units, root, options, requested)
+    output = isempty(requested) ? _new_directory(joinpath(root, ".jetsweep"), Libc.strftime("%Y%m%d-%H%M%S", time())) :
+             mkpath(requested)
     write_tag(output)
     write_inventory(joinpath(output, "inventory.toml"), inventory)
     write_plan(joinpath(output, "plan.toml"), units, inventory.root, notes)
@@ -594,9 +599,10 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
         if work isa Context
             # What the environment is prepared from, digested before preparation reads it.
             inputs = contained(() -> _digests(_environment_inputs(work)), _ -> Dict{String,String}())
-            environment = prepared(work, _environment_directory(output, work))
-            contained(() -> _add_resolved_inputs!(inputs, environment), _ -> inputs)
-            environments[work] = _Prepared(environment, inputs, 1, ReentrantLock())
+            let environment = prepared(work, _environment_directory(output, work))
+                contained(() -> _add_resolved_inputs!(inputs, environment), _ -> inputs)
+                environments[work] = _Prepared(environment, inputs, 1, ReentrantLock())
+            end
             return [_task(unit, previous) for unit in members[work]]
         end
         gpu = isempty(gpus) ? nothing : gpus[mod1(started_units[] += 1, length(gpus))]
