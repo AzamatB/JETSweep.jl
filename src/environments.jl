@@ -70,9 +70,9 @@ function _merge_dep!(deps::Dict{String,String}, name::String, uuid)
     return deps
 end
 
-_bound(bound) = bound.n == 0 ? "0" : join(bound.t[1:bound.n], ".")
+_bound(bound::Pkg.Versions.VersionBound) = bound.n == 0 ? "0" : join(bound.t[1:bound.n], ".")
 "A version range in compat syntax: Pkg prints ranges in a notation compat reads differently."
-_compat(range) = range.upper.n == 0 ? ">= " * _bound(range.lower) : _bound(range.lower) * " - " * _bound(range.upper)
+_compat(range::Pkg.Versions.VersionRange) = range.upper.n == 0 ? ">= " * _bound(range.lower) : _bound(range.lower) * " - " * _bound(range.upper)
 
 function _merge_compat!(compat::Dict{String,String}, name::String, value::String)
     if haskey(compat, name)
@@ -87,6 +87,7 @@ end
 
 "Pkg metadata permits missing names and UUIDs; validate them once, at this boundary."
 function _identity(package, description::String)
+    package === nothing && error("$description has no name or UUID")
     name, uuid = package.name, package.uuid
     name isa String || error("$description has no name")
     uuid isa UUID || error("$description ($name) has no UUID")
@@ -130,8 +131,9 @@ function _scratch_project(context::Context, envs)
                 uuid === nothing || _merge_dep!(deps, name, uuid)
             end
         end
-        if env.pkg !== nothing
-            package = _identity(env.pkg, "package at $directory")
+        pkg = env.pkg
+        if pkg !== nothing
+            package = _identity(pkg, "package at $directory")
             _merge_dep!(deps, package.name, package.uuid)
             sources[package.name] = Dict("path" => directory)
         end
@@ -150,7 +152,9 @@ function _scratch_project(context::Context, envs)
             uuid = _registered(name)
             uuid === nothing || _merge_dep!(deps, name, uuid)
         else
-            _merge_dep!(deps, name, _identity(Pkg.Types.EnvCache(_project_file(directory)).pkg, "package at $directory").uuid)
+            file = _project_file(directory)
+            file === nothing && error("no Julia project at $directory")
+            _merge_dep!(deps, name, _identity(Pkg.Types.EnvCache(file).pkg, "package at $directory").uuid)
             sources[name] = Dict("path" => directory)
         end
     end
@@ -170,7 +174,8 @@ end
 
 function _absolute!(entry::Pkg.Types.PackageEntry, manifest_file::String)
     directory = dirname(manifest_file)
-    entry.path === nothing || (entry.path = abspath(directory, entry.path))
+    path = entry.path
+    path === nothing || (entry.path = abspath(directory, path))
     source = entry.repo.source
     source === nothing || Pkg.Types.isurl(source) || (entry.repo.source = abspath(directory, source))
     return entry
@@ -490,7 +495,8 @@ function _supply_revise!(manifest)
 end
 
 function _entry_source(entry::Pkg.Types.PackageEntry, manifest_file::String)
-    entry.path === nothing || return Dict("path" => abspath(dirname(manifest_file), entry.path))
+    path = entry.path
+    path === nothing || return Dict("path" => abspath(dirname(manifest_file), path))
     repo = entry.repo
     repo.source === nothing && return nothing
     source = Dict("url" => repo.source, "rev" => something(repo.rev, string(entry.tree_hash)))
@@ -511,7 +517,8 @@ function _require_tool()
         uuid in seen && continue
         push!(seen, uuid)
         entry = get(tool.manifest, uuid, nothing)
-        path = entry === nothing ? nothing : Pkg.Operations.source_path(tool.manifest_file, entry)
+        entry === nothing && (installed = false; break)
+        path = Pkg.Operations.source_path(tool.manifest_file, entry)
         installed = path !== nothing && isdir(path) && Pkg.Operations.check_artifacts_downloaded(path)
         installed && append!(pending, values(entry.deps))
     end
@@ -538,13 +545,14 @@ function _add_tool!(project::Dict, preferences::Dict, manifest)
     sources = get!(project, "sources", Dict{String,Dict{String,String}}())
     for uuid in (_JETLS, _TESTRUNNER, _REVISE)
         entry = tool.manifest[uuid]
-        _merge_dep!(project["deps"], entry.name, uuid)
+        name = entry.name::String
+        _merge_dep!(project["deps"], name, uuid)
         source = _entry_source(entry, tool.manifest_file)
-        source === nothing || haskey(sources, entry.name) || (sources[entry.name] = source)
+        source === nothing || haskey(sources, name) || (sources[name] = source)
     end
     # A target that locks a Revise keeps it within the analyzer's series; others get the
     # release JETSweep's own environment has, also when the environment is re-resolved.
-    revise = tool.manifest[_REVISE].version
+    revise = tool.manifest[_REVISE].version::VersionNumber
     _merge_compat!(get!(project, "compat", Dict{String,String}()), "Revise",
                    locked ? "$(revise.major).$(revise.minor)" : "=$revise")
     get!(project, "extras", Dict{String,String}())["JETLSCore"] = string(_JETLSCORE)
@@ -554,7 +562,7 @@ function _add_tool!(project::Dict, preferences::Dict, manifest)
     named = merge(project["deps"], get(project, "extras", Dict{String,String}()))
     compat = get(project, "compat", Dict{String,String}())
     deferred = Dict{String,String}()
-    for (name, bound) in collect(compat)
+    for name in collect(keys(compat))
         name == "julia" && continue
         any(entry -> entry.name == name && string(entry.uuid) != get(named, name, ""), values(manifest)) &&
             (deferred[name] = pop!(compat, name))

@@ -28,6 +28,6 @@ function __init__()
 end
 
 export SweepOptions, discover, plan, sweep
-public main, read_config, prepare, prelude, parse_source
+public main, parse_source, prelude, prepare, read_config
 
 end # module JETSweep

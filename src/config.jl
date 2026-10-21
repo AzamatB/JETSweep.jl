@@ -59,48 +59,48 @@ jetls_config = "tools/.JETLSConfig.toml"
 """
 function read_config(root::AbstractString, file::AbstractString="")
     explicit = !isempty(file)
-    file = explicit ? abspath(file) : joinpath(root, ".JETSweep.toml")
-    isfile(file) || (explicit ? throw(ArgumentError("configuration file does not exist: $file")) : return Config())
+    candidate = explicit ? abspath(file) : joinpath(root, ".JETSweep.toml")
+    isfile(candidate) || (explicit ? throw(ArgumentError("configuration file does not exist: $candidate")) : return Config())
     # Globs match real paths, as discovery finds them.
-    file = joinpath(realpath(dirname(file)), basename(file))
-    data = TOML.parsefile(file)
+    config_file = joinpath(realpath(dirname(candidate)), basename(candidate))
+    data = TOML.parsefile(config_file)
     unknown = setdiff(keys(data), ("exclude", "context"))
-    isempty(unknown) || throw(ArgumentError("$file: unknown keys $(join(sort!(collect(unknown)), ", "))"))
-    base = dirname(file)
+    isempty(unknown) || throw(ArgumentError("$config_file: unknown keys $(join(sort!(collect(unknown)), ", "))"))
+    base = dirname(config_file)
     root = ispath(root) ? realpath(root) : abspath(root)
     directory = _within(root, base) ? base : root
-    exclude = _strings(get(data, "exclude", String[]), "exclude", file)
+    exclude = _strings(get(data, "exclude", String[]), "exclude", config_file)
     tables = get(data, "context", Any[])
     tables isa Vector && all(table -> table isa AbstractDict, tables) ||
-        throw(ArgumentError("$file: `context` must be an array of tables, [[context]]"))
+        throw(ArgumentError("$config_file: `context` must be an array of tables, [[context]]"))
     contexts = map(tables) do table
-        unknown = setdiff(keys(table), ("match", "project", "setup", "args", "env", "jetls_config"))
-        isempty(unknown) || throw(ArgumentError("$file: unknown [[context]] keys $(join(sort!(collect(unknown)), ", "))"))
+        extra = setdiff(keys(table), ("match", "project", "setup", "args", "env", "jetls_config"))
+        isempty(extra) || throw(ArgumentError("$config_file: unknown [[context]] keys $(join(sort!(collect(extra)), ", "))"))
         match = get(table, "match", nothing)
-        match isa String || throw(ArgumentError("$file: each [[context]] needs a `match` glob"))
+        match isa String || throw(ArgumentError("$config_file: each [[context]] needs a `match` glob"))
         project = get(table, "project", "")
-        project isa String || throw(ArgumentError("$file: `project` must be a path"))
+        project isa String || throw(ArgumentError("$config_file: `project` must be a path"))
         if haskey(table, "project")
             project = _absolute(base, project)
             basename(project) in _PROJECT_FILES && (project = dirname(project))
-            any(name -> isfile(joinpath(project, name)), _PROJECT_FILES) ||
-                throw(ArgumentError("$file: no Julia project at $project"))
+            any(isfile, joinpath.(project, _PROJECT_FILES)) ||
+                throw(ArgumentError("$config_file: no Julia project at $project"))
         end
-        setup = [_absolute(base, path) for path in _strings(get(table, "setup", String[]), "setup", file)]
+        setup = [_absolute(base, path) for path in _strings(get(table, "setup", String[]), "setup", config_file)]
         for path in setup
-            isfile(path) || throw(ArgumentError("$file: setup file does not exist: $path"))
+            isfile(path) || throw(ArgumentError("$config_file: setup file does not exist: $path"))
         end
         env = get(table, "env", Dict{String,Any}())
         env isa AbstractDict && all(value -> value isa String, values(env)) ||
-            throw(ArgumentError("$file: `env` must be a table of strings"))
+            throw(ArgumentError("$config_file: `env` must be a table of strings"))
         jetls_config = get(table, "jetls_config", "")
-        jetls_config isa String || throw(ArgumentError("$file: `jetls_config` must be a path"))
+        jetls_config isa String || throw(ArgumentError("$config_file: `jetls_config` must be a path"))
         if haskey(table, "jetls_config")
             jetls_config = _absolute(base, jetls_config)
-            isfile(jetls_config) || throw(ArgumentError("$file: JETLS configuration does not exist: $jetls_config"))
+            isfile(jetls_config) || throw(ArgumentError("$config_file: JETLS configuration does not exist: $jetls_config"))
         end
         ContextRule(match, _glob(match), Set{String}(keys(table)), project, setup,
-                    _strings(get(table, "args", String[]), "args", file), Dict{String,String}(env), jetls_config)
+                    _strings(get(table, "args", String[]), "args", config_file), Dict{String,String}(env), jetls_config)
     end
-    return Config(file, directory, exclude, contexts)
+    return Config(config_file, directory, exclude, contexts)
 end

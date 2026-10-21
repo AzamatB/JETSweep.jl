@@ -14,6 +14,7 @@ struct Include
 end
 Include(target::String, line::Int, followed::Bool) = Include(target, line, followed, 0)
 
+"The static facts `parse_source` finds in a file."
 struct Syntax
     includes::Vector{Include}
     "Parse failures and includes that cannot be resolved statically."
@@ -109,7 +110,7 @@ function _rebind!(bindings::Dict{Symbol,String}, ex::Expr, file::String, package
     return bindings
 end
 
-_assigned!(names::Set{Symbol}, ex) = names
+_assigned!(names::Set{Symbol}, ::Any) = names
 function _assigned!(names::Set{Symbol}, ex::Expr)
     (ex.head === :(=) || ex.head in _UPDATES) && !_signature(first(ex.args)) && _symbols!(names, first(ex.args))
     foreach(arg -> _assigned!(names, arg), ex.args)
@@ -120,6 +121,72 @@ end
 _loop_names(spec) = spec isa Expr && spec.head in (:(=), :block, :filter) ?
     (spec.head === :(=) ? _symbols(first(spec.args)) : mapreduce(_loop_names, union, spec.args; init=Set{Symbol}())) :
     (spec isa Symbol ? Set([spec]) : Set{Symbol}())
+
+"What `parse_source` has found in a file so far, and the line it has reached."
+mutable struct _SourceFacts
+    const file::String
+    const packages::Dict{String,Project}
+    const exports::Dict{String,Dict{Symbol,String}}
+    const includes::Vector{Include}
+    const notes::Vector{String}
+    const imports::Vector{String}
+    const modules::Vector{String}
+    line::Int
+end
+
+"Add what `ex` includes, imports and defines to `facts`; `bindings` are the path constants it sees."
+function _source_facts!(facts::_SourceFacts, ex, bindings::Dict{Symbol,String}, followed::Bool, depth::Int=0)
+    ex isa LineNumberNode && (facts.line = ex.line; return)
+    ex isa Expr || return
+    (; file, packages, exports, includes, notes, imports, modules) = facts
+    head = ex.head
+    if head in (:error, :incomplete)
+        push!(notes, "$file:$(facts.line): cannot be parsed")
+        return
+    elseif head === :quote
+        return
+    elseif head in (:using, :import)
+        for path in ex.args
+            path isa Expr && path.head in (:(:), :as) && (path = first(path.args))
+            path isa Expr && path.head === :. && !isempty(path.args) && first(path.args) isa Symbol &&
+                first(path.args) !== :. && push!(imports, String(first(path.args)))
+        end
+        return
+    elseif _is_include(ex)
+        target = _path(last(ex.args), file, bindings, packages)
+        if target === nothing
+            push!(notes, "$file:$(facts.line): include target is only known at run time")
+            push!(includes, Include("", facts.line, followed, depth))
+        else
+            target = normpath(dirname(file), target)
+            push!(includes, Include(target, facts.line, followed, depth))
+            merge!(bindings, get(exports, target, Dict{Symbol,String}()))
+        end
+        return
+    elseif _method(ex)
+        # Parameters shadow outer bindings; the body is analyzed, never run, at top level.
+        body = copy(bindings)
+        foreach(name -> delete!(body, name), _symbols(first(ex.args)))
+        foreach(arg -> _source_facts!(facts, arg, body, false, depth), ex.args[2:end])
+        return
+    elseif head === :module
+        ex.args[2] isa Symbol && push!(modules, String(ex.args[2]))
+        _source_facts!(facts, last(ex.args), Dict{Symbol,String}(), followed, depth + 1)
+        return
+    elseif head === :(=) || head in _UPDATES
+        _rebind!(bindings, ex, file, packages)
+    end
+    # Bindings made inside conditionals and scopes do not leak outward.
+    scoped = head in (:let, :for, :while, :if, :elseif, :try, :&&, :||, :generator, :comprehension)
+    inner = scoped ? copy(bindings) : bindings
+    if head in (:for, :let, :generator)
+        specs = head === :generator ? ex.args[2:end] : ex.args[1:1]
+        foreach(spec -> foreach(name -> delete!(inner, name), _loop_names(spec)), specs)
+    end
+    foreach(arg -> _source_facts!(facts, arg, inner, followed, depth), ex.args)
+    scoped && foreach(name -> delete!(bindings, name), _assigned!(Set{Symbol}(), ex))
+    return
+end
 
 """
     parse_source(file, packages=Dict(); exports=Dict()) -> Syntax
@@ -136,60 +203,8 @@ function parse_source(file::String, packages::Dict{String,Project}=Dict{String,P
     catch err
         return Syntax(includes, ["$file: cannot be read: $(sprint(showerror, err))"])
     end
-    line = 1
-    function visit(ex, bindings::Dict{Symbol,String}, followed::Bool, depth::Int=0)
-        ex isa LineNumberNode && (line = ex.line; return)
-        ex isa Expr || return
-        head = ex.head
-        if head in (:error, :incomplete)
-            push!(notes, "$file:$line: cannot be parsed")
-            return
-        elseif head === :quote
-            return
-        elseif head in (:using, :import)
-            for path in ex.args
-                path isa Expr && path.head in (:(:), :as) && (path = first(path.args))
-                path isa Expr && path.head === :. && !isempty(path.args) && first(path.args) isa Symbol &&
-                    first(path.args) !== :. && push!(imports, String(first(path.args)))
-            end
-            return
-        elseif _is_include(ex)
-            target = _path(last(ex.args), file, bindings, packages)
-            if target === nothing
-                push!(notes, "$file:$line: include target is only known at run time")
-                push!(includes, Include("", line, followed, depth))
-            else
-                target = normpath(dirname(file), target)
-                push!(includes, Include(target, line, followed, depth))
-                merge!(bindings, get(exports, target, Dict{Symbol,String}()))
-            end
-            return
-        elseif _method(ex)
-            # Parameters shadow outer bindings; the body is analyzed, never run, at top level.
-            inner = copy(bindings)
-            foreach(name -> delete!(inner, name), _symbols(first(ex.args)))
-            foreach(arg -> visit(arg, inner, false, depth), ex.args[2:end])
-            return
-        elseif head === :module
-            ex.args[2] isa Symbol && push!(modules, String(ex.args[2]))
-            visit(last(ex.args), Dict{Symbol,String}(), followed, depth + 1)
-            return
-        elseif head === :(=) || head in _UPDATES
-            _rebind!(bindings, ex, file, packages)
-        end
-        # Bindings made inside conditionals and scopes do not leak outward.
-        scoped = head in (:let, :for, :while, :if, :elseif, :try, :&&, :||, :generator, :comprehension)
-        inner = scoped ? copy(bindings) : bindings
-        if head in (:for, :let, :generator)
-            specs = head === :generator ? ex.args[2:end] : ex.args[1:1]
-            foreach(spec -> foreach(name -> delete!(inner, name), _loop_names(spec)), specs)
-        end
-        foreach(arg -> visit(arg, inner, followed, depth), ex.args)
-        scoped && foreach(name -> delete!(bindings, name), _assigned!(Set{Symbol}(), ex))
-        return
-    end
     top = Dict{Symbol,String}()
-    visit(tree, top, true)
+    _source_facts!(_SourceFacts(file, packages, exports, includes, notes, imports, modules, 1), tree, top, true)
     return Syntax(unique!(includes), unique!(notes), unique!(imports), top, unique!(modules))
 end
 
@@ -206,14 +221,23 @@ function _statements(file::String; modules::Bool=false, blocks::Bool=true)
     return text, _flatten!(Tuple{JS.SyntaxNode,Any}[], tree; modules, blocks)
 end
 
+"The children of `node`, none for a leaf."
+function _children(node::JS.SyntaxNode)
+    children = JS.children(node)
+    return children === nothing ? JS.SyntaxNode[] : children
+end
+
+"The value of the leaf `node`, an identifier's name or a literal's value, if it has one."
+_value(node::JS.SyntaxNode) = (data = node.data; data === nothing ? nothing : data.val)
+
 "Push the statements `node` holds, with their expressions, onto `statements`."
 function _flatten!(statements::Vector{Tuple{JS.SyntaxNode,Any}}, node::JS.SyntaxNode; modules::Bool=false,
                    blocks::Bool=true)
     kind = JS.kind(node)
     if kind == JS.K"toplevel" || (blocks && kind == JS.K"block")
-        foreach(child -> _flatten!(statements, child; modules, blocks), JS.children(node))
+        foreach(child -> _flatten!(statements, child; modules, blocks), _children(node))
     elseif modules && kind == JS.K"module"
-        foreach(child -> _flatten!(statements, child; modules, blocks), JS.children(last(JS.children(node))))
+        foreach(child -> _flatten!(statements, child; modules, blocks), _children(last(_children(node))))
     elseif kind != JS.K"error"
         ex = try
             Expr(node)
@@ -260,12 +284,13 @@ function _conditional_definitions(ex)
     ex isa Expr || return false
     _macro_name(ex) == "@static" && return _conditional_definitions(last(ex.args))
     ex.head in (:if, :elseif) || return false
-    # A string in a branch is no docstring, nor anything else.
-    member(ex) = ex isa Union{LineNumberNode,String} || ex isa Expr &&
-        (ex.head in (:using, :import) || _definition(ex) || _assignment(ex) !== nothing ||
-         _conditional_definitions(ex) || (ex.head === :block && all(member, ex.args)))
-    return all(member, ex.args[2:end])
+    return all(_definition_member, ex.args[2:end])
 end
+
+"Whether `ex` can stand in a branch of `_conditional_definitions`. A string there is no docstring, nor anything else."
+_definition_member(ex) = ex isa Union{LineNumberNode,String} || ex isa Expr &&
+    (ex.head in (:using, :import) || _definition(ex) || _assignment(ex) !== nothing ||
+     _conditional_definitions(ex) || (ex.head === :block && all(_definition_member, ex.args)))
 
 "The names a definition or import statement binds."
 function _bound_names(ex)
@@ -481,6 +506,10 @@ function _binds!(names::Set{Symbol}, ex)
     return names
 end
 
+"The name an indexed or field expression starts from, as `a` of `a.b[i]`, or `nothing`."
+_mutation_root(ex) = ex isa Symbol ? ex :
+    ex isa Expr && ex.head in (:ref, :.) && !isempty(ex.args) ? _mutation_root(first(ex.args)) : nothing
+
 """
 Names that `ex` may mutate, or rebind from a local scope, invisibly to a later evaluation:
 arguments of `!` functions, objects of indexed, field and broadcast assignments, and names
@@ -489,15 +518,14 @@ assigned as `global` in functions and loops.
 function _mutated!(names::Set{Symbol}, ex, scoped::Bool=false)
     ex isa Expr || return names
     ex.head in (:quote, :inert) && return names
-    root(ex) = ex isa Symbol ? ex : ex isa Expr && ex.head in (:ref, :.) && !isempty(ex.args) ? root(first(ex.args)) : nothing
     target = nothing
     if ex.head === :call && length(ex.args) >= 2 && endswith(_name(first(ex.args)), '!')
         position = findfirst(arg -> !(arg isa Expr && arg.head === :parameters), ex.args[2:end])
-        position === nothing || (target = root(ex.args[position+1]))
+        position === nothing || (target = _mutation_root(ex.args[position+1]))
     elseif (ex.head === :(=) || ex.head in _UPDATES) && first(ex.args) isa Expr && first(ex.args).head in (:ref, :.)
-        target = root(first(ex.args))
+        target = _mutation_root(first(ex.args))
     elseif ex.head === :.=
-        target = root(first(ex.args))
+        target = _mutation_root(first(ex.args))
     elseif ex.head === :global && scoped
         foreach(arg -> _assigned!(names, arg), ex.args)
     end
@@ -908,12 +936,125 @@ function _exits!(conditions::Vector{Any}, ex, exits::Tuple, path::Vector{Any}=An
     elseif head in (:for, :while)
         :return in exits && _exits!(conditions, last(ex.args), (:return,), [path; first(ex.args)])
     elseif head === :macrocall
-        _macro_name(ex) in _INLINE_MACROS || (exits = filter(!=(:return), exits))
-        foreach(arg -> _exits!(conditions, arg, exits, path), ex.args[2:end])
+        inner = _macro_name(ex) in _INLINE_MACROS ? exits : filter(!=(:return), exits)
+        foreach(arg -> _exits!(conditions, arg, inner, path), ex.args[2:end])
     else
         foreach(arg -> _exits!(conditions, arg, exits, path), ex.args)
     end
     return conditions
+end
+
+"What `_reads!` gathers from a statement, and what it knows of the conditional the statement may be."
+struct _Reads
+    "The names whose values JETLS evaluates."
+    direct::Set{Symbol}
+    "The names assignments bind, with the names their values and conditions read."
+    locals::Vector{Pair{Set{Symbol},Set{Symbol}}}
+    "The names the statement binds, if it is a conditional the worker does not outline."
+    bound::Set{Symbol}
+    "Whether that conditional may bind any name, as when it imports or includes."
+    opaque::Bool
+end
+
+"Whether `part`, a statement of a conditional, is moved out of it (see `_reads!`)."
+function _moved(reads::_Reads, part)
+    _outlined(part) || return false
+    names = _signature_reads!(Set{Symbol}(), part)
+    return isempty(names) || (!reads.opaque && isdisjoint(names, reads.bound))
+end
+
+_needs!(reads::_Reads, parts, controls) =
+    (foreach(part -> _evaluated_symbols!(reads.direct, part), parts); foreach(c -> _symbols!(reads.direct, c), controls))
+
+# What follows an early exit, as `include(file)` follows `file in SKIPPED && continue`,
+# runs only where its conditions let it.
+_exited(controls, part) = (exits = _exits!(Any[], part, (:break, :continue, :return));
+                           isempty(exits) ? controls : [controls; exits])
+
+# Functions defined in loops, `let` and `try` blocks are local: closures. The closures in
+# statements moved out of a conditional need no conditions either.
+function _visit_reads!(reads::_Reads, ex, controls::Vector{Any}, branches::Vector{Any}, scoped::Bool, forced::Bool,
+                       toplevel::Bool=false)
+    ex isa Expr || return
+    head = ex.head
+    if toplevel && head in (:if, :elseif, :block)
+        parts = head === :block ? ex.args : ex.args[2:end]
+        if head !== :block
+            condition = first(ex.args)
+            _visit_reads!(reads, condition, controls, branches, scoped, forced)
+            controls, branches = [controls; condition], [branches; condition]
+        end
+        for part in parts
+            outlined = forced || head === :block && _moved(reads, part)
+            _visit_reads!(reads, part, controls, branches, scoped, outlined,
+                          !outlined && Meta.isexpr(part, head === :block ? (:if, :block) : (:elseif, :block)))
+            head === :block && (controls = _exited(controls, part))
+        end
+    elseif head in (:quote, :inert, :module)
+        return
+    elseif head === :macrocall
+        name = _macro_name(ex)
+        name in _TEST_MACROS && return     # JETLS outlines their closures into thunks
+        # `@eval [module] code` evaluates its module, and the code at top level.
+        name == "@eval" &&
+            return (foreach(arg -> _code_reads!(reads.direct, arg), ex.args[2:end]); _needs!(reads, Any[], controls))
+        # `@static` evaluates its condition when it expands.
+        !forced && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
+            _needs!(reads, Any[first(last(ex.args).args)], controls)
+        # JETLS evaluates the deprecation `@deprecate_binding` declares, and the constant
+        # holding its message.
+        !forced && name == "@deprecate_binding" && _needs!(reads, Any[get(ex.args, 6, nothing)], controls)
+        for arg in ex.args[2:end]
+            _visit_reads!(reads, arg, controls, branches, scoped, forced)
+        end
+    elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "include_string")
+        _needs!(reads, ex.args[2:end], controls)
+    elseif head === :call && _name(first(ex.args)) == "eval"
+        foreach(arg -> _code_reads!(reads.direct, arg), ex.args[2:end])
+        _needs!(reads, Any[], controls)
+    elseif head === :call && _name(first(ex.args)) == "deprecate" &&
+           _macro_name(get(ex.args, 2, nothing)) == "@__MODULE__"
+        # JETLS evaluates only the deprecations of the module's own bindings.
+        forced || _needs!(reads, Any[], controls)
+    elseif _method(ex)
+        forced || (_closure(ex) || scoped ? _needs!(reads, branches, Any[]) :
+                   (_signature_types!(reads.direct, first(ex.args)); _needs!(reads, Any[], controls)))
+    elseif head in (:struct, :abstract, :primitive)
+        forced || (_type_symbols!(reads.direct, ex); _needs!(reads, Any[], controls))
+    elseif head in (:using, :import)
+        forced || _needs!(reads, Any[], controls)
+    elseif head in (:if, :elseif, :&&, :||)
+        condition = first(ex.args)
+        _visit_reads!(reads, condition, controls, branches, scoped, forced)
+        for arg in ex.args[2:end]
+            _visit_reads!(reads, arg, [controls; condition], [branches; condition], scoped, forced)
+        end
+    elseif head in (:for, :while)
+        _visit_reads!(reads, first(ex.args), controls, branches, scoped, forced)
+        # A `break`, `return` or `@goto` decides whether the later iterations run.
+        body = _exits!([controls; first(ex.args)], last(ex.args), (:break, :return))
+        _visit_reads!(reads, last(ex.args), body, branches, true, forced)
+    elseif head === :let
+        _visit_reads!(reads, first(ex.args), controls, branches, scoped, forced)
+        _visit_reads!(reads, last(ex.args), controls, branches, true, forced)
+    elseif head === :try
+        for arg in ex.args
+            _visit_reads!(reads, arg, controls, branches, true, forced)
+        end
+    elseif head === :block
+        for part in ex.args
+            _visit_reads!(reads, part, controls, branches, scoped, forced)
+            controls = _exited(controls, part)
+        end
+    else
+        !forced && head in (:generator, :comprehension, :typed_comprehension, :do) && _needs!(reads, branches, Any[])
+        if head === :(=) && !_signature(first(ex.args))
+            push!(reads.locals, _symbols(first(ex.args)) => union(_symbols(last(ex.args)), map(_symbols, controls)...))
+        end
+        for arg in ex.args
+            _visit_reads!(reads, arg, controls, branches, scoped, forced)
+        end
+    end
 end
 
 """
@@ -935,95 +1076,9 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
     conditional = !whole && ex isa Expr && ex.head === :if
     bound = conditional ? _may_bind!(Set{Symbol}(), ex) : Set{Symbol}()
     opaque = conditional && (_stays(ex) || _imports(ex))
-    function moved(part)
-        _outlined(part) || return false
-        reads = _signature_reads!(Set{Symbol}(), part)
-        return isempty(reads) || (!opaque && isdisjoint(reads, bound))
-    end
     direct = Set{Symbol}()
     locals = Pair{Set{Symbol},Set{Symbol}}[]
-    needs!(parts, controls) =
-        (foreach(part -> _evaluated_symbols!(direct, part), parts); foreach(c -> _symbols!(direct, c), controls))
-    # What follows an early exit, as `include(file)` follows `file in SKIPPED && continue`,
-    # runs only where its conditions let it.
-    exited(controls, part) = (exits = _exits!(Any[], part, (:break, :continue, :return));
-                              isempty(exits) ? controls : [controls; exits])
-    # Functions defined in loops, `let` and `try` blocks are local: closures. The closures in
-    # statements moved out of a conditional need no conditions either.
-    function visit(ex, controls::Vector{Any}, branches::Vector{Any}, scoped::Bool, forced::Bool, toplevel::Bool=false)
-        ex isa Expr || return
-        head = ex.head
-        if toplevel && head in (:if, :elseif, :block)
-            parts = head === :block ? ex.args : ex.args[2:end]
-            if head !== :block
-                condition = first(ex.args)
-                visit(condition, controls, branches, scoped, forced)
-                controls, branches = [controls; condition], [branches; condition]
-            end
-            for part in parts
-                outlined = forced || head === :block && moved(part)
-                visit(part, controls, branches, scoped, outlined,
-                      !outlined && Meta.isexpr(part, head === :block ? (:if, :block) : (:elseif, :block)))
-                head === :block && (controls = exited(controls, part))
-            end
-        elseif head in (:quote, :inert, :module)
-            return
-        elseif head === :macrocall
-            name = _macro_name(ex)
-            name in _TEST_MACROS && return     # JETLS outlines their closures into thunks
-            # `@eval [module] code` evaluates its module, and the code at top level.
-            name == "@eval" && return (foreach(arg -> _code_reads!(direct, arg), ex.args[2:end]); needs!(Any[], controls))
-            # `@static` evaluates its condition when it expands.
-            !forced && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
-                needs!(Any[first(last(ex.args).args)], controls)
-            # JETLS evaluates the deprecation `@deprecate_binding` declares, and the constant
-            # holding its message.
-            !forced && name == "@deprecate_binding" && needs!(Any[get(ex.args, 6, nothing)], controls)
-            foreach(arg -> visit(arg, controls, branches, scoped, forced), ex.args[2:end])
-        elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "include_string")
-            needs!(ex.args[2:end], controls)
-        elseif head === :call && _name(first(ex.args)) == "eval"
-            foreach(arg -> _code_reads!(direct, arg), ex.args[2:end])
-            needs!(Any[], controls)
-        elseif head === :call && _name(first(ex.args)) == "deprecate" &&
-               _macro_name(get(ex.args, 2, nothing)) == "@__MODULE__"
-            # JETLS evaluates only the deprecations of the module's own bindings.
-            forced || needs!(Any[], controls)
-        elseif _method(ex)
-            forced || (_closure(ex) || scoped ? needs!(branches, Any[]) :
-                       (_signature_types!(direct, first(ex.args)); needs!(Any[], controls)))
-        elseif head in (:struct, :abstract, :primitive)
-            forced || (_type_symbols!(direct, ex); needs!(Any[], controls))
-        elseif head in (:using, :import)
-            forced || needs!(Any[], controls)
-        elseif head in (:if, :elseif, :&&, :||)
-            condition = first(ex.args)
-            visit(condition, controls, branches, scoped, forced)
-            foreach(arg -> visit(arg, [controls; condition], [branches; condition], scoped, forced), ex.args[2:end])
-        elseif head in (:for, :while)
-            visit(first(ex.args), controls, branches, scoped, forced)
-            # A `break`, `return` or `@goto` decides whether the later iterations run.
-            body = _exits!([controls; first(ex.args)], last(ex.args), (:break, :return))
-            visit(last(ex.args), body, branches, true, forced)
-        elseif head === :let
-            visit(first(ex.args), controls, branches, scoped, forced)
-            visit(last(ex.args), controls, branches, true, forced)
-        elseif head === :try
-            foreach(arg -> visit(arg, controls, branches, true, forced), ex.args)
-        elseif head === :block
-            for part in ex.args
-                visit(part, controls, branches, scoped, forced)
-                controls = exited(controls, part)
-            end
-        else
-            !forced && head in (:generator, :comprehension, :typed_comprehension, :do) && needs!(branches, Any[])
-            if head === :(=) && !_signature(first(ex.args))
-                push!(locals, _symbols(first(ex.args)) => union(_symbols(last(ex.args)), (_symbols(c) for c in controls)...))
-            end
-            foreach(arg -> visit(arg, controls, branches, scoped, forced), ex.args)
-        end
-    end
-    visit(ex, Any[], Any[], false, whole, conditional)
+    _visit_reads!(_Reads(direct, locals, bound, opaque), ex, Any[], Any[], false, whole, conditional)
     changed = true
     while changed
         changed = false
@@ -1178,42 +1233,44 @@ end
 
 function _macro_identifier(node::JS.SyntaxNode)
     JS.kind(node) == JS.K"macrocall" || return nothing
-    name = first(JS.children(node))
-    JS.kind(name) == JS.K"." && (name = last(JS.children(name)))
+    name = first(_children(node))
+    JS.kind(name) == JS.K"." && (name = last(_children(name)))
     JS.kind(name) == JS.K"macro_name" || return nothing
-    identifier = first(JS.children(name))
-    return identifier.data === nothing ? nothing : identifier.data.val
+    return _value(first(_children(name)))
 end
 
 function _include_literal(node::JS.SyntaxNode)
     JS.kind(node) == JS.K"call" || return nothing
-    children = JS.children(node)
+    children = _children(node)
     length(children) >= 2 || return nothing
     callee = first(children)
-    JS.kind(callee) == JS.K"." && (callee = last(JS.children(callee)))
-    callee.data !== nothing && callee.data.val === :include || return nothing
+    JS.kind(callee) == JS.K"." && (callee = last(_children(callee)))
+    _value(callee) === :include || return nothing
     path = last(children)
-    JS.kind(path) == JS.K"string" && length(JS.children(path)) == 1 || return nothing
-    literal = only(JS.children(path))
-    JS.kind(literal) == JS.K"String" || return nothing
-    return path => literal.data.val
+    JS.kind(path) == JS.K"string" && length(_children(path)) == 1 || return nothing
+    literal = only(_children(path))
+    value = _value(literal)
+    JS.kind(literal) == JS.K"String" && value isa String || return nothing
+    return path => value
+end
+
+"Push the edits that pin the locations `node` depends on to `file` onto `edits`."
+function _relocations!(edits::Vector{Pair{UnitRange{Int},String}}, node::JS.SyntaxNode, file::String)
+    macro_name = _macro_identifier(node)
+    if macro_name in (:__DIR__, :__FILE__)
+        return push!(edits, JS.byte_range(node) => repr(macro_name === :__DIR__ ? dirname(file) : file))
+    end
+    literal = _include_literal(node)
+    if literal !== nothing && !isabspath(last(literal))
+        push!(edits, JS.byte_range(first(literal)) => repr(normpath(dirname(file), last(literal))))
+    end
+    JS.is_leaf(node) || foreach(child -> _relocations!(edits, child, file), _children(node))
+    return edits
 end
 
 "The source text of `node`, with locations that depend on its file pinned to `file`."
 function _relocated(node::JS.SyntaxNode, text::String, file::String)
-    edits = Pair{UnitRange{Int},String}[]
-    function visit(n)
-        macro_name = _macro_identifier(n)
-        if macro_name in (:__DIR__, :__FILE__)
-            return push!(edits, JS.byte_range(n) => repr(macro_name === :__DIR__ ? dirname(file) : file))
-        end
-        literal = _include_literal(n)
-        if literal !== nothing && !isabspath(last(literal))
-            push!(edits, JS.byte_range(first(literal)) => repr(normpath(dirname(file), last(literal))))
-        end
-        JS.is_leaf(n) || foreach(visit, JS.children(n))
-    end
-    visit(node)
+    edits = _relocations!(Pair{UnitRange{Int},String}[], node, file)
     bytes = codeunits(text)
     io = IOBuffer()
     position = first(JS.byte_range(node))
@@ -1225,10 +1282,11 @@ function _relocated(node::JS.SyntaxNode, text::String, file::String)
     return String(take!(io))
 end
 
+"A statement of a test driver that a prelude may copy, with where it is from and its source text."
 struct _DriverStatement
     file::String
     line::Int
-    ex::Any
+    ex::Expr
     "The names that select it, those an assignment, module or conditional binds; empty for imports and definitions."
     names::Vector{Symbol}
     text::String
@@ -1308,7 +1366,7 @@ include `stops` accepts, if any.
 """
 function _reaching_branch(node::JS.SyntaxNode, ex, stops)
     Meta.isexpr(ex, (:if, :elseif)) || return nothing
-    children = JS.children(node)
+    children = _children(node)
     for i in 2:min(length(ex.args), length(children))
         stops(ex.args[i]) || continue
         Meta.isexpr(ex.args[i], :elseif) && return _reaching_branch(children[i], ex.args[i], stops)

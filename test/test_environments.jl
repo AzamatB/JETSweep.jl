@@ -870,6 +870,12 @@ end
         @test occursin("Ghost", fallback.message)
         @test !haskey(_environments_project(fallback)["deps"], "Broken")
 
+        # So does one whose project is gone, for which the active project does not stand in.
+        gone = joinpath(root, "Gone")
+        vanished = _environments_prepare(context(Dict("Gone" => gone)), joinpath(envs, "vanished"))
+        @test vanished == JETSweep.Environment(:ready, joinpath(envs, "vanished"),
+            "Packages imported without being declared that could not be added: Gone (no Julia project at $gone).")
+
         # Registered packages that cannot be installed leave those of the workspace. Without
         # downloads, a registered package that is not installed cannot be.
         graded = _environments_prepare(context(Dict("Sibling" => sibling, "Oxygen" => "")), joinpath(envs, "graded"))
