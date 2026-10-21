@@ -384,11 +384,17 @@ end)
 
 """
 The global that the statement at `pc` of lowered code `code` defines, if it does: a constant
-or global it assigns, or a function it creates.
+or global it assigns, a function it creates, or the type of a closure, which lowering defines
+in a thunk of its own.
 """
 function definition(code::Vector{Any}, pc::Int)
     stmt = code[pc]
     Meta.isexpr(stmt, :method, 1) && return only(stmt.args) isa GlobalRef ? only(stmt.args) : nothing
+    if Meta.isexpr(stmt, :thunk, 1) && only(stmt.args) isa Core.CodeInfo
+        thunk = only(stmt.args).code
+        i = findfirst(i -> definition(thunk, i) !== nothing, eachindex(thunk))
+        return i === nothing ? nothing : definition(thunk, i)
+    end
     Meta.isexpr(stmt, :call, 4) || return nothing
     f, mod, name = stmt.args[1], stmt.args[2], stmt.args[3]
     f in (GlobalRef(Core, :declare_const), GlobalRef(Core, :setglobal!), Core.declare_const, Core.setglobal!) ||

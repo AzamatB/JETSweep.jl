@@ -309,16 +309,17 @@ end
 # ==============
 #
 # Script analysis evaluates definitions, imports, includes and the deprecations of bindings,
-# as `@deprecate_binding` declares them, but not assignments, so a definition or `include`
-# that needs an assigned value stops it
-# (`toplevel/missing-concretization`), and other code sees assigned values only as types.
+# as `@deprecate_binding` declares them, but not assignments, so any of these that needs an
+# assigned value stops it (`toplevel/missing-concretization`), and other code sees assigned
+# values only as types.
 # JETSweep lets JETLS evaluate the top-level statements that cannot have side effects:
 # assignments of values built from literals, paths and pure functions of names already
 # bound, and blocks and conditionals made only of these, definitions and imports. Values
 # that depend on how and where the program runs (`ARGS`, `ENV`, `PROGRAM_FILE`, its
 # directory and the files there) are evaluated
 # only where analysis needs them: in `include` and `eval` arguments, definition signatures,
-# and the conditions JETLS evaluates to define the closures in their branches or to import.
+# `@deprecate_binding` messages, and the conditions JETLS evaluates to define the closures in
+# their branches, to import or to deprecate.
 # Since JETLS always evaluates `include` and `eval` calls, whatever their arguments need is
 # evaluated too, pure or not, as a test driver's selection of the files it includes, and so
 # are the conditions that decide whether they run, also those of early exits such as
@@ -917,13 +918,13 @@ end
 
 """
 Add the names whose values JETLS evaluates when it analyzes the top-level statement `ex`:
-arguments of `include` and `eval` calls, signatures of definitions, the control flow around
-these and around imports, and the conditions of branches that define closures, which JETLS
-evaluates to define them; with `forced`, only those of `include` and `eval` calls, which
-JETLS evaluates whatever they need. Assignments in `ex` that these names depend on count too.
-Control flow includes early exits: the conditions of a `continue`, `break`, `return` or
-`@goto` control what follows it, and those of a `break`, `return` or `@goto` every iteration
-of its loop.
+arguments of `include` and `eval` calls, signatures of definitions, messages of
+`@deprecate_binding`, the control flow around these and around imports and deprecations, and
+the conditions of branches that define closures, which JETLS evaluates to define them; with
+`forced`, only those of `include` and `eval` calls, which JETLS evaluates whatever they need.
+Assignments in `ex` that these names depend on count too. Control flow includes early exits:
+the conditions of a `continue`, `break`, `return` or `@goto` control what follows it, and
+those of a `break`, `return` or `@goto` every iteration of its loop.
 """
 function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
     # Closures in an outlined expression's branches need no conditions.
@@ -975,12 +976,19 @@ function _reads!(needed::Set{Symbol}, ex; forced::Bool=false)
             # `@static` evaluates its condition when it expands.
             !forced && name == "@static" && last(ex.args) isa Expr && last(ex.args).head === :if &&
                 needs!(Any[first(last(ex.args).args)], controls)
+            # JETLS evaluates the deprecation `@deprecate_binding` declares, and the constant
+            # holding its message.
+            !forced && name == "@deprecate_binding" && needs!(Any[get(ex.args, 6, nothing)], controls)
             foreach(arg -> visit(arg, controls, branches, scoped, forced), ex.args[2:end])
         elseif _is_include(ex) || (head === :call && _name(first(ex.args)) == "include_string")
             needs!(ex.args[2:end], controls)
         elseif head === :call && _name(first(ex.args)) == "eval"
             foreach(arg -> _code_reads!(direct, arg), ex.args[2:end])
             needs!(Any[], controls)
+        elseif head === :call && _name(first(ex.args)) == "deprecate" &&
+               _macro_name(get(ex.args, 2, nothing)) == "@__MODULE__"
+            # JETLS evaluates only the deprecations of the module's own bindings.
+            forced || needs!(Any[], controls)
         elseif _method(ex)
             forced || (_closure(ex) || scoped ? needs!(branches, Any[]) :
                        (_signature_types!(direct, first(ex.args)); needs!(Any[], controls)))
