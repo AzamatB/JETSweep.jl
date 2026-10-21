@@ -1,4 +1,4 @@
-using Test, JETSweep
+using JETSweep, Test
 
 const TEST_FILES = ["test_discovery.jl", "test_syntax.jl", "test_planning.jl", "test_environments.jl",
                     "test_execution.jl", "test_integration.jl"]

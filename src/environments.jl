@@ -615,6 +615,7 @@ function prepare(context::Context, directory::String; instantiate::Bool=true)
             join(dropped, ", ") * (isempty(failure) ? "." : " ($failure)."))
         return Environment(:ready, directory, strip(join(notes, " ") * " " * environment.message))
     end
+    error("unreachable: preparing without undeclared imports returns its environment")
 end
 
 function _prepared(context::Context, directory::String, instantiate::Bool)

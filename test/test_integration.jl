@@ -1,4 +1,4 @@
-using Test, JETSweep, TOML
+using JETSweep, TOML, Test
 
 const INTEGRATION_FIXTURE = joinpath(@__DIR__, "fixtures", "workspace")
 

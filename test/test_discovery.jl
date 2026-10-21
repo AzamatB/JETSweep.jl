@@ -1,4 +1,4 @@
-using Test, JETSweep, LibGit2, TOML, UUIDs
+using JETSweep, LibGit2, TOML, Test, UUIDs
 
 function discovery_write(root, relative, contents="nothing\n")
     path = joinpath(root, relative)
@@ -55,8 +55,8 @@ end
 "Root-relative excluded paths mapped to the reason discovery gives."
 function discovery_reasons(inventory)
     return discovery_dict(map(inventory.excluded) do item
-        path, reason = match(r"^(.*) \(([^()]*)\)$", item).captures
-        discovery_relative(inventory, path) => String(reason)
+        found = match(r"^(.*) \(([^()]*)\)$", item)::RegexMatch
+        discovery_relative(inventory, something(found[1])) => String(something(found[2]))
     end)
 end
 
@@ -306,7 +306,7 @@ end
         ignored = git ? String[] : ["Sibling/ignored/Ignored"]
         inventory = discover(root; exclude=["Sibling"])
         @test discovery_files(inventory) == ["Kept/src/Kept.jl"]
-        @test [discovery_relative(inventory, p.dir) for p in inventory.projects] == ["Kept"]
+        @test [p.dir for p in inventory.projects] == [kept]
         @test available(inventory) == [["Sibling"; ignored; "Sibling/vendor/Vendored"], String[]]
         @test isempty(inventory.issues)
         @test discovery_reasons(inventory) == Dict("Sibling" => "excluded by pattern")
