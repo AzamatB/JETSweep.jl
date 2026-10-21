@@ -166,8 +166,8 @@ outlinable_scope(ex) = ex isa Expr && (ex.head in (:for, :while, :let, :try) ||
 
 """
 Whether code binds nothing where it stands: tests and logging, whose bodies and arguments
-are local scopes, loops, `let` and `try` blocks, and calls and control flow of these, of
-values and of what JET outlines.
+are local scopes, but for values such as the exception `@test_throws` expects; loops, `let`
+and `try` blocks; and calls and control flow of these, of values and of what JET outlines.
 """
 binds_nothing(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) ||
     (ex.head === :macrocall ? any(names -> macro_name(ex) in names, (TEST_MACROS, LOGGING_MACROS, VALUE_MACROS)) :
@@ -331,11 +331,11 @@ Core.eval(LS.Interpreter, quote
     end
 end)
 
-# JETLS reports a `@test` that always fails only in top-level code, since a function body is
-# inferred for each specialization, for some of which a test may fail while it passes for
-# others. A function the worker outlines top-level code into has one, so its tests count too:
-# unless a test set is declared `failfast=false` or has a custom type, test sets are
-# fail-fast, so the code after such a test is not analyzed, as at top level.
+# JETLS reports a `@test` or `@test_throws` that always fails only in top-level code, since a
+# function body is inferred for each specialization, for some of which a test may fail while
+# it passes for others. A function the worker outlines top-level code into has one, so its
+# tests count too. Its test sets are fail-fast where they would be at top level, so the code
+# after such a `@test` is not analyzed there, as at top level.
 Core.eval(LS.Analyzer, quote
     function report_failing_test!(analyzer::LSAnalyzer, sv::CC.InferenceState, argtypes::Vector{Any})
         def = sv.linfo.def
@@ -343,13 +343,25 @@ Core.eval(LS.Analyzer, quote
         length(argtypes) == 2 || return false
         value = CC.widenconditional(argtypes[2])
         if value isa Const && value.val === false
-            add_new_report!(analyzer, sv.result, FailingTestReport(sv, Bool))
+            add_new_report!(analyzer, sv.result, FailingTestReport(sv, Bool, nothing))
             return true
         end
         t = CC.widenconst(value)
         t === Union{} && return false
         CC.hasintersect(t, Bool) && return false
-        add_new_report!(analyzer, sv.result, FailingTestReport(sv, t))
+        add_new_report!(analyzer, sv.result, FailingTestReport(sv, t, nothing))
+        return true
+    end
+    function report_failing_test_exception!(analyzer::LSAnalyzer, sv::CC.InferenceState, argtypes::Vector{Any})
+        def = sv.linfo.def
+        def isa Module || (def isa Method && $is_outlined(def.name)) || return false
+        length(argtypes) ≥ 3 || return false
+        expected = JET.matching_test_exception_type(argtypes[3])
+        expected === nothing && return false
+        exct = CC.typesubtract(CC.widenconst(argtypes[2]), JET.NoTestException,
+            CC.InferenceParams(analyzer).max_union_splitting)
+        (exct === Union{} || CC.hasintersect(exct, expected)) && return false
+        add_new_report!(analyzer, sv.result, FailingTestReport(sv, exct, (argtypes[3]::Const).val))
         return true
     end
 end)

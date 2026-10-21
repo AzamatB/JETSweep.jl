@@ -308,8 +308,9 @@ end
 # Concretization
 # ==============
 #
-# Script analysis evaluates definitions, imports and includes but not assignments, so a
-# definition or `include` that needs an assigned value stops it
+# Script analysis evaluates definitions, imports, includes and the deprecations of bindings,
+# as `@deprecate_binding` declares them, but not assignments, so a definition or `include`
+# that needs an assigned value stops it
 # (`toplevel/missing-concretization`), and other code sees assigned values only as types.
 # JETSweep lets JETLS evaluate the top-level statements that cannot have side effects:
 # assignments of values built from literals, paths and pure functions of names already
@@ -662,8 +663,9 @@ const _LOGGING_MACROS = Set(["@debug", "@info", "@warn", "@error", "@logmsg"])
 
 """
 Whether code binds nothing where it stands: tests and logging, whose bodies and arguments are
-local scopes, loops, `let` and `try` blocks, and calls and control flow of these, of values
-such as `@__DIR__` and of expressions JET can analyze in a closure.
+local scopes, but for values such as the exception `@test_throws` expects; loops, `let` and
+`try` blocks; and calls and control flow of these, of values such as `@__DIR__` and of
+expressions JET can analyze in a closure.
 """
 _binds_nothing(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) ||
     (ex.head === :macrocall ? any(names -> _macro_name(ex) in names, (_TESTING_MACROS, _LOGGING_MACROS, _PURE_MACROS)) :

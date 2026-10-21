@@ -212,6 +212,10 @@ end
                 # The header is reported where it stands.
                 isdir(item) && foreach(x -> println(x), item)
             end
+            for n in 1:2
+                @test_throws ArgumentError parse(Int, n)
+                n > 1 && foreach(x -> println(x), 1:n)
+            end
             """)
         # A script runs as the program, so a check for that holds as it would.
         write(joinpath(root, "main_check.jl"), """
@@ -574,8 +578,11 @@ end
         @test status("loop.jl") === :findings
         inside = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "inside.jl"))
         @test issubset([2, 7, 10, 15], [f.line for f in inside.findings if f.code == "inference/method-error"])
-        # A test that always fails is reported in outlined code as at top level.
+        # A test that always fails is reported in outlined code as at top level, a `@test_throws`
+        # too, but not what its expression throws.
         @test any(f -> f.code == "inference/failing-test" && f.line == 12, inside.findings)
+        @test any(f -> f.code == "inference/failing-test" && f.line == 20, inside.findings)
+        @test !any(f -> f.code == "inference/method-error" && f.line == 20, inside.findings)
         @test status("Preluded/test/wrapped.jl") === :incomplete
         @test reasons("Preluded/test/wrapped.jl") == reasons("Preluded/test/runtests.jl")
         @test any(reason -> occursin("Preluded/test/runtests.jl:5 [toplevel/error]", reason),
