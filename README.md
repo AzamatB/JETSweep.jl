@@ -29,7 +29,10 @@ Pkg.Apps.add(url="https://github.com/AzamatB/JETSweep.jl")
 
 This installs the `jetsweep` command into `~/.julia/bin`; add that directory to `PATH`.
 From a checkout, instantiated once with `julia --project -e 'using Pkg; Pkg.instantiate()'`,
-`julia --project -m JETSweep DIRECTORY` runs the same command.
+`julia --project -m JETSweep DIRECTORY` runs the same command. After a pull that moves the
+JETLS pin, update the checkout with `Pkg.update()`: `Pkg.resolve()` keeps the packages JETLS
+vendors at the old release's revisions, and JETSweep refuses to run until they are the ones
+JETLS pins.
 
 ## Usage
 
