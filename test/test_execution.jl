@@ -417,6 +417,32 @@ end
     end
 end
 
+@testset "the analyzer's vendored packages must be the ones JETLS pins" begin
+    # After a pull moves the JETLS pin, `Pkg.resolve` can keep a vendored package at the old
+    # release's revision: a run fails before writing anything, saying how to update it.
+    mktempdir() do tool
+        cp(joinpath(EXECUTION_PACKAGE, "Project.toml"), joinpath(tool, "Project.toml"))
+        manifest = TOML.parsefile(joinpath(EXECUTION_PACKAGE, "Manifest.toml"))
+        only(manifest["deps"]["JETLSCore"])["repo-rev"] = repeat("0", 40)
+        open(io -> TOML.print(io, manifest), joinpath(tool, "Manifest.toml"), "w")
+        loaded = JETSweep._LOADED_PROJECT[]
+        JETSweep._LOADED_PROJECT[] = joinpath(tool, "Project.toml")
+        try
+            mktempdir() do directory
+                write(joinpath(directory, "script.jl"), "f() = 1\n")
+                code, _, err = execution_capture(() -> JETSweep.main([directory]))
+                @test code == 2
+                @test err == "jetsweep: JETSweep's project $tool has packages JETLS vendors at other " *
+                             "revisions than it pins (JETLSCore); run " *
+                             "`julia --project=$tool -e 'using Pkg; Pkg.update()'` first\n"
+                @test readdir(directory) == ["script.jl"]
+            end
+        finally
+            JETSweep._LOADED_PROJECT[] = loaded
+        end
+    end
+end
+
 @testset "Sweeps started in the same second get their own report directories" begin
     mktempdir() do directory
         root = realpath(directory)

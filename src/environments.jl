@@ -505,8 +505,26 @@ function _entry_source(entry::Pkg.Types.PackageEntry, manifest_file::String)
 end
 
 """
+The packages JETLS vendors that the manifest `tool` has at other revisions than JETLS pins.
+Analysis environments take them from `tool`, so they would analyze with parts of two releases.
+"""
+function _stale_vendored(tool::Pkg.Types.EnvCache)
+    jetls = tool.manifest[_JETLS]
+    project = Pkg.Types.projectfile_path(Pkg.Operations.source_path(tool.manifest_file, jetls)::String)
+    stale = String[]
+    for (name, source) in get(TOML.parsefile(something(project)), "sources", Dict{String,Any}())
+        uuid = get(jetls.deps, name, nothing)
+        (uuid === nothing || !haskey(source, "rev") || !haskey(tool.manifest, uuid)) && continue
+        repo = tool.manifest[uuid].repo
+        (repo.rev, repo.subdir) == (source["rev"], get(source, "subdir", nothing)) || push!(stale, name)
+    end
+    return sort!(stale)
+end
+
+"""
 Fail unless the project JETSweep was loaded from has the analyzer installed, which a
-checkout lacks until it is instantiated.
+checkout lacks until it is instantiated, with the packages JETLS vendors at the revisions it
+pins: when a pull moves JETSweep's JETLS pin, `Pkg.resolve` keeps them where they were.
 """
 function _require_tool()
     tool = Pkg.Types.EnvCache(tool_project())
@@ -522,10 +540,14 @@ function _require_tool()
         installed = path !== nothing && isdir(path) && Pkg.Operations.check_artifacts_downloaded(path)
         installed && append!(pending, values(entry.deps))
     end
-    installed && return nothing
     directory = Base.shell_escape(dirname(tool.project_file))
-    error("JETSweep's project $directory is not instantiated; run ",
-          "`julia --project=$directory -e 'using Pkg; Pkg.instantiate()'` first")
+    installed || error("JETSweep's project $directory is not instantiated; run ",
+                       "`julia --project=$directory -e 'using Pkg; Pkg.instantiate()'` first")
+    stale = _stale_vendored(tool)
+    isempty(stale) || error("JETSweep's project $directory has packages JETLS vendors at other ",
+                            "revisions than it pins ($(join(stale, ", "))); run ",
+                            "`julia --project=$directory -e 'using Pkg; Pkg.update()'` first")
+    return nothing
 end
 
 """
