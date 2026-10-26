@@ -53,10 +53,10 @@ end
 Run `code` in a fresh Julia process whose only environments are the prepared one and the stdlib. Like the
 workers, it uses default code generation flags and existing package images, so it writes no caches.
 """
-function _environments_run(environment, code)
+function _environments_run(environment, code; env=Dict{String,String}())
     julia = joinpath(Sys.BINDIR, Base.julia_exename())
     command = `$julia --startup-file=no --compiled-modules=existing --project=$(environment.dir) -e $code`
-    return readchomp(addenv(command, "JULIA_LOAD_PATH" => "@:@stdlib"))
+    return readchomp(addenv(command, "JULIA_LOAD_PATH" => "@:@stdlib", env...))
 end
 
 function _environments_commit(repository::LibGit2.GitRepo, message)
@@ -523,13 +523,12 @@ end
             """)
         chmod(joinpath(bin, "git"), 0o755)
         # Each depot is empty but for the clones it gets; the user's depots provide the registries and analyzer.
-        depots(depot) = join([depot; DEPOT_PATH], ':')
-        prepared(sharer, name) = JETSweep._prepare(_environments_context(sharer), joinpath(envs, name), SweepOptions())
+        # The workers get these variables; this process's environment stays as it is for the other tests.
+        depots(depot) = Dict("JULIA_DEPOT_PATH" => join([depot; DEPOT_PATH], ':'))
+        prepared(sharer, name, env) = JETSweep._prepare(_environments_context(sharer), joinpath(envs, name), SweepOptions(); env)
         depot = mkpath(joinpath(root, "depot"))
-        environments = withenv("JULIA_DEPOT_PATH" => depots(depot), "JULIA_PKG_USE_CLI_GIT" => "true",
-                               "PATH" => bin * ':' * ENV["PATH"]) do
-            asyncmap(i -> prepared(sharers[i], "sharer$i"), eachindex(sharers))
-        end
+        cloning = merge(depots(depot), Dict("JULIA_PKG_USE_CLI_GIT" => "true", "PATH" => bin * ':' * ENV["PATH"]))
+        environments = asyncmap(i -> prepared(sharers[i], "sharer$i", cloning), eachindex(sharers))
         @test [environment.status for environment in environments] == [:ready, :ready, :ready]
         @test all(environment -> isempty(environment.message), environments)
         clone = joinpath(depot, "clones", string(hash(url)))
@@ -542,11 +541,10 @@ end
         run(`$git init --quiet --bare $broken`)
         write(joinpath(broken, "HEAD"), "ref: refs/heads/.invalid\n")
         @test !JETSweep._valid_clone(broken)
-        environment = withenv(() -> prepared(sharers[1], "repaired"), "JULIA_DEPOT_PATH" => depots(depot))
+        environment = prepared(sharers[1], "repaired", depots(depot))
         @test environment == _environments_ready(joinpath(envs, "repaired", "env"))
         @test JETSweep._valid_clone(broken)
-        @test withenv(() -> _environments_run(environment, "using Sharer1, SharedTool; print(SharedTool.value())"),
-                      "JULIA_DEPOT_PATH" => depots(depot)) == "42"
+        @test _environments_run(environment, "using Sharer1, SharedTool; print(SharedTool.value())"; env=depots(depot)) == "42"
     end
 end
 

@@ -70,7 +70,12 @@ _context_key(context::Context) = bytes2hex(sha256(string(context.project, '\0', 
 
 _environment_directory(output::String, context::Context) = joinpath(output, "environments", _context_key(context))
 
-function _prepare(context::Context, directory::String, options::SweepOptions)
+"""
+Prepare the environment of `context` in a worker, in `directory`, which is also the worker's
+working directory; `env` adds to the worker's environment variables.
+"""
+function _prepare(context::Context, directory::String, options::SweepOptions;
+                  env::Dict{String,String}=Dict{String,String}())
     request = _write_toml(joinpath(directory, "request.toml"), Dict(
         "project" => context.project, "owner" => context.owner, "test" => context.test,
         "triggers" => context.triggers, "imports" => context.imports, "directory" => joinpath(directory, "env"),
@@ -78,8 +83,8 @@ function _prepare(context::Context, directory::String, options::SweepOptions)
     result = joinpath(directory, "result.toml")
     log = joinpath(directory, "log.txt")
     command = julia_command(joinpath(_SCRIPTS, "prepare.jl"), [request, result];
-        project=dirname(tool_project()), threads=1, env=Dict("JULIA_NUM_PRECOMPILE_TASKS" => "2"))
-    process = run_worker(command, log, options.timeout)
+        project=dirname(tool_project()), threads=1, env=merge(Dict("JULIA_NUM_PRECOMPILE_TASKS" => "2"), env))
+    process = run_worker(Cmd(command; dir=directory), log, options.timeout)
     isfile(result) || return Environment(:failed, joinpath(directory, "env"), process.timed_out ?
         "environment preparation timed out; see $log" :
         "environment preparation exited with code $(process.code); see $log")
