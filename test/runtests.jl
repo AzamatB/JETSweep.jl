@@ -12,15 +12,22 @@
 using JETSweep, ReTestItems
 
 const NWORKERS = 3   # measured at 2, 3, 4 and 6: see the report
-# Under coverage, each worker writes its tracefile after every item (`<template>-items.info`): ReTestItems kills a
-# worker right after its last item, often before its exit-time write. A no-op without coverage.
+# ReTestItems kills a worker a moment after its last item, which can cut off the coverage file it writes at exit: under
+# coverage every worker also writes its tracefile after each item, as <file>-items.info (a no-op without coverage).
 const WRITE_COVERAGE = :(let out = Base.JLOptions().output_code_coverage
-    out == C_NULL || ccall(:jl_write_coverage_data, Cvoid, (Cstring,),
-                           replace(unsafe_string(out), r"\.info$" => "-items.info"))
+    out == C_NULL || ccall(:jl_write_coverage_data, Cvoid, (Cstring,), replace(unsafe_string(out), r"\.info$" => "-items.info"))
 end)
-const FILES = filter(endswith("_tests.jl"), readdir(@__DIR__))
-const SELECTED = isempty(ARGS) ? FILES : ARGS
-all(in(FILES), SELECTED) || error("unknown test files: $(join(setdiff(SELECTED, FILES), ", "))")
+# After each item, every worker proves that it runs as the main process does: with its flags (deprecations are errors;
+# `julia --depwarn=error -e 'using Pkg; Pkg.test()'` hands the flag to the test process, its precompile workers and its
+# test workers, and a cache built without it would hide them), and with JETSweep as the main process has it: unchecked,
+# without the hidden submodule `#DispatchCheckup` that a checked run's overlay would give it.
+const WORKER_CHECKS = :(let checked = Main.MAIN_DISPATCH_CHECKUP == "checked"
+    @test Base.JLOptions().depwarn == 2
+    @test Base.JLOptions().check_bounds == Main.MAIN_CHECK_BOUNDS
+    @test get(ENV, "DISPATCH_CHECKUP", "") == Main.MAIN_DISPATCH_CHECKUP
+    @test isdefined(JETSweep, Symbol("#DispatchCheckup")) == checked
+end)
+const SELECTED = isempty(ARGS) ? filter(endswith("_tests.jl"), readdir(@__DIR__)) : ARGS
 
 # Workers load the analyzer compiled with Julia's default code generation flags and JETLS's development mode, as
 # prepared environments have it. Precompile one such environment while the first items run: the sweeps would
@@ -44,13 +51,15 @@ else
     touch(ANALYZER_READY)
 end
 
-paths = isempty(ARGS) ? [@__DIR__] : [joinpath(@__DIR__, file) for file in ARGS]
+paths = isempty(ARGS) ? [@__DIR__] : [joinpath(@__DIR__, f) for f in ARGS]
 # (No full garbage collection after each item: these workers' heaps are large, and measured side by side, the runs
 # without it were faster.) The item timeout, 1200 s, is above the sweeps' own 900 s limit per unit, so a unit that
 # hangs is reported by its sweep, and leaves the sweeps' item (about 300 s on 8 vCPUs) room on CI's 4 vCPUs.
 ReTestItems.runtests(paths...; nworkers=NWORKERS, nworker_threads=1, retries=0, testitem_timeout=1200,
-                     gc_between_testitems=false, test_end_expr=Expr(:block, WRITE_COVERAGE),
+                     validate_paths=true, gc_between_testitems=false,
+                     test_end_expr=Expr(:block, WRITE_COVERAGE, WORKER_CHECKS),
                      worker_init_expr=:(const MAIN_CHECK_BOUNDS = $(Base.JLOptions().check_bounds);
                                         const MAIN_DEPWARN = $(Base.JLOptions().depwarn);
                                         const MAIN_PATHOF = $(pathof(JETSweep));
+                                        const MAIN_DISPATCH_CHECKUP = $(get(ENV, "DISPATCH_CHECKUP", ""));
                                         const ANALYZER_READY = $ANALYZER_READY))
