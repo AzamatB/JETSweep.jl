@@ -27,8 +27,8 @@
                     (:package, "Witness/src/Witness.jl"), (:extension, "Witness/ext/WitnessTestExt.jl"),
                     (:orphan, "Witness/src/disconnected.jl"), (:orphan, "Witness/src/inactive.jl"),
                     (:orphan, "Witness/ext/dormant.jl"),
-                    (:test, "Witness/test/runtests.jl"), (:test, "Witness/test/test_dynamic.jl"),
-                    (:test, "Witness/test/test_independent.jl"), (:script, "scripts/main.jl"),
+                    (:test, "Witness/test/runtests.jl"), (:test, "Witness/test/dynamic.jl"),
+                    (:test, "Witness/test/independent.jl"), (:script, "scripts/main.jl"),
                     (:script, "scripts/clean.jl"), (:script, "tools/report.jl")])
                 @test all(r -> r.status in (:clean, :findings), result.results)
                 @test integration_status(result, file("Witness/test/runtests.jl")) === :clean
@@ -48,7 +48,7 @@
                     ("Witness/ext/helper.jl", 1, "inference/method-error"),
                     # Analyzed in the extension's module, where `extension_failure` is defined.
                     ("Witness/ext/dormant.jl", 1, "inference/method-error"),
-                    ("Witness/test/test_dynamic.jl", 1, "inference/method-error"),
+                    ("Witness/test/dynamic.jl", 1, "inference/method-error"),
                     ("scripts/main.jl", 3, "inference/method-error"),
                     ("scripts/main.jl", 9, "inference/field-error"),
                     ("scripts/main.jl", 11, "inference/undef-global-var"),

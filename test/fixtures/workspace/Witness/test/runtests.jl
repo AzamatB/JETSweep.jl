@@ -6,7 +6,7 @@ helper_number() = 2
 include("helpers.jl")
 
 # Run-time selection, as `Pkg.test(test_args=[...])` uses it: analysis cannot evaluate it.
-const TEST_FILES = ["test_dynamic.jl", "test_independent.jl"]
+const TEST_FILES = ["dynamic.jl", "independent.jl"]
 const SELECTED = isempty(ARGS) ? TEST_FILES : ARGS
 
 @testset "Witness" begin

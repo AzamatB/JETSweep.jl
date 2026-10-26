@@ -309,10 +309,10 @@ Loading JETSweep does not load JETLS; only analysis workers do.
 
 ```sh
 julia --project --depwarn=error -e 'using Pkg; Pkg.test()'
-julia --project --depwarn=error -e 'using Pkg; Pkg.test(test_args=["planning_tests.jl"])'
+julia --project --depwarn=error -e 'using Pkg; Pkg.test(test_args=["units_test.jl"])'
 ```
 
-The test items of `test/*_tests.jl` run on [ReTestItems](https://github.com/JuliaTesting/ReTestItems.jl)
+The test items of `test/*_test.jl` run on [ReTestItems](https://github.com/JuliaTesting/ReTestItems.jl)
 worker processes; `test_args` names the files whose items run.
 
 To move to another JETLS release, set its commit and version in `Project.toml`. Then raise

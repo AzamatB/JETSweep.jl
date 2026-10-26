@@ -1,9 +1,9 @@
-# JETSweep's suite: the test items of test/*_tests.jl, run by ReTestItems on NWORKERS worker processes.
-# `Pkg.test(test_args=["planning_tests.jl"])` runs the items of the files it names. JETSweep does not check its
+# JETSweep's suite: the test items of test/*_test.jl, run by ReTestItems on NWORKERS worker processes.
+# `Pkg.test(test_args=["units_test.jl"])` runs the items of the files it names. JETSweep does not check its
 # suite with DispatchCheckup, so there is no checked run here and no original= file.
 #
 # Most of the time goes to the analysis and preparation workers that the sweeps and preparations start
-# themselves, most in the sweeps' item, the first item of 0_integration_tests.jl: its four sweeps ask for 14 at
+# themselves, most in the sweeps' item, the first item of 0_integration_test.jl: its four sweeps ask for 14 at
 # once and share the slots JETSweep allows a process, one per CPU thread and per 3 GiB of free memory
 # (`JETSweep.worker_cap`: 8 on an 8-vCPU slot here, 3 on the CI runner's 4 vCPUs and 16 GB). ReTestItems starts
 # its first worker on the first item of the files by name, so the sweeps start at once; the other workers take
@@ -27,7 +27,7 @@ const WORKER_CHECKS = :(let checked = Main.MAIN_DISPATCH_CHECKUP == "checked"
     @test get(ENV, "DISPATCH_CHECKUP", "") == Main.MAIN_DISPATCH_CHECKUP
     @test isdefined(JETSweep, Symbol("#DispatchCheckup")) == checked
 end)
-const SELECTED = isempty(ARGS) ? filter(endswith("_tests.jl"), readdir(@__DIR__)) : ARGS
+const SELECTED = isempty(ARGS) ? filter(endswith("_test.jl"), readdir(@__DIR__)) : ARGS
 
 # Workers load the analyzer compiled with Julia's default code generation flags and JETLS's development mode, as
 # prepared environments have it. Precompile one such environment while the first items run: the sweeps would
@@ -36,7 +36,7 @@ const SELECTED = isempty(ARGS) ? filter(endswith("_tests.jl"), readdir(@__DIR__)
 # makes the file ANALYZER_READY. A failed precompile costs only time: the sweeps then compile the analyzer
 # themselves.
 const ANALYZER_READY = joinpath(mktempdir(), "analyzer-ready")
-if any(in(SELECTED), ("0_integration_tests.jl", "environments_tests.jl"))
+if any(in(SELECTED), ("0_integration_test.jl", "preparation_test.jl"))
     let environment = JETSweep.prepare(JETSweep.Context("", "", false, Dict{String,String}()), mktempdir())
         JETSweep.ready(environment) || error("cannot prepare an analysis environment: ", environment.message)
         julia = joinpath(Sys.BINDIR, Base.julia_exename())

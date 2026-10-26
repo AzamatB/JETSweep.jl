@@ -782,14 +782,14 @@ end
         DT.now()
 
         # Files a run takes, all by default or those named in ARGS or SOMEPKG_TESTS.
-        const TEST_FILES = ["runtests.jl", "test_alpha.jl", "test_beta.jl"]
+        const TEST_FILES = ["runtests.jl", "alpha_test.jl", "beta_test.jl"]
         const TEST_ASKED = isempty(ARGS) ? split(get(ENV, "SOMEPKG_TESTS", ""), r"[,\s]+"; keepempty=false) : ARGS
         for f in TEST_ASKED
             f in TEST_FILES || error("no test file $(repr(f)); the files are ", join(TEST_FILES, ", "))
         end
         const TEST_RUN = isempty(TEST_ASKED) ? TEST_FILES : filter(in(TEST_ASKED), TEST_FILES)
 
-        const ORIGINAL_GUARD_FILES = ("test_guards.jl",)
+        const ORIGINAL_GUARD_FILES = ("guards.jl",)
         function _include_suite_test(file)
             file in ORIGINAL_GUARD_FILES && return nothing
             include(joinpath(@__DIR__, file))
@@ -813,8 +813,8 @@ end
             @test days_between(DT.Date(2026, 1, 1), DT.Date(2026, 1, 2)) == 1
         end
         """
-    files = ("test/runtests.jl" => driver, "test/test_alpha.jl" => target)
-    syntax_prelude(files...; target="test/test_alpha.jl") do text, _
+    files = ("test/runtests.jl" => driver, "test/alpha_test.jl" => target)
+    syntax_prelude(files...; target="test/alpha_test.jl") do text, _
         names = syntax_names(text)
         @test syntax_parses(text)
         @test syntax_imports(text) == syntax_imports(driver)
@@ -1236,14 +1236,14 @@ end
 
 @testitem "concretization_patterns evaluates the conditions of early exits that control includes" setup=[Syntax] begin
     selection = """
-        const FILES = ["test_a.jl", "test_guards.jl"]
+        const FILES = ["a_test.jl", "guards.jl"]
         const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)
-        const ORIGINAL = filter(==("test_guards.jl"), RUN)
-        const OTHER = filter(!=("test_guards.jl"), RUN)
+        const ORIGINAL = filter(==("guards.jl"), RUN)
+        const OTHER = filter(!=("guards.jl"), RUN)
         """
     run, original, other = ["const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)",
-                            "const ORIGINAL = filter(==(\"test_guards.jl\"), RUN)",
-                            "const OTHER = filter(!=(\"test_guards.jl\"), RUN)"]
+                            "const ORIGINAL = filter(==(\"guards.jl\"), RUN)",
+                            "const OTHER = filter(!=(\"guards.jl\"), RUN)"]
     patterns(loop) = syntax_patterns(selection * loop)[2:end]
     # A test driver skips what another phase runs, as DispatchCheckup's `original=` files.
     @test patterns("""
