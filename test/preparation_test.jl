@@ -1,3 +1,5 @@
+# Preparation of analysis environments: merged projects, sources, preferences, compat bounds and Git clones.
+@testsetup module Environments
 using JETSweep, LibGit2, Pkg, TOML, Test, UUIDs
 
 function _environments_write(file, data)
@@ -31,8 +33,11 @@ _environments_prepare(context, directory; instantiate=false) =
 _environments_ready(directory) = JETSweep.Environment(:ready, directory, "")
 
 _environments_project(environment) = TOML.parsefile(joinpath(environment.dir, "Project.toml"))
+
 _environments_preferences(environment) = TOML.parsefile(joinpath(environment.dir, "LocalPreferences.toml"))
+
 _environments_manifest(environment) = Pkg.Types.read_manifest(joinpath(environment.dir, "Manifest.toml"))
+
 _environments_path(environment, uuid) =
     abspath(environment.dir, something(_environments_manifest(environment)[UUID(uuid)].path))
 
@@ -53,10 +58,10 @@ end
 Run `code` in a fresh Julia process whose only environments are the prepared one and the stdlib. Like the
 workers, it uses default code generation flags and existing package images, so it writes no caches.
 """
-function _environments_run(environment, code)
+function _environments_run(environment, code; env=Dict{String,String}())
     julia = joinpath(Sys.BINDIR, Base.julia_exename())
     command = `$julia --startup-file=no --compiled-modules=existing --project=$(environment.dir) -e $code`
-    return readchomp(addenv(command, "JULIA_LOAD_PATH" => "@:@stdlib"))
+    return readchomp(addenv(command, "JULIA_LOAD_PATH" => "@:@stdlib", env...))
 end
 
 function _environments_commit(repository::LibGit2.GitRepo, message)
@@ -77,7 +82,13 @@ _environments_entry(name, uuid; version=v"1.0.0", fields...) =
 
 _environments_test_uuid() = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
-@testset "package context: merged scratch environment with the analyzer" begin
+export LibGit2, Pkg, TOML, UUIDs, _environments_write, _environments_package, _environments_sandbox,
+    _environments_context, _environments_prepare, _environments_ready, _environments_project, _environments_preferences,
+    _environments_manifest, _environments_path, _environments_tool, _environments_snapshot, _environments_run,
+    _environments_commit, _environments_seed, _environments_entry, _environments_test_uuid, uuid4, UUID
+end
+
+@testitem "package context: merged scratch environment with the analyzer" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         helper, helper_uuid = _environments_package(root, "PlainHelper")
         parent, parent_uuid = _environments_package(root, "PlainParent"; deps=Dict("PlainHelper" => helper_uuid),
@@ -121,7 +132,7 @@ _environments_test_uuid() = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
     end
 end
 
-@testset "only an empty or new directory is prepared" begin
+@testitem "only an empty or new directory is prepared" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         parent, _ = _environments_package(root, "RefusedParent")
         context = _environments_context(parent)
@@ -141,7 +152,7 @@ end
     end
 end
 
-@testset "test context merges the test target and test/Project.toml" begin
+@testitem "test context merges the test target and test/Project.toml" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         _, extra_uuid = _environments_package(root, "TargetHelper")
         _, dedicated_uuid = _environments_package(root, "DedicatedHelper")
@@ -174,7 +185,7 @@ end
     end
 end
 
-@testset "test projects named either way, inside or outside the package's workspace" begin
+@testitem "test projects named either way, inside or outside the package's workspace" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         _, helper_uuid = _environments_package(root, "TestOnlyHelper")
         layouts = (("ConventionTested", "Project.toml", (;)), ("JuliaProjectTested", "JuliaProject.toml", (;)),
@@ -200,7 +211,7 @@ end
     end
 end
 
-@testset "extension triggers become dependencies" begin
+@testitem "extension triggers become dependencies" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         first, first_uuid = _environments_package(root, "FirstTrigger")
         _, second_uuid = _environments_package(root, "SecondTrigger")
@@ -236,7 +247,7 @@ end
     end
 end
 
-@testset "script contexts use the nearest environment only" begin
+@testitem "script contexts use the nearest environment only" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         _, owned_uuid = _environments_package(root, "OwnedHelper")
         _, script_uuid = _environments_package(root, "ScriptHelper")
@@ -265,7 +276,7 @@ end
     end
 end
 
-@testset "a target's Revise must be of the analyzer's series" begin
+@testitem "a target's Revise must be of the analyzer's series" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         revise = string(_environments_tool("Revise").uuid)
         scripts = joinpath(root, "scripts")
@@ -276,7 +287,7 @@ end
     end
 end
 
-@testset "missing dependencies fail when downloads are disabled" begin
+@testitem "missing dependencies fail when downloads are disabled" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         absent = string(uuid4())
         _environments_package(root, "UnregisteredSibling"; uuid=absent)   # present, but nothing locates it
@@ -311,7 +322,7 @@ end
     end
 end
 
-@testset "invalid contexts fail with their cause" begin
+@testitem "invalid contexts fail with their cause" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         failure(context, name) = _environments_prepare(context, joinpath(envs, name))
         helper_uuid = string(uuid4())
@@ -356,7 +367,7 @@ end
     end
 end
 
-@testset "workspaces and the active versioned manifest seed resolution" begin
+@testitem "workspaces and the active versioned manifest seed resolution" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         member, member_uuid = _environments_package(root, "WorkspaceMember")
         seeded, seeded_uuid = _environments_package(joinpath(root, "vendor"), "SeededHelper")
@@ -395,7 +406,7 @@ end
     end
 end
 
-@testset "stale path-dependency metadata is refreshed" begin
+@testitem "stale path-dependency metadata is refreshed" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         helper, helper_uuid = _environments_package(root, "FreshHelper")
         parent, parent_uuid = _environments_package(root, "StaleParent"; deps=Dict("FreshHelper" => helper_uuid),
@@ -414,7 +425,7 @@ end
     end
 end
 
-@testset "a path dependency's dependencies come from its project, not from a dependent's manifest" begin
+@testitem "a path dependency's dependencies come from its project, not from a dependent's manifest" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         printf, random = "de0858da-6303-5e67-8744-51eddeeeb8d7", "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
         unicode = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
@@ -438,7 +449,7 @@ end
     end
 end
 
-@testset "an environment's inputs are known before it is prepared, wherever they are" begin
+@testitem "an environment's inputs are known before it is prepared, wherever they are" setup=[Environments, Analyzer] begin
     mktempdir() do root
         printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
         # A sweep of one repository excludes its siblings; their files are inputs all the same.
@@ -461,7 +472,7 @@ end
     end
 end
 
-@testset "explicit sources override stale manifest locations" begin
+@testitem "explicit sources override stale manifest locations" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         helper, helper_uuid = _environments_package(root, "ChosenHelper")
         parent, _ = _environments_package(root, "SourceParent"; deps=Dict("ChosenHelper" => helper_uuid),
@@ -478,7 +489,7 @@ end
     end
 end
 
-@testset "URL sources replace stale checkouts and keep exact commits" begin
+@testitem "URL sources replace stale checkouts and keep exact commits" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         repository = joinpath(root, "UrlRepository")
         _, trigger_uuid = _environments_package(repository, "UrlTrigger")
@@ -503,7 +514,7 @@ end
     end
 end
 
-@testset "preparations side by side clone a shared Git source once, and make a broken clone again" begin
+@testitem "preparations side by side clone a shared Git source once, and make a broken clone again" setup=[Environments, Analyzer] begin
     git = Sys.which("git")::String
     _environments_sandbox() do root, envs
         repository = joinpath(root, "SharedRepository")
@@ -523,13 +534,12 @@ end
             """)
         chmod(joinpath(bin, "git"), 0o755)
         # Each depot is empty but for the clones it gets; the user's depots provide the registries and analyzer.
-        depots(depot) = join([depot; DEPOT_PATH], ':')
-        prepared(sharer, name) = JETSweep._prepare(_environments_context(sharer), joinpath(envs, name), SweepOptions())
+        # The workers get these variables; this process's environment stays as it is for the other tests.
+        depots(depot) = Dict("JULIA_DEPOT_PATH" => join([depot; DEPOT_PATH], ':'))
+        prepared(sharer, name, env) = JETSweep._prepare(_environments_context(sharer), joinpath(envs, name), SweepOptions(); env)
         depot = mkpath(joinpath(root, "depot"))
-        environments = withenv("JULIA_DEPOT_PATH" => depots(depot), "JULIA_PKG_USE_CLI_GIT" => "true",
-                               "PATH" => bin * ':' * ENV["PATH"]) do
-            asyncmap(i -> prepared(sharers[i], "sharer$i"), eachindex(sharers))
-        end
+        cloning = merge(depots(depot), Dict("JULIA_PKG_USE_CLI_GIT" => "true", "PATH" => bin * ':' * ENV["PATH"]))
+        environments = asyncmap(i -> prepared(sharers[i], "sharer$i", cloning), eachindex(sharers))
         @test [environment.status for environment in environments] == [:ready, :ready, :ready]
         @test all(environment -> isempty(environment.message), environments)
         clone = joinpath(depot, "clones", string(hash(url)))
@@ -542,15 +552,14 @@ end
         run(`$git init --quiet --bare $broken`)
         write(joinpath(broken, "HEAD"), "ref: refs/heads/.invalid\n")
         @test !JETSweep._valid_clone(broken)
-        environment = withenv(() -> prepared(sharers[1], "repaired"), "JULIA_DEPOT_PATH" => depots(depot))
+        environment = prepared(sharers[1], "repaired", depots(depot))
         @test environment == _environments_ready(joinpath(envs, "repaired", "env"))
         @test JETSweep._valid_clone(broken)
-        @test withenv(() -> _environments_run(environment, "using Sharer1, SharedTool; print(SharedTool.value())"),
-                      "JULIA_DEPOT_PATH" => depots(depot)) == "42"
+        @test _environments_run(environment, "using Sharer1, SharedTool; print(SharedTool.value())"; env=depots(depot)) == "42"
     end
 end
 
-@testset "a clone is broken if a clone stopped before it ended, not if its HEAD names a missing branch" begin
+@testitem "a clone is broken if a clone stopped before it ended, not if its HEAD names a missing branch" setup=[Environments, Analyzer] begin
     git = Sys.which("git")::String
     mktempdir() do root
         clone(name) = joinpath(root, name)
@@ -573,7 +582,7 @@ end
     end
 end
 
-@testset "a clone stays locked while its holder blocks, until it dies, and then serves its waiters in turn" begin
+@testitem "a clone stays locked while its holder blocks, until it dies, and then serves its waiters in turn" setup=[Environments, Analyzer] begin
     git = Sys.which("git")::String
     mktempdir() do root
         repository, uuid = _environments_package(root, "LockedTool")
@@ -635,7 +644,7 @@ end
     end
 end
 
-@testset "standard library dependencies resolve offline" begin
+@testitem "standard library dependencies resolve offline" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         dates, printf = "ade2ca70-3891-5945-98fb-dc099432e06a", "de0858da-6303-5e67-8744-51eddeeeb8d7"
         parent, _ = _environments_package(root, "StdlibParent"; deps=Dict("Dates" => dates),
@@ -649,7 +658,7 @@ end
     end
 end
 
-@testset "preference precedence and __clear__" begin
+@testitem "preference precedence and __clear__" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         exported = Dict("backend" => "exported", "clear_me" => true, "exported_only" => 1)
         parent, parent_uuid = _environments_package(root, "PreferenceParent";
@@ -680,7 +689,7 @@ end
     end
 end
 
-@testset "preferences bind transitive packages through [extras]" begin
+@testitem "preferences bind transitive packages through [extras]" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         dependency, dependency_uuid = _environments_package(root, "PreferenceDependency")
         _, helper_uuid = _environments_package(root, "PreferenceHelper";
@@ -707,7 +716,7 @@ end
     end
 end
 
-@testset "compat bounds of combined projects intersect" begin
+@testitem "compat bounds of combined projects intersect" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         function merged(name, package_bound, test_bound; version=v"1.0.0")
             # The context resolves, so its helper has a version inside the bounds.
@@ -742,7 +751,7 @@ end
     end
 end
 
-@testset "compat and sources on names JETLS vendors privately stay with the target" begin
+@testitem "compat and sources on names JETLS vendors privately stay with the target" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         preferences_uuid = "21216c6a-2e73-6563-6e65-726566657250"   # registered; JETLS vendors its own
         locked = Pkg.Types.EnvCache(JETSweep.tool_project()).manifest[UUID(preferences_uuid)].version
@@ -784,7 +793,7 @@ end
     end
 end
 
-@testset "preparation never runs dependency build scripts, including the re-resolve fallback" begin
+@testitem "preparation never runs dependency build scripts, including the re-resolve fallback" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         dependency_uuid = string(uuid4())
         dependency, _ = _environments_package(root, "BuildGuardDependency"; uuid=dependency_uuid,
@@ -849,7 +858,7 @@ end
     end
 end
 
-@testset "undeclared imports are added, or left out when they cannot be" begin
+@testitem "undeclared imports are added, or left out when they cannot be" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         sibling, sibling_uuid = _environments_package(root, "Sibling"; body="value() = 7")
         scripts = joinpath(root, "scripts")

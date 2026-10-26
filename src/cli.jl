@@ -4,7 +4,8 @@ const HELP = """
     Usage: jetsweep [OPTIONS] DIRECTORY
 
     Options:
-      --jobs N            Analyses run in parallel (default: CPU threads, capped by memory)
+      --jobs N            Analyses run in parallel (default: CPU threads), at most one per CPU
+                          thread and per 3 GiB of free memory
       --threads N         Threads for package and extension analyses (default: 4)
       --timeout SECONDS   Time limit for each analysis or environment; 0 disables (default: 1800)
       --gpus auto|none|LIST

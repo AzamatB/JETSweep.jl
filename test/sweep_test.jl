@@ -1,13 +1,21 @@
+# Execution: scheduling, worker processes, exit codes, the command line, JETLS settings and reports.
+@testsetup module Execution
 using JETSweep, TOML, Test
 
 execution_context(name) = JETSweep.Context("/execution/$name", "", false, Dict{String,String}())
+
 execution_task(name, weight=1, priority=(0, 0)) = JETSweep._Task(weight, priority, execution_context(name))
+
+"No cap on the slots of the process (`JETSweep.worker_cap`): the dispatch tests check a dispatch's own capacity."
+execution_uncapped() = typemax(Int)
+
 execution_name(task) = basename((task.work::JETSweep.Context).project)
 
 "Dispatch `tasks`, recording start and end events and the peak clamped weight in use."
-function execution_trace(tasks, capacity; followups=Dict{String,Vector{JETSweep._Task}}(), pause=0.02)
+function execution_trace(tasks, capacity; followups=Dict{String,Vector{JETSweep._Task}}(), pause=0.02,
+                         cap=execution_uncapped)
     load, peak, events = Ref(0), Ref(0), String[]
-    dispatcher = @async JETSweep._dispatch(tasks, capacity) do task
+    dispatcher = @async JETSweep._dispatch(tasks, capacity; cap) do task
         name, weight = execution_name(task), min(task.weight, capacity)
         load[] += weight
         peak[] = max(peak[], load[])
@@ -21,73 +29,6 @@ function execution_trace(tasks, capacity; followups=Dict{String,Vector{JETSweep.
     timedwait(() -> istaskdone(dispatcher), 60.0; pollint=0.01) === :ok || error("dispatch did not finish")
     wait(dispatcher)
     return (; peak=peak[], events, starts=[event[7:end] for event in events if startswith(event, "start ")])
-end
-
-@testset "Dispatch runs every task once, in priority order, within capacity" begin
-    trace = execution_trace(JETSweep._Task[], 3)
-    @test isempty(trace.events)
-    weights = [3, 1, 2, 2, 1, 4, 1, 1, 2, 3, 1, 2]
-    priorities = [(i % 3, (7i) % 11) for i in eachindex(weights)]
-    tasks = [execution_task("t$i", weights[i], priorities[i]) for i in eachindex(weights)]
-    for capacity in (1, 3, 4)
-        trace = execution_trace(tasks, capacity)
-        @test sort(trace.starts) == sort(["t$i" for i in eachindex(weights)])
-        @test allunique(trace.starts)
-        @test trace.starts == ["t$i" for i in sortperm(priorities)]
-        @test trace.peak <= capacity
-    end
-    @test execution_trace([execution_task("u$i") for i in 1:8], 4).peak == 4
-end
-
-@testset "A task that does not fit blocks later tasks" begin
-    tasks = [execution_task("C", 1, (0, 2)), execution_task("A", 2, (0, 0)), execution_task("B", 2, (0, 1))]
-    trace = execution_trace(tasks, 3)
-    @test trace.starts == ["A", "B", "C"]
-    @test findfirst(==("start C"), trace.events) > findfirst(==("end A"), trace.events)
-    @test trace.peak == 3
-end
-
-@testset "Weight above capacity is clamped and runs alone" begin
-    trace = execution_trace([execution_task("L", 1, (0, 1)), execution_task("H", 10, (0, 0))], 2)
-    @test trace.events == ["start H", "end H", "start L", "end L"]
-    @test trace.peak == 2
-    @test execution_trace([execution_task("H", 100)], 1).events == ["start H", "end H"]
-end
-
-@testset "Follow-up tasks are scheduled by priority" begin
-    tasks = [execution_task("A", 1, (0, 0)), execution_task("B", 1, (2, 0)), execution_task("C", 1, (0, 1))]
-    followups = Dict("A" => [execution_task("F", 1, (1, 0)), execution_task("E", 1, (0, -5))],
-                     "F" => [execution_task("G", 1, (3, 0))])
-    @test execution_trace(tasks, 1; followups).starts == ["A", "E", "C", "F", "B", "G"]
-    trace = execution_trace(tasks, 2; followups)
-    @test sort(trace.starts) == ["A", "B", "C", "E", "F", "G"]
-    @test trace.peak <= 2
-end
-
-@testset "A failing step stops new tasks and propagates once running tasks finish" begin
-    events, failed = String[], Base.Event()
-    tasks = [execution_task("slow", 1, (0, 0)), execution_task("bad", 1, (0, 1)),
-             (execution_task("rest$i", 1, (1, i)) for i in 1:3)...]
-    failure = try
-        JETSweep._dispatch(tasks, 2) do task
-            name = execution_name(task)
-            push!(events, "start $name")
-            name == "bad" && (notify(failed); error("step failed"))
-            if name == "slow"
-                wait(failed)
-                sleep(0.2)
-                push!(events, "end slow")
-                return [execution_task("followup", 1, (0, 0))]
-            end
-            return JETSweep._Task[]
-        end
-        nothing
-    catch err
-        err
-    end
-    @test failure isa CapturedException
-    @test failure.ex == ErrorException("step failed")
-    @test events == ["start slow", "start bad", "end slow"]
 end
 
 function execution_alive(pid::Integer)
@@ -111,12 +52,257 @@ function execution_gone(pid::Integer)
     return gone
 end
 
-@testset "An interrupt stops every running worker at once" begin
+execution_finding(severity; file="/root/a.jl", line=1, code="code", message="message") =
+    JETSweep.Finding(file, line, 1, line, 5, severity, code, message)
+
+execution_result(status, findings=JETSweep.Finding[]) =
+    JETSweep.UnitResult("unit", status, findings, String[], String[], String[], 0.0, "")
+
+execution_inventory(issues=String[]) =
+    JETSweep.Inventory("/root", JETSweep.Project[], JETSweep.Source[], [JETSweep.Project[], JETSweep.Project[]], String[], issues)
+
+"Call `f` with standard output and error redirected; return its value and both outputs."
+function execution_capture(f)
+    mktempdir() do directory
+        out, err = joinpath(directory, "out"), joinpath(directory, "err")
+        value = open(out, "w") do outio
+            open(errio -> redirect_stderr(() -> redirect_stdout(f, outio), errio), err, "w")
+        end
+        return value, read(out, String), read(err, String)
+    end
+end
+
+"The directory of the JETSweep package under test."
+const EXECUTION_PACKAGE = pkgdir(JETSweep)::String
+
+execution_unit(entry; kind=:test, expected=[entry], setup=String[], jetls_config="") =
+    JETSweep.Unit("$kind-unit", kind, entry, execution_context("unit"), expected, "", "",
+                  JETSweep.Overrides(; setup, jetls_config), String[])
+
+"A sweep of `root` in which `unit`'s entry statically includes its other expected files."
+function execution_sweep(unit, root, output)
+    inventory = JETSweep.Inventory(root, JETSweep.Project[], JETSweep.Source[], [JETSweep.Project[], JETSweep.Project[]], String[], String[])
+    dynamic = isfile(unit.entry) ? filter(i -> isempty(i.target), JETSweep.parse_source(unit.entry).includes) : JETSweep.Include[]
+    includes = [dynamic; [JETSweep.Include(file, 1, true) for file in unit.expected if file != unit.entry]]
+    syntax = Dict(unit.entry => JETSweep.Syntax(includes, String[]))
+    return JETSweep._Sweep(inventory, output, SweepOptions(), syntax, Dict{String,JETSweep.Unit}(),
+                           Dict{String,Vector{String}}(), Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
+end
+
+"Write `unit`'s JETLS configuration; returns the root its paths are relative to and the configuration."
+function execution_jetls(unit, root, separate=String[])
+    directory = mktempdir()
+    config = JETSweep._write_jetls_config(unit, directory, execution_sweep(unit, root, directory), separate)
+    @test config == joinpath(directory, "config")
+    return root, TOML.parsefile(joinpath(config, ".JETLSConfig.toml"))
+end
+
+execution_touch(path, content="nothing\n") = (mkpath(dirname(path)); write(path, content); path)
+
+"Concretization patterns of a written configuration, as (pattern, path) pairs."
+execution_patterns(data) =
+    [(p["pattern"], get(p, "path", "")) for p in get(data["full_analysis"], "concretization_patterns", [])]
+
+execution_skips(data) = get(get(data, "initialization_options", Dict()), "analysis_overrides", [])
+
+execution_skip(path) = Dict("path" => path, "on_include" => "skip")
+
+"A test driver that includes the test files it selects at run time."
+const EXECUTION_DRIVER = """
+    const DIR = @__DIR__
+    seed = rand()
+    files = filter(file -> startswith(file, "test_"), readdir(DIR))
+    for file in files
+        include(joinpath(DIR, file))
+    end
+    """
+
+const EXECUTION_SELECTION = "files = filter(file -> startswith(file, \"test_\"), readdir(DIR))"
+
+const EXECUTION_USER_JETLS = """
+    [full_analysis]
+    debounce = 2.0
+    auto_instantiate = "always"
+    concretization_timeout = 30
+
+    [[full_analysis.concretization_patterns]]
+    pattern = "const C_ = v_"
+
+    [diagnostic]
+    enabled = false
+    all_files = false
+
+    [[diagnostic.patterns]]
+    pattern = "lowering/unused-argument"
+    match_by = "code"
+    match_type = "literal"
+    severity = "off"
+
+    [[initialization_options.analysis_overrides]]
+    path = "src/generated.jl"
+    on_include = "skip"
+    """
+
+# JETLS's vendored Glob, with which it reads configured paths as patterns.
+const EXECUTION_GLOB = Base.require(Base.PkgId(Base.UUID("a6ef924f-2b2c-5d99-b812-8edbc1441234"), "Glob"))
+
+"Files among `files` that a configured glob in `paths` selects, matched as JETLS does."
+execution_selected(paths, files, base) = filter(files) do file
+    candidate = JETSweep._within(file, base) ? JETSweep._slash(relpath(file, base)) : file
+    any(path -> occursin(EXECUTION_GLOB.FilenameMatch(path, "dp"), candidate), paths)
+end
+
+"Files in which JETLS concretizes `statement`: those its patterns select below the root."
+function execution_concretized(data, statement, files, base)
+    paths = [path for (pattern, path) in execution_patterns(data) if pattern == statement]
+    return filter(file -> JETSweep._within(file, base), execution_selected(paths, files, base))
+end
+
+execution_skipped(data, files, base) =
+    execution_selected([override["path"] for override in execution_skips(data)], files, base)
+
+execution_script(name) = JETSweep.Unit("script-$name", :script, "/root/$name.jl", execution_context(name),
+                                       ["/root/$name.jl"], "", "", JETSweep.Overrides(), String[])
+
+execution_incomplete(name, status, reasons, notes=String[]; log="") =
+    JETSweep.UnitResult("script-$name", status, JETSweep.Finding[], String[], reasons, notes, 1.0, log)
+
+"Report a sweep of `/root` with these units and results; return the terminal summary and summary.txt."
+function execution_report(output, units, results)
+    inventory = JETSweep.Inventory("/root", JETSweep.Project[], JETSweep.Source[], [JETSweep.Project[], JETSweep.Project[]], String[], String[])
+    io = IOBuffer()
+    JETSweep.write_report(JETSweep.SweepResult("/root", output, inventory, units, String[], results, String[], 1.0, 2); io)
+    return String(take!(io)), read(joinpath(output, "summary.txt"), String)
+end
+
+export TOML, execution_context, execution_task, execution_uncapped, execution_name, execution_trace, execution_alive,
+    execution_sh, execution_gone, execution_finding, execution_result, execution_inventory, execution_capture,
+    EXECUTION_PACKAGE, execution_unit, execution_sweep, execution_jetls, execution_touch, execution_patterns,
+    execution_skips, execution_skip, EXECUTION_DRIVER, EXECUTION_SELECTION, EXECUTION_USER_JETLS, EXECUTION_GLOB,
+    execution_selected, execution_concretized, execution_skipped, execution_script, execution_incomplete,
+    execution_report
+end
+
+@testitem "Dispatch runs every task once, in priority order, within capacity" setup=[Execution] begin
+    trace = execution_trace(JETSweep._Task[], 3)
+    @test isempty(trace.events)
+    weights = [3, 1, 2, 2, 1, 4, 1, 1, 2, 3, 1, 2]
+    priorities = [(i % 3, (7i) % 11) for i in eachindex(weights)]
+    tasks = [execution_task("t$i", weights[i], priorities[i]) for i in eachindex(weights)]
+    for capacity in (1, 3, 4)
+        trace = execution_trace(tasks, capacity)
+        @test sort(trace.starts) == sort(["t$i" for i in eachindex(weights)])
+        @test allunique(trace.starts)
+        @test trace.starts == ["t$i" for i in sortperm(priorities)]
+        @test trace.peak <= capacity
+    end
+    @test execution_trace([execution_task("u$i") for i in 1:8], 4).peak == 4
+end
+
+# The cap of what a process runs at once, which JETSweep takes from the machine: GitHub's runner and this machine.
+@testitem "A process's slots are capped by its CPU threads and free memory" setup=[Execution] begin
+    GB = 1000^3
+    # This suite's CI runner, GitHub's ubuntu-latest: 4 vCPUs and 16 GB, of which the system holds about 1 GB and the
+    # suite's test processes 3.2 GB when its sweeps start. The sweeps' analysis workers take about 0.85 GB each.
+    runner = JETSweep.worker_cap(4, 16GB - 1GB - 32GB ÷ 10)
+    @test runner == 3   # not 4: the free memory, at 3 GiB a slot, sets it
+    @test runner * 85GB ÷ 100 + 32GB ÷ 10 + 1GB <= 16GB
+    # An 8-vCPU slot of this machine (JULIA_CPU_THREADS=8), with hundreds of GB free, or with the 64 GB of the
+    # g6e.2xlarge it emulates: every vCPU.
+    @test JETSweep.worker_cap(8, 300GB) == 8
+    @test JETSweep.worker_cap(8, 64GB - 1GB - 32GB ÷ 10) == 8
+    @test JETSweep.worker_cap(48, 7 * 1024^3) == 2
+    @test JETSweep.worker_cap(8, 0) == JETSweep.worker_cap(0, 300GB) == 1   # at least one
+    @test 1 <= JETSweep.worker_cap() <= Sys.CPU_THREADS
+    @test SweepOptions().jobs == Sys.CPU_THREADS   # (the cap applies whatever `jobs` asks)
+end
+
+@testitem "Dispatches side by side share the process's slots" setup=[Execution] begin
+    load, peak, ran = Ref(0), Ref(0), String[]
+    loads, peaks = Dict(name => Ref(0) for name in ("a", "b")), Dict(name => Ref(0) for name in ("a", "b"))
+    # (A dispatch that an earlier item interrupted may still be releasing its slots.)
+    timedwait(() -> JETSweep._SHARED.used[] == 0, 60.0; pollint=0.01)
+    # Each dispatch asks for 3 slots, of the 4 the process has.
+    dispatch(name) = JETSweep._dispatch([execution_task("$name$i") for i in 1:6], 3; cap=() -> 4) do task
+        push!(ran, execution_name(task))
+        load[] += 1
+        loads[name][] += 1
+        peak[] = max(peak[], load[])
+        peaks[name][] = max(peaks[name][], loads[name][])
+        sleep(0.05)
+        load[] -= 1
+        loads[name][] -= 1
+        return JETSweep._Task[]
+    end
+    dispatches = [@async(dispatch(name)) for name in ("a", "b")]
+    timedwait(() -> all(istaskdone, dispatches), 60.0; pollint=0.01) === :ok || error("dispatch did not finish")
+    foreach(wait, dispatches)
+    @test sort(ran) == sort(["$name$i" for name in ("a", "b") for i in 1:6])
+    @test peak[] == 4
+    @test peaks["a"][] <= 3 && peaks["b"][] <= 3
+    @test JETSweep._SHARED.used[] == 0
+    # A task heavier than the process's slots is clamped to them and runs alone.
+    trace = execution_trace([execution_task("L", 1, (0, 1)), execution_task("H", 5, (0, 0))], 8; cap=() -> 2)
+    @test trace.events == ["start H", "end H", "start L", "end L"]
+end
+
+@testitem "A task that does not fit blocks later tasks" setup=[Execution] begin
+    tasks = [execution_task("C", 1, (0, 2)), execution_task("A", 2, (0, 0)), execution_task("B", 2, (0, 1))]
+    trace = execution_trace(tasks, 3)
+    @test trace.starts == ["A", "B", "C"]
+    @test findfirst(==("start C"), trace.events) > findfirst(==("end A"), trace.events)
+    @test trace.peak == 3
+end
+
+@testitem "Weight above capacity is clamped and runs alone" setup=[Execution] begin
+    trace = execution_trace([execution_task("L", 1, (0, 1)), execution_task("H", 10, (0, 0))], 2)
+    @test trace.events == ["start H", "end H", "start L", "end L"]
+    @test trace.peak == 2
+    @test execution_trace([execution_task("H", 100)], 1).events == ["start H", "end H"]
+end
+
+@testitem "Follow-up tasks are scheduled by priority" setup=[Execution] begin
+    tasks = [execution_task("A", 1, (0, 0)), execution_task("B", 1, (2, 0)), execution_task("C", 1, (0, 1))]
+    followups = Dict("A" => [execution_task("F", 1, (1, 0)), execution_task("E", 1, (0, -5))],
+                     "F" => [execution_task("G", 1, (3, 0))])
+    @test execution_trace(tasks, 1; followups).starts == ["A", "E", "C", "F", "B", "G"]
+    trace = execution_trace(tasks, 2; followups)
+    @test sort(trace.starts) == ["A", "B", "C", "E", "F", "G"]
+    @test trace.peak <= 2
+end
+
+@testitem "A failing step stops new tasks and propagates once running tasks finish" setup=[Execution] begin
+    events, failed = String[], Base.Event()
+    tasks = [execution_task("slow", 1, (0, 0)), execution_task("bad", 1, (0, 1)),
+             (execution_task("rest$i", 1, (1, i)) for i in 1:3)...]
+    failure = try
+        JETSweep._dispatch(tasks, 2; cap=execution_uncapped) do task
+            name = execution_name(task)
+            push!(events, "start $name")
+            name == "bad" && (notify(failed); error("step failed"))
+            if name == "slow"
+                wait(failed)
+                sleep(0.2)
+                push!(events, "end slow")
+                return [execution_task("followup", 1, (0, 0))]
+            end
+            return JETSweep._Task[]
+        end
+        nothing
+    catch err
+        err
+    end
+    @test failure isa CapturedException
+    @test failure.ex == ErrorException("step failed")
+    @test events == ["start slow", "start bad", "end slow"]
+end
+
+@testitem "An interrupt stops every running worker at once" setup=[Execution] begin
     mktempdir() do directory
         started = time()
         tasks = [execution_task("w$i", 1, (0, i)) for i in 1:3]
         failure = try
-            JETSweep._dispatch(tasks, 3) do task
+            JETSweep._dispatch(tasks, 3; cap=execution_uncapped) do task
                 name = execution_name(task)
                 name == "w3" && (sleep(1.0); throw(InterruptException()))
                 JETSweep.run_worker(execution_sh("echo \$\$ > \"\$1\"; exec sleep 60", joinpath(directory, name)),
@@ -133,7 +319,7 @@ end
     end
 end
 
-@testset "Worker exit codes, signals and logs" begin
+@testitem "Worker exit codes, signals and logs" setup=[Execution] begin
     mktempdir() do directory
         log = joinpath(directory, "worker.log")
         write(log, "previous\n")
@@ -150,7 +336,7 @@ end
     end
 end
 
-@testset "Worker process groups are terminated" begin
+@testitem "Worker process groups are terminated" setup=[Execution] begin
     mktempdir() do directory
         log = joinpath(directory, "worker.log")
         pidfile = joinpath(directory, "child.pid")
@@ -173,7 +359,7 @@ end
     end
 end
 
-@testset "Workers get a virtual display when there is none" begin
+@testitem "Workers get a virtual display when there is none" setup=[Execution] begin
     if Sys.islinux() && Sys.which("Xvfb") !== nothing
         withenv("DISPLAY" => nothing) do
             # Workers get the display; this process's environment stays as it was.
@@ -187,7 +373,7 @@ end
     end
 end
 
-@testset "Worker Julia command" begin
+@testitem "Worker Julia command" setup=[Execution] begin
     command = withenv("JULIA_PROJECT" => "/elsewhere", "JULIA_LOAD_PATH" => "/elsewhere",
                       "OMP_NUM_THREADS" => "8", "JETSWEEP_EXECUTION_MARK" => "inherited") do
         JETSweep.julia_command("/scripts/worker.jl", ["a", "b c"]; project="/environment", threads=3,
@@ -227,14 +413,7 @@ end
     end
 end
 
-execution_finding(severity; file="/root/a.jl", line=1, code="code", message="message") =
-    JETSweep.Finding(file, line, 1, line, 5, severity, code, message)
-execution_result(status, findings=JETSweep.Finding[]) =
-    JETSweep.UnitResult("unit", status, findings, String[], String[], String[], 0.0, "")
-execution_inventory(issues=String[]) =
-    JETSweep.Inventory("/root", JETSweep.Project[], JETSweep.Source[], [JETSweep.Project[], JETSweep.Project[]], String[], issues)
-
-@testset "Exit codes" begin
+@testitem "Exit codes" setup=[Execution] begin
     inventory = execution_inventory()
     clean = execution_result(:clean)
     for fail_on in (:error, :warning, :info, :hint, :none)
@@ -258,7 +437,7 @@ execution_inventory(issues=String[]) =
     @test JETSweep.exit_code(inventory, [mixed], String[], :error) == 0
 end
 
-@testset "Unique findings" begin
+@testitem "Unique findings" setup=[Execution] begin
     @test JETSweep.unique_findings(JETSweep.UnitResult[]) == JETSweep.Finding[]
     @test JETSweep.unique_findings(JETSweep.UnitResult[]) isa Vector{JETSweep.Finding}
     shared = execution_finding(2; file="/root/b.jl", line=4, message=string("dup", "licate"))
@@ -284,7 +463,7 @@ end
     @test length(JETSweep.unique_findings([severities])) == 2
 end
 
-@testset "Command-line arguments" begin
+@testitem "Command-line arguments" setup=[Execution] begin
     directory, options = JETSweep.parse_arguments(["--jobs", "3", "--threads=2", "--timeout", "1.5",
         "--gpus", "0, 2", "--output", "out", "--config=jetsweep.toml", "--exclude", "a/**", "--exclude=b=c",
         "--include-ignored", "--tracked-only", "--offline", "--plan", "--fail-on", "warning", "workspace"])
@@ -341,21 +520,7 @@ end
     end
 end
 
-"Call `f` with standard output and error redirected; return its value and both outputs."
-function execution_capture(f)
-    mktempdir() do directory
-        out, err = joinpath(directory, "out"), joinpath(directory, "err")
-        value = open(out, "w") do outio
-            open(errio -> redirect_stderr(() -> redirect_stdout(f, outio), errio), err, "w")
-        end
-        return value, read(out, String), read(err, String)
-    end
-end
-
-"The directory of the JETSweep package under test."
-const EXECUTION_PACKAGE = pkgdir(JETSweep)::String
-
-@testset "Command-line entry point" begin
+@testitem "Command-line entry point" setup=[Execution] begin
     for arguments in (["--help"], ["-h"])
         code, out, err = execution_capture(() -> JETSweep.main(arguments))
         @test code == 0
@@ -399,7 +564,7 @@ const EXECUTION_PACKAGE = pkgdir(JETSweep)::String
     end
 end
 
-@testset "only the analyzer needs to be installed" begin
+@testitem "only the analyzer needs to be installed" setup=[Execution] begin
     # Packages of JETSweep's environment that the analyzer does not depend on may be missing.
     mktempdir() do tool
         cp(joinpath(EXECUTION_PACKAGE, "Project.toml"), joinpath(tool, "Project.toml"))
@@ -417,7 +582,7 @@ end
     end
 end
 
-@testset "the analyzer's vendored packages must be the ones JETLS pins" begin
+@testitem "the analyzer's vendored packages must be the ones JETLS pins" setup=[Execution] begin
     # After a pull moves the JETLS pin, `Pkg.resolve` can keep a vendored package at the old
     # release's revision: a run fails before writing anything, saying how to update it.
     mktempdir() do tool
@@ -443,7 +608,7 @@ end
     end
 end
 
-@testset "Sweeps started in the same second get their own report directories" begin
+@testitem "Sweeps started in the same second get their own report directories" setup=[Execution] begin
     mktempdir() do directory
         root = realpath(directory)
         write(joinpath(root, "script.jl"), "f() = 1\n")
@@ -466,7 +631,7 @@ end
     end
 end
 
-@testset "GPU assignment" begin
+@testitem "GPU assignment" setup=[Execution] begin
     @test JETSweep._gpus(["none"]) == [""]
     @test JETSweep._gpus(["0", "GPU-1234"]) == ["0", "GPU-1234"]
     withenv("CUDA_VISIBLE_DEVICES" => "5") do
@@ -494,72 +659,7 @@ end
     end
 end
 
-execution_unit(entry; kind=:test, expected=[entry], setup=String[], jetls_config="") =
-    JETSweep.Unit("$kind-unit", kind, entry, execution_context("unit"), expected, "", "",
-                  JETSweep.Overrides(; setup, jetls_config), String[])
-
-"A sweep of `root` in which `unit`'s entry statically includes its other expected files."
-function execution_sweep(unit, root, output)
-    inventory = JETSweep.Inventory(root, JETSweep.Project[], JETSweep.Source[], [JETSweep.Project[], JETSweep.Project[]], String[], String[])
-    dynamic = isfile(unit.entry) ? filter(i -> isempty(i.target), JETSweep.parse_source(unit.entry).includes) : JETSweep.Include[]
-    includes = [dynamic; [JETSweep.Include(file, 1, true) for file in unit.expected if file != unit.entry]]
-    syntax = Dict(unit.entry => JETSweep.Syntax(includes, String[]))
-    return JETSweep._Sweep(inventory, output, SweepOptions(), syntax, Dict{String,JETSweep.Unit}(),
-                           Dict{String,Vector{String}}(), Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
-end
-
-"Write `unit`'s JETLS configuration; returns the root its paths are relative to and the configuration."
-function execution_jetls(unit, root, separate=String[])
-    directory = mktempdir()
-    config = JETSweep._write_jetls_config(unit, directory, execution_sweep(unit, root, directory), separate)
-    @test config == joinpath(directory, "config")
-    return root, TOML.parsefile(joinpath(config, ".JETLSConfig.toml"))
-end
-
-execution_touch(path, content="nothing\n") = (mkpath(dirname(path)); write(path, content); path)
-
-"Concretization patterns of a written configuration, as (pattern, path) pairs."
-execution_patterns(data) =
-    [(p["pattern"], get(p, "path", "")) for p in get(data["full_analysis"], "concretization_patterns", [])]
-execution_skips(data) = get(get(data, "initialization_options", Dict()), "analysis_overrides", [])
-execution_skip(path) = Dict("path" => path, "on_include" => "skip")
-
-"A test driver that includes the test files it selects at run time."
-const EXECUTION_DRIVER = """
-    const DIR = @__DIR__
-    seed = rand()
-    files = filter(file -> startswith(file, "test_"), readdir(DIR))
-    for file in files
-        include(joinpath(DIR, file))
-    end
-    """
-const EXECUTION_SELECTION = "files = filter(file -> startswith(file, \"test_\"), readdir(DIR))"
-
-const EXECUTION_USER_JETLS = """
-    [full_analysis]
-    debounce = 2.0
-    auto_instantiate = "always"
-    concretization_timeout = 30
-
-    [[full_analysis.concretization_patterns]]
-    pattern = "const C_ = v_"
-
-    [diagnostic]
-    enabled = false
-    all_files = false
-
-    [[diagnostic.patterns]]
-    pattern = "lowering/unused-argument"
-    match_by = "code"
-    match_type = "literal"
-    severity = "off"
-
-    [[initialization_options.analysis_overrides]]
-    path = "src/generated.jl"
-    on_include = "skip"
-    """
-
-@testset "JETLS configuration" begin
+@testitem "JETLS configuration" setup=[Execution] begin
     mktempdir() do outer
         write(joinpath(outer, ".JETLSConfig.toml"), "[diagnostic]\npatterns = []\n")
         root = joinpath(outer, "root")
@@ -652,23 +752,7 @@ const EXECUTION_USER_JETLS = """
     end
 end
 
-# JETLS's vendored Glob, with which it reads configured paths as patterns.
-const EXECUTION_GLOB = Base.require(Base.PkgId(Base.UUID("a6ef924f-2b2c-5d99-b812-8edbc1441234"), "Glob"))
-
-"Files among `files` that a configured glob in `paths` selects, matched as JETLS does."
-execution_selected(paths, files, base) = filter(files) do file
-    candidate = JETSweep._within(file, base) ? JETSweep._slash(relpath(file, base)) : file
-    any(path -> occursin(EXECUTION_GLOB.FilenameMatch(path, "dp"), candidate), paths)
-end
-"Files in which JETLS concretizes `statement`: those its patterns select below the root."
-function execution_concretized(data, statement, files, base)
-    paths = [path for (pattern, path) in execution_patterns(data) if pattern == statement]
-    return filter(file -> JETSweep._within(file, base), execution_selected(paths, files, base))
-end
-execution_skipped(data, files, base) =
-    execution_selected([override["path"] for override in execution_skips(data)], files, base)
-
-@testset "JETLS selects exactly the files the settings are written for" begin
+@testitem "JETLS selects exactly the files the settings are written for" setup=[Execution] begin
     mktempdir() do root
         test = joinpath(root, "Pkg", "test")
         driver = execution_touch(joinpath(test, "runtests.jl"), EXECUTION_DRIVER)
@@ -683,7 +767,7 @@ execution_skipped(data, files, base) =
     end
 end
 
-@testset "JETLS applies the settings for files outside the configuration's directory" begin
+@testitem "JETLS applies the settings for files outside the configuration's directory" setup=[Execution] begin
     mktempdir() do root
         driver = execution_touch(joinpath(root, "Pkg", "test", "runtests.jl"), EXECUTION_DRIVER)
         separate = execution_touch(joinpath(root, "Pkg", "test", "test_second.jl"))
@@ -701,7 +785,7 @@ end
     end
 end
 
-@testset "Report directories are tagged as caches, so later sweeps skip them" begin
+@testitem "Report directories are tagged as caches, so later sweeps skip them" setup=[Execution] begin
     mktempdir() do directory
         root = realpath(directory)
         script = execution_touch(joinpath(root, "script.jl"), "f() = 1\n")
@@ -719,7 +803,7 @@ end
     end
 end
 
-@testset "A plan prints the discovery issues that fail it" begin
+@testitem "A plan prints the discovery issues that fail it" setup=[Execution] begin
     mktempdir() do directory
         root = realpath(directory)
         execution_touch(joinpath(root, "Broken", "Project.toml"), "name = \"Broken\"\nuuid = \"not-a-uuid\"\n")
@@ -732,7 +816,7 @@ end
     end
 end
 
-@testset "Edits to packages the sweep leaves out do not count as changed inputs" begin
+@testitem "Edits to packages the sweep leaves out do not count as changed inputs" setup=[Execution] begin
     mktempdir() do directory
         root = realpath(directory)
         package(name, uuid) = (execution_touch(joinpath(root, name, "Project.toml"), "name = \"$name\"\nuuid = \"$uuid\"\n");
@@ -749,7 +833,7 @@ end
     end
 end
 
-@testset "A context that selects no unit is a mistake, unless the sweep leaves out what it selects" begin
+@testitem "A context that selects no unit is a mistake, unless the sweep leaves out what it selects" setup=[Execution] begin
     mktempdir() do directory
         root = realpath(directory)
         execution_touch(joinpath(root, "Swept", "tools", "check.jl"), "include(\"lib.jl\")\n")
@@ -799,7 +883,7 @@ end
     end
 end
 
-@testset "The units of an unavailable environment point to its log, if it has one" begin
+@testitem "The units of an unavailable environment point to its log, if it has one" setup=[Execution] begin
     mktempdir() do output
         unit = execution_unit(execution_touch(joinpath(output, "root", "script.jl")); kind=:script)
         sweep = execution_sweep(unit, joinpath(output, "root"), output)
@@ -814,20 +898,7 @@ end
     end
 end
 
-execution_script(name) = JETSweep.Unit("script-$name", :script, "/root/$name.jl", execution_context(name),
-                                       ["/root/$name.jl"], "", "", JETSweep.Overrides(), String[])
-execution_incomplete(name, status, reasons, notes=String[]; log="") =
-    JETSweep.UnitResult("script-$name", status, JETSweep.Finding[], String[], reasons, notes, 1.0, log)
-
-"Report a sweep of `/root` with these units and results; return the terminal summary and summary.txt."
-function execution_report(output, units, results)
-    inventory = JETSweep.Inventory("/root", JETSweep.Project[], JETSweep.Source[], [JETSweep.Project[], JETSweep.Project[]], String[], String[])
-    io = IOBuffer()
-    JETSweep.write_report(JETSweep.SweepResult("/root", output, inventory, units, String[], results, String[], 1.0, 2); io)
-    return String(take!(io)), read(joinpath(output, "summary.txt"), String)
-end
-
-@testset "Incomplete units are grouped by cause, whichever environment's log it points to" begin
+@testitem "Incomplete units are grouped by cause, whichever environment's log it points to" setup=[Execution] begin
     mktempdir() do output
         timed_out(key) = "environment unavailable: environment preparation timed out; see $output/environments/$key/log.txt"
         exited(key) = "environment unavailable: environment preparation exited with code 1; see /out dir/$key/log.txt"
@@ -846,7 +917,7 @@ end
     end
 end
 
-@testset "The summary shows an incomplete unit's notes with its reasons" begin
+@testitem "The summary shows an incomplete unit's notes with its reasons" setup=[Execution] begin
     mktempdir() do output
         stop = "analysis stopped at /root/report.jl:1 [toplevel/error]: JET could not execute this top-level code: " *
                "ArgumentError: Package Humanize not found in current path.\n- Run `import Pkg; Pkg.add(\"Humanize\")`"
@@ -867,7 +938,7 @@ end
     end
 end
 
-@testset "Files a unit did not reach get follow-up units" begin
+@testitem "Files a unit did not reach get follow-up units" setup=[Execution] begin
     mktempdir() do directory
         root = realpath(directory)
         package = joinpath(root, "Pkg")
@@ -917,7 +988,7 @@ end
     end
 end
 
-@testset "A repeated sweep schedules the longest analyses first" begin
+@testitem "A repeated sweep schedules the longest analyses first" setup=[Execution] begin
     mktempdir() do directory
         root = realpath(directory)
         @test isempty(JETSweep._previous_seconds(root))
@@ -956,7 +1027,7 @@ end
     end
 end
 
-@testset "a worker that exits without a result is reported with its error" begin
+@testitem "a worker that exits without a result is reported with its error" setup=[Execution] begin
     mktempdir() do directory
         log = joinpath(directory, "log.txt")
         @test JETSweep._worker_error(log, 1) === nothing

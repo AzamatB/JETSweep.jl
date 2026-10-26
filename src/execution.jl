@@ -14,23 +14,35 @@ struct _Task
 end
 
 """
-Run `step(task)` for every task on `capacity` CPU slots, in priority order. A task that
-does not fit waits for slots rather than letting later tasks pass it, so heavy tasks
-cannot starve. `step` returns follow-up tasks. An interrupt stops every worker at once.
+The slots in use by all the dispatches of this process, and the most they may use together:
+the `worker_cap()` of the moment when none was in use. Sweeps side by side, as the test suite
+runs them, so fit the machine together. Dispatches wait on the shared condition, so that one
+that frees slots wakes the others.
 """
-function _dispatch(step, tasks::Vector{_Task}, capacity::Int)
+const _SHARED = (condition=Threads.Condition(), used=Ref(0), cap=Ref(0))
+
+"""
+Run `step(task)` for every task on `capacity` CPU slots, in priority order, within the slots
+the process has for all its dispatches (`_SHARED`; `cap()` sets their number when none is in
+use). A task that does not fit waits for slots rather than letting later tasks pass it, so
+heavy tasks cannot starve. `step` returns follow-up tasks. An interrupt stops every worker at once.
+"""
+function _dispatch(step, tasks::Vector{_Task}, capacity::Int; cap=worker_cap)
     queue = sort(tasks; by=task -> task.priority)
-    condition = Threads.Condition()
+    condition = _SHARED.condition
     used, running = Ref(0), Ref(0)
     failure = Ref{Any}(nothing)
     try
         @lock condition while true
             # Ctrl-C interrupts whichever task is current, usually one waiting for its worker.
             failure[] isa InterruptException && throw(failure[])
-            while !isempty(queue) && failure[] === nothing && used[] + min(first(queue).weight, capacity) <= capacity
+            while !isempty(queue) && failure[] === nothing
+                _SHARED.used[] == 0 && (_SHARED.cap[] = cap())
+                weight = min(first(queue).weight, capacity, _SHARED.cap[])
+                used[] + weight <= capacity && _SHARED.used[] + weight <= _SHARED.cap[] || break
                 task = popfirst!(queue)
-                weight = min(task.weight, capacity)
                 used[] += weight
+                _SHARED.used[] += weight
                 running[] += 1
                 @async begin
                     followups = _Task[]
@@ -41,6 +53,7 @@ function _dispatch(step, tasks::Vector{_Task}, capacity::Int)
                     end
                     @lock condition begin
                         used[] -= weight
+                        _SHARED.used[] -= weight
                         running[] -= 1
                         for followup in followups
                             index = searchsortedfirst(queue, followup; by=task -> task.priority)
@@ -70,7 +83,13 @@ _context_key(context::Context) = bytes2hex(sha256(string(context.project, '\0', 
 
 _environment_directory(output::String, context::Context) = joinpath(output, "environments", _context_key(context))
 
-function _prepare(context::Context, directory::String, options::SweepOptions)
+"""
+Prepare the environment of `context` in a worker, in `directory`, which is also the worker's
+working directory; `env` adds to the worker's environment variables.
+"""
+function _prepare(context::Context, directory::String, options::SweepOptions;
+                  env::Dict{String,String}=Dict{String,String}())
+    directory = abspath(directory)
     request = _write_toml(joinpath(directory, "request.toml"), Dict(
         "project" => context.project, "owner" => context.owner, "test" => context.test,
         "triggers" => context.triggers, "imports" => context.imports, "directory" => joinpath(directory, "env"),
@@ -78,8 +97,8 @@ function _prepare(context::Context, directory::String, options::SweepOptions)
     result = joinpath(directory, "result.toml")
     log = joinpath(directory, "log.txt")
     command = julia_command(joinpath(_SCRIPTS, "prepare.jl"), [request, result];
-        project=dirname(tool_project()), threads=1, env=Dict("JULIA_NUM_PRECOMPILE_TASKS" => "2"))
-    process = run_worker(command, log, options.timeout)
+        project=dirname(tool_project()), threads=1, env=merge(Dict("JULIA_NUM_PRECOMPILE_TASKS" => "2"), env))
+    process = run_worker(Cmd(command; dir=directory), log, options.timeout)
     isfile(result) || return Environment(:failed, joinpath(directory, "env"), process.timed_out ?
         "environment preparation timed out; see $log" :
         "environment preparation exited with code $(process.code); see $log")
