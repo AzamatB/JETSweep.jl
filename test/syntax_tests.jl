@@ -1,3 +1,5 @@
+# Syntax: include targets, preludes and concretization patterns.
+@testsetup module Syntax
 using JETSweep, Test
 
 const SyntaxInclude = JETSweep.Include
@@ -61,6 +63,7 @@ syntax_names(text::String) = syntax_names!(Set{Symbol}(), Meta.parseall(text))
 syntax_imports(text::String) = [ex for ex in Meta.parseall(text).args if Meta.isexpr(ex, (:using, :import))]
 
 syntax_broken(ex) = ex isa Expr && (ex.head in (:error, :incomplete) || any(syntax_broken, ex.args))
+
 syntax_parses(text::String) = !syntax_broken(Meta.parseall(text))
 
 "Load `text` as a file of its own directory into a fresh module: the module, or the error."
@@ -80,9 +83,22 @@ end
 syntax_dynamic(file::String, line::Int) = "$file:$line: include target is only known at run time"
 
 syntax_value(sandbox::Module, name::Symbol) = Base.invokelatest(getglobal, sandbox, name)
+
 syntax_call(sandbox::Module, name::Symbol, args...) = Base.invokelatest(syntax_value(sandbox, name), args...)
 
-@testset "parse_source resolves literal and path-call targets" begin
+"Concretization patterns of `code` written as `file.jl`."
+function syntax_patterns(code::String)
+    mktempdir() do directory
+        return JETSweep.concretization_patterns(syntax_write(realpath(directory), "file.jl", code))
+    end
+end
+
+export SyntaxInclude, syntax_write, syntax_parse, syntax_targets, syntax_prelude, syntax_callee,
+    syntax_names!, syntax_names, syntax_imports, syntax_broken, syntax_parses, syntax_load, syntax_dynamic,
+    syntax_value, syntax_call, syntax_patterns
+end
+
+@testitem "parse_source resolves literal and path-call targets" setup=[Syntax] begin
     parsed = syntax_parse(raw"""
         include("literal.jl")
         include("sub/../normalized.jl")
@@ -105,7 +121,7 @@ syntax_call(sandbox::Module, name::Symbol, args...) = Base.invokelatest(syntax_v
     @test isempty(parsed.syntax.notes)
 end
 
-@testset "parse_source recognizes every include call form" begin
+@testitem "parse_source recognizes every include call form" setup=[Syntax] begin
     parsed = syntax_parse("""
         include(identity, "mapped.jl")
         include(ex -> ex, joinpath(@__DIR__, "lambda_mapped.jl"))
@@ -129,7 +145,7 @@ end
     @test defined.syntax.notes == [syntax_dynamic(defined.file, 2)]
 end
 
-@testset "prelude keeps conditional imports that can load" begin
+@testitem "prelude keeps conditional imports that can load" setup=[Syntax] begin
     # A whole-module import binds names not known statically; the test file may use any.
     driver = "using Test\n@static if VERSION >= v\"1.0\"\n    using Dates\nend\nfor f in ARGS\n    include(f)\nend\n"
     syntax_prelude("test/runtests.jl" => driver, "test/target.jl" => "@test year(Date(2020, 1, 1)) == 2020\n") do text, _
@@ -161,7 +177,7 @@ end
     end
 end
 
-@testset "prelude follows the branch of a conditional that includes the test file" begin
+@testitem "prelude follows the branch of a conditional that includes the test file" setup=[Syntax] begin
     driver = """
         using Test
         if !isempty(ARGS)
@@ -181,7 +197,7 @@ end
     end
 end
 
-@testset "prelude follows includes through pkgdir and pathof of the unit's package" begin
+@testitem "prelude follows includes through pkgdir and pathof of the unit's package" setup=[Syntax] begin
     mktempdir() do directory
         dir = realpath(directory)
         driver = syntax_write(dir, "test/runtests.jl", """
@@ -203,7 +219,7 @@ end
     end
 end
 
-@testset "parse_source resolves pkgdir and pathof through the packages map" begin
+@testitem "parse_source resolves pkgdir and pathof through the packages map" setup=[Syntax] begin
     root = "/depot/packages/Dep"
     code = """
         include(joinpath(pkgdir(Dep), "bootstrap.jl"))
@@ -227,7 +243,7 @@ end
     @test syntax_parse(code).syntax.includes == [SyntaxInclude("", line, true) for line in 1:8]
 end
 
-@testset "parse_source follows bindings to literal paths" begin
+@testitem "parse_source follows bindings to literal paths" setup=[Syntax] begin
     @test syntax_targets(raw"""
         const SRC = joinpath(@__DIR__, "src")
         include(joinpath(SRC, "constant.jl"))
@@ -252,7 +268,7 @@ end
                  joinpath("nested", "chained.jl"), "global.jl", "block.jl", "rebound.jl", ""]
 end
 
-@testset "parse_source scopes bindings" begin
+@testitem "parse_source scopes bindings" setup=[Syntax] begin
     # Assignments inside conditionals and scopes neither leak nor survive as the outer value.
     @test syntax_targets("if flag\n    conditional = \"a.jl\"\nend\ninclude(conditional)\n") == [""]
     @test syntax_targets("p = \"a.jl\"\nif flag\n    p = \"b.jl\"\nend\ninclude(p)\n") == [""]
@@ -273,7 +289,7 @@ end
     @test syntax_targets("p = \"a.jl\"\nmodule M\ninclude(p)\nend\n") == [""]
 end
 
-@testset "parse_source does not resolve shadowed or rebound names to stale bindings" begin
+@testitem "parse_source does not resolve shadowed or rebound names to stale bindings" setup=[Syntax] begin
     # Arguments and iteration variables are locals that shadow the file's bindings.
     @test syntax_targets("p = \"a.jl\"\nload(p) = include(p)\n") == [""]
     @test syntax_targets("f = \"a.jl\"\n[include(f) for f in files]\n") == [""]
@@ -282,7 +298,7 @@ end
     @test syntax_targets("p = \"a.jl\"\np, q = \"b.jl\", \"c.jl\"\ninclude(p)\n") in ([""], ["b.jl"])
 end
 
-@testset "parse_source records dynamic targets with a note" begin
+@testitem "parse_source records dynamic targets with a note" setup=[Syntax] begin
     parsed = syntax_parse(raw"""
         include(ARGS[1])
         for f in files
@@ -300,7 +316,7 @@ end
     @test parsed.syntax.notes == [syntax_dynamic(parsed.file, line) for line in dynamic]
 end
 
-@testset "parse_source marks includes in function bodies as not followed" begin
+@testitem "parse_source marks includes in function bodies as not followed" setup=[Syntax] begin
     parsed = syntax_parse("""
         function long_form()
             include("long.jl")
@@ -366,7 +382,7 @@ end
     @test isempty(parsed.syntax.notes)
 end
 
-@testset "parse_source ignores quoted code" begin
+@testitem "parse_source ignores quoted code" setup=[Syntax] begin
     parsed = syntax_parse("""
         expression = :(include("quoted.jl"))
         block = quote
@@ -381,7 +397,7 @@ end
     @test isempty(parsed.syntax.notes)
 end
 
-@testset "parse_source notes parse failures" begin
+@testitem "parse_source notes parse failures" setup=[Syntax] begin
     parsed = syntax_parse("include(\"before.jl\")\nfunction broken(\n")
     @test parsed.syntax.includes == [SyntaxInclude(joinpath(parsed.dir, "before.jl"), 1, true)]
     @test startswith(only(parsed.syntax.notes), "$(parsed.file):2: cannot be parsed")
@@ -401,7 +417,7 @@ end
     @test !occursin(marker, note)
 end
 
-@testset "prelude keeps imports and definitions and drops other statements" begin
+@testitem "prelude keeps imports and definitions and drops other statements" setup=[Syntax] begin
     driver = """
         using Test
         using Dates: Date, value as date_value
@@ -473,7 +489,7 @@ end
     end
 end
 
-@testset "prelude keeps the assignments the target and kept definitions refer to" begin
+@testitem "prelude keeps the assignments the target and kept definitions refer to" setup=[Syntax] begin
     driver = """
         using Test
         const USED_BY_TARGET = 1
@@ -544,7 +560,7 @@ end
     end
 end
 
-@testset "prelude keeps the conditional definitions the target and kept definitions refer to" begin
+@testitem "prelude keeps the conditional definitions the target and kept definitions refer to" setup=[Syntax] begin
     driver = """
         using Test
         const NEW = VERSION >= v"1.0"
@@ -598,7 +614,7 @@ end
     end
 end
 
-@testset "prelude follows the files the driver includes statically at top level" begin
+@testitem "prelude follows the files the driver includes statically at top level" setup=[Syntax] begin
     driver = """
         using Test
         include("helpers.jl")
@@ -660,7 +676,7 @@ end
     end
 end
 
-@testset "prelude relocates @__DIR__ and @__FILE__ to the original files" begin
+@testitem "prelude relocates @__DIR__ and @__FILE__ to the original files" setup=[Syntax] begin
     driver = """
         const DRIVER_DIR = @__DIR__
         const DRIVER_FILE = @__FILE__
@@ -707,7 +723,7 @@ end
     end
 end
 
-@testset "prelude output loads as the definitions it was made from" begin
+@testitem "prelude output loads as the definitions it was made from" setup=[Syntax] begin
     driver = raw"""
         interpolated(x) = "v=$x, w=$(x + 1)"
         dollar() = "\$"
@@ -753,7 +769,7 @@ end
     end
 end
 
-@testset "prelude of a Godela-style driver keeps the context and drops the selection" begin
+@testitem "prelude of a Godela-style driver keeps the context and drops the selection" setup=[Syntax] begin
     driver = raw"""
         import UUIDs
         UUIDs.uuid4()
@@ -815,14 +831,7 @@ end
     end
 end
 
-"Concretization patterns of `code` written as `file.jl`."
-function syntax_patterns(code::String)
-    mktempdir() do directory
-        return JETSweep.concretization_patterns(syntax_write(realpath(directory), "file.jl", code))
-    end
-end
-
-@testset "concretization_patterns selects statements free of side effects" begin
+@testitem "concretization_patterns selects statements free of side effects" setup=[Syntax] begin
     code = """
         using LinearAlgebra
         import Statistics as Stats
@@ -866,7 +875,7 @@ end
     end
 end
 
-@testset "concretization_patterns evaluates run-dependent values only where analysis needs them" begin
+@testitem "concretization_patterns evaluates run-dependent values only where analysis needs them" setup=[Syntax] begin
     code = """
         outdir = ARGS[1]
         mesh, case = ARGS
@@ -905,7 +914,7 @@ end
         "const REPLACEMENT = string(:new_value, get(ENV, \"SUFFIX\", \"\"))"]
 end
 
-@testset "concretization_patterns follows what JETLS outlines, includes and imports" begin
+@testitem "concretization_patterns follows what JETLS outlines, includes and imports" setup=[Syntax] begin
     # The worker outlines expressions of calls and control flow, so the closures in their
     # branches need no evaluated conditions; one that assigns is not outlined.
     @test JETSweep._outlined(:(lock === nothing || atexit(() -> close(lock))))
@@ -1066,7 +1075,7 @@ end
     end
 end
 
-@testset "concretization_patterns needs only what JETLS evaluates, where it does" begin
+@testitem "concretization_patterns needs only what JETLS evaluates, where it does" setup=[Syntax] begin
     # Default values and argument names are not evaluated when a method is defined, nor is
     # the quoted code `@eval` defines, except what it interpolates.
     @test syntax_patterns("outdir = ARGS[1]\nwrite_to(x; dir=outdir) = x\n") == String[]
@@ -1105,7 +1114,7 @@ end
     @test syntax_patterns(code) == ["const M = min(1, 2)"]
 end
 
-@testset "concretization_patterns forgets values that other code may change" begin
+@testitem "concretization_patterns forgets values that other code may change" setup=[Syntax] begin
     code = """
         errs = Float64[]
         for i in 1:3
@@ -1145,7 +1154,7 @@ end
                                          "const AST = Meta.parseall(MANIFEST)"]
 end
 
-@testset "concretization_patterns takes blocks and conditionals whole, as JETLS matches them" begin
+@testitem "concretization_patterns takes blocks and conditionals whole, as JETLS matches them" setup=[Syntax] begin
     code = """
         begin
             const ROOT = dirname(@__DIR__)
@@ -1174,7 +1183,7 @@ end
         "if Sys.iswindows()\n    const ONLY_WINDOWS = 1\nend", "const READ_ONLY_WINDOWS = ONLY_WINDOWS + 1"]
 end
 
-@testset "concretization_patterns leaves out patterns that would match other statements" begin
+@testitem "concretization_patterns leaves out patterns that would match other statements" setup=[Syntax] begin
     # MacroTools matches structurally, with names such as `x_` and `@__DIR__` as wildcards.
     code = """
         x = rand(3)
@@ -1197,7 +1206,7 @@ end
     @test JETSweep._may_match(Expr(:block, :(a = 1)), :(a = 1))
 end
 
-@testset "concretization_patterns of a test driver evaluates its file selection" begin
+@testitem "concretization_patterns of a test driver evaluates its file selection" setup=[Syntax] begin
     driver = """
         const FILES = ["test_a.jl", "test_b.jl"]
         const ASKED = isempty(ARGS) ? split(get(ENV, "TESTS", ""), ","; keepempty = false) : ARGS
@@ -1225,7 +1234,7 @@ end
     @test syntax_patterns("const FILES = list_tests()\nrun(f) = include(f)\nforeach(run, FILES)\n") == String[]
 end
 
-@testset "concretization_patterns evaluates the conditions of early exits that control includes" begin
+@testitem "concretization_patterns evaluates the conditions of early exits that control includes" setup=[Syntax] begin
     selection = """
         const FILES = ["test_a.jl", "test_guards.jl"]
         const RUN = isempty(ARGS) ? FILES : filter(in(ARGS), FILES)
@@ -1273,7 +1282,7 @@ end
           patterns("for file in RUN\n    @time file in ORIGINAL && return\n    include(file)\nend\n") == [run, original]
 end
 
-@testset "includes resolve through path constants other files define" begin
+@testitem "includes resolve through path constants other files define" setup=[Syntax] begin
     mktempdir() do directory
         root = realpath(directory)
         bootstrap = syntax_write(root, "lib/bootstrap.jl", "const LIBDIR = @__DIR__\nconst DATA = joinpath(dirname(LIBDIR), \"data\")\n")
@@ -1289,7 +1298,7 @@ end
     end
 end
 
-@testset "parse_source records the packages imports load" begin
+@testitem "parse_source records the packages imports load" setup=[Syntax] begin
     parsed = syntax_parse("""
         using A, B.C
         import D as E

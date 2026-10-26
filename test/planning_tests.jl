@@ -1,7 +1,11 @@
+# Planning: the analysis units of an inventory, their contexts and configuration.
+@testsetup module Planning
 using JETSweep, TOML, Test, UUIDs
 
 const PLANNING_DATES = "ade2ca70-3891-5945-98fb-dc099432e06a"
+
 const PLANNING_TEST = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
 const PLANNING_OTHER = "5c0d4e38-7f43-4d0b-9a49-3b5bfbd1f6a1"
 
 function planning_file(root::String, relative::String, content::String="")
@@ -33,9 +37,13 @@ function planning_plan(root::String, file::String="")
 end
 
 planning_unit(units, entry::String) = only(filter(unit -> unit.entry == entry, units))
+
 planning_entries(units) = Set(unit.entry for unit in units)
+
 planning_noted(unit, text) = any(note -> occursin(text, note), unit.notes)
+
 planning_overrides(overrides) = (overrides.setup, overrides.args, overrides.env, overrides.jetls_config)
+
 const PLANNING_NONE = (String[], String[], Dict{String,String}(), "")
 
 function planning_invariants(inventory, units)
@@ -49,7 +57,12 @@ function planning_invariants(inventory, units)
     @test issorted(units; by=unit -> (unit.entry, unit.extension))
 end
 
-@testset "package units cover the owned files their entry reaches and their other sources" begin
+export TOML, UUIDs, PLANNING_DATES, PLANNING_TEST, PLANNING_OTHER, planning_file, planning_project,
+    planning_package, planning_context, planning_plan, planning_unit, planning_entries, planning_noted,
+    planning_overrides, PLANNING_NONE, planning_invariants, uuid4, UUID
+end
+
+@testitem "package units cover the owned files their entry reaches and their other sources" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         outer = planning_package(root, "Outer", "Outer")
@@ -105,7 +118,7 @@ end
     end
 end
 
-@testset "extension units for flat and directory layouts" begin
+@testitem "extension units for flat and directory layouts" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         host = planning_package(root, "Host", "Host";
@@ -148,7 +161,7 @@ end
     end
 end
 
-@testset "test units: drivers, run-time includes and helpers" begin
+@testitem "test units: drivers, run-time includes and helpers" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         tested = planning_package(root, "Tested", "Tested")
@@ -242,7 +255,7 @@ end
     end
 end
 
-@testset "script units group by include roots in their nearest environment" begin
+@testitem "script units group by include roots in their nearest environment" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         main = planning_file(root, "main.jl", "include(\"lib/util.jl\")\n")
@@ -279,7 +292,7 @@ end
     end
 end
 
-@testset "files an include cycle reaches are covered by the cycle's entry" begin
+@testitem "files an include cycle reaches are covered by the cycle's entry" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         leaf = planning_file(root, "a.jl")
@@ -294,7 +307,7 @@ end
     end
 end
 
-@testset "a tree without Julia files plans no units" begin
+@testitem "a tree without Julia files plans no units" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         @test isempty(last(planning_plan(root)))
@@ -306,7 +319,7 @@ end
     end
 end
 
-@testset "notes record dynamic includes and parse failures" begin
+@testitem "notes record dynamic includes and parse failures" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         dynamic = planning_file(root, "dynamic.jl", "include(ARGS[1])\n")
@@ -353,7 +366,7 @@ end
     end
 end
 
-@testset "unit ids are deterministic, unique and relative to the root" begin
+@testitem "unit ids are deterministic, unique and relative to the root" setup=[Planning] begin
     function planning_workspace(root)
         package = planning_package(root, "Pkg", "Pkg"; weakdeps=Dict("Dates" => PLANNING_DATES),
                                    extensions=Dict("PkgDatesExt" => "Dates"))
@@ -382,7 +395,7 @@ end
     end
 end
 
-@testset "excluded files are not planned" begin
+@testitem "excluded files are not planned" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         host = planning_package(root, "Host", "Host"; weakdeps=Dict("Dates" => PLANNING_DATES),
@@ -404,7 +417,7 @@ end
     end
 end
 
-@testset "read_config" begin
+@testitem "read_config" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         @test JETSweep.read_config(root).file == ""
@@ -491,7 +504,7 @@ end
     end
 end
 
-@testset "context rules apply to the units they match" begin
+@testitem "context rules apply to the units they match" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         environment = planning_project(root, "tools/env")
@@ -566,7 +579,7 @@ end
     end
 end
 
-@testset "setup applies to tests and scripts, and package analyses note it does not" begin
+@testitem "setup applies to tests and scripts, and package analyses note it does not" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         setup = planning_file(root, "setup.jl")
@@ -598,7 +611,7 @@ end
     end
 end
 
-@testset "scripts and tests get the packages they import without declaring them" begin
+@testitem "scripts and tests get the packages they import without declaring them" setup=[Planning] begin
     mktempdir() do directory
         root = realpath(directory)
         sibling = planning_package(root, "Sibling", "Sibling")

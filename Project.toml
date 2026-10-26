@@ -18,6 +18,7 @@ JETLS = {rev = "2b04cd545418d72d3e5527c8c9337bce09b6ccc6", url = "https://github
 JETLS = "=2026.10.21"
 LibGit2 = "1"
 Pkg = "1.13"
+ReTestItems = "1.35"
 Revise = "3.17.3"
 SHA = "1"
 TOML = "1"
@@ -28,8 +29,9 @@ julia_flags = ["--startup-file=no", "--history-file=no"]
 
 [extras]
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+ReTestItems = "817f1d60-ba6b-4fd5-9520-3cf149f6a823"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [targets]
-test = ["Dates", "Test", "UUIDs"]
+test = ["Dates", "ReTestItems", "Test", "UUIDs"]

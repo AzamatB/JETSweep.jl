@@ -1,3 +1,5 @@
+# Discovery: the inventory of a tree's projects and sources, their ownership, exclusions, Git and symlinks.
+@testsetup module Discovery
 using JETSweep, LibGit2, TOML, Test, UUIDs
 
 function discovery_write(root, relative, contents="nothing\n")
@@ -36,6 +38,7 @@ function discovery_git(directory, files...)
 end
 
 discovery_relative(inventory, path) = isempty(path) ? "" : relpath(path, inventory.root)
+
 discovery_files(inventory) = [discovery_relative(inventory, source.path) for source in inventory.sources]
 
 "A `Dict` of `pairs` that fails on repeated keys instead of silently keeping the last."
@@ -69,9 +72,15 @@ discovery_snapshot(inventory) = (inventory.root,
     [(s.path, s.kind, s.project, s.owner) for s in inventory.sources], inventory.excluded, inventory.issues)
 
 const DISCOVERY_DATES = "ade2ca70-3891-5945-98fb-dc099432e06a"
+
 const DISCOVERY_TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
-@testset "Recursive inventory, source kinds and ownership" begin
+export LibGit2, TOML, UUIDs, discovery_write, discovery_toml, discovery_package, discovery_git,
+    discovery_relative, discovery_files, discovery_dict, discovery_placement, discovery_reasons, discovery_project_at,
+    discovery_snapshot, DISCOVERY_DATES, DISCOVERY_TOML, uuid4, UUID
+end
+
+@testitem "Recursive inventory, source kinds and ownership" setup=[Discovery] begin
     mktempdir() do root
         discovery_write(root, "Project.toml", discovery_toml(deps=Dict("Dates" => DISCOVERY_DATES)))
         discovery_write(root, "scripts/run.jl")
@@ -153,7 +162,7 @@ const DISCOVERY_TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
     end
 end
 
-@testset "JuliaProject.toml takes precedence over Project.toml" begin
+@testitem "JuliaProject.toml takes precedence over Project.toml" setup=[Discovery] begin
     mktempdir() do root
         preferred = discovery_package(root, "Preferred", "Preferred"; file="JuliaProject.toml")
         discovery_write(preferred, "Project.toml", "not valid [ TOML")
@@ -176,7 +185,7 @@ end
     end
 end
 
-@testset "Malformed project metadata is recorded as issues" begin
+@testitem "Malformed project metadata is recorded as issues" setup=[Discovery] begin
     mktempdir() do root
         id = string(uuid4())
         cases = [
@@ -223,7 +232,7 @@ end
     end
 end
 
-@testset "The nearest named project owns its sources, even with broken metadata" begin
+@testitem "The nearest named project owns its sources, even with broken metadata" setup=[Discovery] begin
     mktempdir() do root
         outer = discovery_package(root, "Outer", "Outer")
         discovery_write(outer, "vendor/Inner/Project.toml", "name = \"Inner\"\nuuid = \"invalid\"\n")
@@ -253,7 +262,7 @@ end
     end
 end
 
-@testset "Exclusion globs" begin
+@testitem "Exclusion globs" setup=[Discovery] begin
     mktempdir() do root
         files = ["keep.jl", "loose scripts/main.jl", "deep/loose scripts/main.jl", "pkg/src/top.jl",
                  "pkg/src/disconnected.jl", "pkg/src/sub/deep.jl", "pkg/src/sub/disconnected.jl",
@@ -285,64 +294,66 @@ end
     end
 end
 
-@testset "The packages a sweep leaves out stay available, without their sources or issues (Git: $git)" for git in (false, true)
-    mktempdir() do directory
-        root = realpath(directory)
-        sibling = discovery_package(root, "Sibling", "Sibling")
-        discovery_write(sibling, "test/runtests.jl")
-        discovery_write(sibling, "vendor/Broken/Project.toml", "[deps\n")
-        discovery_write(sibling, "vendor/Environment/Project.toml", "[deps]\n")
-        discovery_package(sibling, "vendor/Vendored", "Vendored")
-        # What discovery leaves out for another reason stays out.
-        discovery_package(sibling, "node_modules/Pruned", "Pruned")
-        discovery_package(sibling, ".state/Hidden", "Hidden")
-        discovery_package(sibling, "ignored/Ignored", "Ignored")
-        kept = discovery_package(root, "Kept", "Kept")
-        if git
-            discovery_write(root, ".gitignore", "ignored/\n")
-            discovery_git(root)
+@testitem "The packages a sweep leaves out stay available, without their sources or issues" setup=[Discovery] begin
+    @testset "The packages a sweep leaves out stay available, without their sources or issues (Git: $git)" for git in (false, true)
+        mktempdir() do directory
+            root = realpath(directory)
+            sibling = discovery_package(root, "Sibling", "Sibling")
+            discovery_write(sibling, "test/runtests.jl")
+            discovery_write(sibling, "vendor/Broken/Project.toml", "[deps\n")
+            discovery_write(sibling, "vendor/Environment/Project.toml", "[deps]\n")
+            discovery_package(sibling, "vendor/Vendored", "Vendored")
+            # What discovery leaves out for another reason stays out.
+            discovery_package(sibling, "node_modules/Pruned", "Pruned")
+            discovery_package(sibling, ".state/Hidden", "Hidden")
+            discovery_package(sibling, "ignored/Ignored", "Ignored")
+            kept = discovery_package(root, "Kept", "Kept")
+            if git
+                discovery_write(root, ".gitignore", "ignored/\n")
+                discovery_git(root)
+            end
+            available(inventory) = [[discovery_relative(inventory, p.dir) for p in tier] for tier in inventory.available]
+            ignored = git ? String[] : ["Sibling/ignored/Ignored"]
+            inventory = discover(root; exclude=["Sibling"])
+            @test discovery_files(inventory) == ["Kept/src/Kept.jl"]
+            @test [p.dir for p in inventory.projects] == [kept]
+            @test available(inventory) == [["Sibling"; ignored; "Sibling/vendor/Vendored"], String[]]
+            @test isempty(inventory.issues)
+            @test discovery_reasons(inventory) == Dict("Sibling" => "excluded by pattern")
+            # An excluded project file is left out with the rest.
+            inventory = discover(root; exclude=["Sibling/Project.toml"])
+            @test !any(p -> p.dir == sibling, inventory.projects) && all(isempty, inventory.available)
+            @test discovery_placement(inventory)["Sibling/src/Sibling.jl"] == (:script, "", "")
+            # A configuration's patterns are relative to its directory when the sweep is of part of
+            # it, and what they exclude comes after what only the sweep leaves out: the rest of that
+            # directory, and what `--exclude` excludes there.
+            file = discovery_write(root, ".JETSweep.toml", "exclude = [\"Sibling/test\", \"vendor\"]\n")
+            inventory = discover(root; exclude=["Sibling"], config=JETSweep.read_config(root, file))
+            @test available(inventory) == [["Sibling"; ignored], ["Sibling/vendor/Vendored"]]
+            inventory = discover(kept; config=JETSweep.read_config(kept, file))
+            @test discovery_files(inventory) == ["src/Kept.jl"]
+            @test available(inventory) == [relpath.(joinpath.(root, ["Sibling"; ignored]), kept), ["../Sibling/vendor/Vendored"]]
+            @test isempty(inventory.issues) && isempty(inventory.excluded)
+            # `--exclude` applies within the directory swept.
+            @test available(discover(kept; exclude=["vendor"], config=JETSweep.read_config(kept, file))) == available(inventory)
+            inventory = discover(sibling; config=JETSweep.read_config(sibling, file))
+            @test discovery_files(inventory) == [relpath.(joinpath.(root, ignored, "src", "Ignored.jl"), sibling); "src/Sibling.jl"]
+            @test available(inventory) == [["../Kept"], ["vendor/Vendored"]]
+            @test discovery_files(discover(sibling; exclude=["Sibling/test"])) ==
+                  [relpath.(joinpath.(root, ignored, "src", "Ignored.jl"), sibling); "src/Sibling.jl"; "test/runtests.jl";
+                   "vendor/Vendored/src/Vendored.jl"]
+            @test isempty(discover(sibling; config=JETSweep.read_config(sibling, file)).issues) && !isempty(discover(sibling).issues)
+            # Globs of a configuration whose directory is not above the sweep's are relative to the
+            # directory swept, so all paths are within the directory they are relative to.
+            @test JETSweep.read_config(sibling, file).directory == root
+            @test JETSweep.read_config(root, file).directory == root
+            @test JETSweep.read_config(root, discovery_write(sibling, "tools/.JETSweep.toml", "")).directory == root
+            @test isempty(discover(kept; config=JETSweep.read_config(kept, joinpath(sibling, "tools/.JETSweep.toml"))).available[1])
         end
-        available(inventory) = [[discovery_relative(inventory, p.dir) for p in tier] for tier in inventory.available]
-        ignored = git ? String[] : ["Sibling/ignored/Ignored"]
-        inventory = discover(root; exclude=["Sibling"])
-        @test discovery_files(inventory) == ["Kept/src/Kept.jl"]
-        @test [p.dir for p in inventory.projects] == [kept]
-        @test available(inventory) == [["Sibling"; ignored; "Sibling/vendor/Vendored"], String[]]
-        @test isempty(inventory.issues)
-        @test discovery_reasons(inventory) == Dict("Sibling" => "excluded by pattern")
-        # An excluded project file is left out with the rest.
-        inventory = discover(root; exclude=["Sibling/Project.toml"])
-        @test !any(p -> p.dir == sibling, inventory.projects) && all(isempty, inventory.available)
-        @test discovery_placement(inventory)["Sibling/src/Sibling.jl"] == (:script, "", "")
-        # A configuration's patterns are relative to its directory when the sweep is of part of
-        # it, and what they exclude comes after what only the sweep leaves out: the rest of that
-        # directory, and what `--exclude` excludes there.
-        file = discovery_write(root, ".JETSweep.toml", "exclude = [\"Sibling/test\", \"vendor\"]\n")
-        inventory = discover(root; exclude=["Sibling"], config=JETSweep.read_config(root, file))
-        @test available(inventory) == [["Sibling"; ignored], ["Sibling/vendor/Vendored"]]
-        inventory = discover(kept; config=JETSweep.read_config(kept, file))
-        @test discovery_files(inventory) == ["src/Kept.jl"]
-        @test available(inventory) == [relpath.(joinpath.(root, ["Sibling"; ignored]), kept), ["../Sibling/vendor/Vendored"]]
-        @test isempty(inventory.issues) && isempty(inventory.excluded)
-        # `--exclude` applies within the directory swept.
-        @test available(discover(kept; exclude=["vendor"], config=JETSweep.read_config(kept, file))) == available(inventory)
-        inventory = discover(sibling; config=JETSweep.read_config(sibling, file))
-        @test discovery_files(inventory) == [relpath.(joinpath.(root, ignored, "src", "Ignored.jl"), sibling); "src/Sibling.jl"]
-        @test available(inventory) == [["../Kept"], ["vendor/Vendored"]]
-        @test discovery_files(discover(sibling; exclude=["Sibling/test"])) ==
-              [relpath.(joinpath.(root, ignored, "src", "Ignored.jl"), sibling); "src/Sibling.jl"; "test/runtests.jl";
-               "vendor/Vendored/src/Vendored.jl"]
-        @test isempty(discover(sibling; config=JETSweep.read_config(sibling, file)).issues) && !isempty(discover(sibling).issues)
-        # Globs of a configuration whose directory is not above the sweep's are relative to the
-        # directory swept, so all paths are within the directory they are relative to.
-        @test JETSweep.read_config(sibling, file).directory == root
-        @test JETSweep.read_config(root, file).directory == root
-        @test JETSweep.read_config(root, discovery_write(sibling, "tools/.JETSweep.toml", "")).directory == root
-        @test isempty(discover(kept; config=JETSweep.read_config(kept, joinpath(sibling, "tools/.JETSweep.toml"))).available[1])
     end
 end
 
-@testset "JETSweep._glob" begin
+@testitem "JETSweep._glob" setup=[Discovery] begin
     matches(pattern, path) = occursin(JETSweep._glob(pattern), path)
     @test matches("*.jl", "a.jl") && !matches("*.jl", "a/b.jl") && !matches("*.jl", "a.jlx")
     @test matches("?.jl", "a.jl") && !matches("?.jl", "ab.jl") && !matches("a?b", "a/b")
@@ -363,7 +374,7 @@ end
     @test matches("é*/ü?.jl", "éa/üb.jl") && !matches("é*/ü?.jl", "éa/übc.jl")
 end
 
-@testset "Hidden, dependency and cache directories outside Git" begin
+@testitem "Hidden, dependency and cache directories outside Git" setup=[Discovery] begin
     mktempdir() do root
         for file in (".hidden/x.jl", ".jetsweep/run/worker.jl", ".dotfile.jl", "node_modules/x.jl",
                      "a/node_modules/y.jl", "__pycache__/z.jl", "a/__pycache__/w.jl", "kept.jl", "a/kept.jl")
@@ -380,7 +391,7 @@ end
     end
 end
 
-@testset "Report output is excluded, also through an alias of the root" begin
+@testitem "Report output is excluded, also through an alias of the root" setup=[Discovery] begin
     mktempdir() do directory
         root = mkpath(joinpath(directory, "actual"))
         alias = joinpath(directory, "alias")
@@ -403,25 +414,27 @@ end
     end
 end
 
-@testset "Directories tagged as caches are excluded, such as earlier reports (Git: $git)" for git in (false, true)
-    mktempdir() do root
-        discovery_write(root, "input.jl")
-        # An earlier report: its tag, generated entries and environments.
-        discovery_write(root, "reports/a/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n# A tag.\n")
-        discovery_write(root, "reports/a/units/script-1/entry.jl")
-        discovery_write(root, "reports/a/environments/1/env/Project.toml", "")
-        # Only the signature marks a cache.
-        discovery_write(root, "notes/CACHEDIR.TAG", "Signature: none\n")
-        discovery_write(root, "notes/kept.jl")
-        git && discovery_git(root, "reports/a/units/script-1/entry.jl")
-        inventory = discover(root)
-        @test discovery_files(inventory) == ["input.jl", "notes/kept.jl"]
-        @test isempty(inventory.projects) && isempty(inventory.issues)
-        @test discovery_reasons(inventory) == Dict("reports/a" => "tagged cache directory")
+@testitem "Directories tagged as caches are excluded, such as earlier reports" setup=[Discovery] begin
+    @testset "Directories tagged as caches are excluded, such as earlier reports (Git: $git)" for git in (false, true)
+        mktempdir() do root
+            discovery_write(root, "input.jl")
+            # An earlier report: its tag, generated entries and environments.
+            discovery_write(root, "reports/a/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n# A tag.\n")
+            discovery_write(root, "reports/a/units/script-1/entry.jl")
+            discovery_write(root, "reports/a/environments/1/env/Project.toml", "")
+            # Only the signature marks a cache.
+            discovery_write(root, "notes/CACHEDIR.TAG", "Signature: none\n")
+            discovery_write(root, "notes/kept.jl")
+            git && discovery_git(root, "reports/a/units/script-1/entry.jl")
+            inventory = discover(root)
+            @test discovery_files(inventory) == ["input.jl", "notes/kept.jl"]
+            @test isempty(inventory.projects) && isempty(inventory.issues)
+            @test discovery_reasons(inventory) == Dict("reports/a" => "tagged cache directory")
+        end
     end
 end
 
-@testset "Symlinks are never followed: cycles, aliases, outside targets and broken links" begin
+@testitem "Symlinks are never followed: cycles, aliases, outside targets and broken links" setup=[Discovery] begin
     mktempdir() do sandbox
         root = mkpath(joinpath(sandbox, "root"))
         outside = discovery_write(sandbox, "outside/external.jl")
@@ -454,7 +467,7 @@ end
     end
 end
 
-@testset "Unresolvable symlinks are excluded, not fatal" begin
+@testitem "Unresolvable symlinks are excluded, not fatal" setup=[Discovery] begin
     mktempdir() do sandbox
         root = mkpath(joinpath(sandbox, "root"))
         discovery_write(root, "kept.jl")
@@ -473,7 +486,7 @@ end
     end
 end
 
-@testset "Git: tracked, ignored, untracked, hidden and nested repositories" begin
+@testitem "Git: tracked, ignored, untracked, hidden and nested repositories" setup=[Discovery] begin
     mktempdir() do root
         nested = joinpath(root, "nested repo")
         for file in ("ignored/retained.jl", "ignored/dropped.jl", "generated/result.jl", "untracked file.jl",
@@ -522,7 +535,7 @@ end
     end
 end
 
-@testset "Repositories linked by .git files and unreadable repositories" begin
+@testitem "Repositories linked by .git files and unreadable repositories" setup=[Discovery] begin
     mktempdir() do sandbox
         root = mkpath(joinpath(sandbox, "root"))
         linked = joinpath(root, "linked")
@@ -545,31 +558,33 @@ end
     end
 end
 
-@testset "Unreadable directories are recorded as issues (Git: $git)" for git in (false, true)
-    mktempdir() do root
-        discovery_write(root, "open.jl")
-        git && discovery_git(root, "open.jl")
-        locked = mkpath(joinpath(root, "locked"))
-        chmod(locked, 0o000)
-        try
-            denied = try
-                readdir(locked)
-                false
-            catch
-                true
+@testitem "Unreadable directories are recorded as issues" setup=[Discovery] begin
+    @testset "Unreadable directories are recorded as issues (Git: $git)" for git in (false, true)
+        mktempdir() do root
+            discovery_write(root, "open.jl")
+            git && discovery_git(root, "open.jl")
+            locked = mkpath(joinpath(root, "locked"))
+            chmod(locked, 0o000)
+            try
+                denied = try
+                    readdir(locked)
+                    false
+                catch
+                    true
+                end
+                inventory = discover(root)
+                @test discovery_files(inventory) == ["open.jl"]
+                issue = joinpath(inventory.root, "locked") * ": cannot list directory: "
+                # Permissions do not deny a superuser, who then has no issue to record.
+                @test startswith(only(inventory.issues), issue) skip=!denied
+            finally
+                chmod(locked, 0o755)
             end
-            inventory = discover(root)
-            @test discovery_files(inventory) == ["open.jl"]
-            issue = joinpath(inventory.root, "locked") * ": cannot list directory: "
-            # Permissions do not deny a superuser, who then has no issue to record.
-            @test startswith(only(inventory.issues), issue) skip=!denied
-        finally
-            chmod(locked, 0o755)
         end
     end
 end
 
-@testset "Discovery is deterministic" begin
+@testitem "Discovery is deterministic" setup=[Discovery] begin
     mktempdir() do directory
         root = mkpath(joinpath(directory, "root"))
         for name in ("Zeta", "Alpha", "Mu")
