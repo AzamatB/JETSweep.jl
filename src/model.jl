@@ -121,7 +121,7 @@ complete(result::UnitResult) = result.status in (:clean, :findings)
 
 "Controls shared by the command line and the Julia API."
 Base.@kwdef struct SweepOptions
-    jobs::Int = default_jobs()
+    jobs::Int = Sys.CPU_THREADS
     threads::Int = 4
     timeout::Float64 = 1800.0
     output::String = ""
@@ -135,8 +135,18 @@ Base.@kwdef struct SweepOptions
     tracked_only::Bool = false
 end
 
-"Parallel workers that fit the machine: one per core, at most one per 3 GiB of memory."
-default_jobs() = max(1, min(Sys.CPU_THREADS, Int(Sys.total_memory() ÷ (3 * 1024^3))))
+"The memory a worker is planned with: about what an analysis of a large package takes."
+const WORKER_MEMORY = 3 * 1024^3
+
+"""
+    worker_cap(threads=Sys.CPU_THREADS, free=Sys.free_memory()) -> Int
+
+The `jobs` slots that fit the machine: one per CPU thread and one per `WORKER_MEMORY` of free
+memory, at least one. Every sweep of a process takes its slots from these: the process uses at
+most `worker_cap()` at once, as it was when none was in use, whatever `jobs` asks.
+"""
+worker_cap(threads::Integer=Sys.CPU_THREADS, free::Integer=Sys.free_memory()) =
+    max(1, min(Int(threads), Int(free ÷ WORKER_MEMORY)))
 
 "A finished sweep: its inventory, units, their results, and the derived exit code."
 struct SweepResult

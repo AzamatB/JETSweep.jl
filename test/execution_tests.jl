@@ -6,12 +6,16 @@ execution_context(name) = JETSweep.Context("/execution/$name", "", false, Dict{S
 
 execution_task(name, weight=1, priority=(0, 0)) = JETSweep._Task(weight, priority, execution_context(name))
 
+"No cap on the slots of the process (`JETSweep.worker_cap`): the dispatch tests check a dispatch's own capacity."
+execution_uncapped() = typemax(Int)
+
 execution_name(task) = basename((task.work::JETSweep.Context).project)
 
 "Dispatch `tasks`, recording start and end events and the peak clamped weight in use."
-function execution_trace(tasks, capacity; followups=Dict{String,Vector{JETSweep._Task}}(), pause=0.02)
+function execution_trace(tasks, capacity; followups=Dict{String,Vector{JETSweep._Task}}(), pause=0.02,
+                         cap=execution_uncapped)
     load, peak, events = Ref(0), Ref(0), String[]
-    dispatcher = @async JETSweep._dispatch(tasks, capacity) do task
+    dispatcher = @async JETSweep._dispatch(tasks, capacity; cap) do task
         name, weight = execution_name(task), min(task.weight, capacity)
         load[] += weight
         peak[] = max(peak[], load[])
@@ -171,7 +175,7 @@ function execution_report(output, units, results)
     return String(take!(io)), read(joinpath(output, "summary.txt"), String)
 end
 
-export TOML, execution_context, execution_task, execution_name, execution_trace, execution_alive,
+export TOML, execution_context, execution_task, execution_uncapped, execution_name, execution_trace, execution_alive,
     execution_sh, execution_gone, execution_finding, execution_result, execution_inventory, execution_capture,
     EXECUTION_PACKAGE, execution_unit, execution_sweep, execution_jetls, execution_touch, execution_patterns,
     execution_skips, execution_skip, EXECUTION_DRIVER, EXECUTION_SELECTION, EXECUTION_USER_JETLS, EXECUTION_GLOB,
@@ -193,6 +197,53 @@ end
         @test trace.peak <= capacity
     end
     @test execution_trace([execution_task("u$i") for i in 1:8], 4).peak == 4
+end
+
+# The cap of what a process runs at once, which JETSweep takes from the machine: GitHub's runner and this machine.
+@testitem "A process's slots are capped by its CPU threads and free memory" setup=[Execution] begin
+    GB = 1000^3
+    # This suite's CI runner, GitHub's ubuntu-latest: 4 vCPUs and 16 GB, of which the system holds about 1 GB and the
+    # suite's test processes 3.2 GB when its sweeps start. The sweeps' analysis workers take about 0.85 GB each.
+    runner = JETSweep.worker_cap(4, 16GB - 1GB - 32GB ÷ 10)
+    @test runner == 3   # not 4: the free memory, at 3 GiB a slot, sets it
+    @test runner * 85GB ÷ 100 + 32GB ÷ 10 + 1GB <= 16GB
+    # An 8-vCPU slot of this machine (JULIA_CPU_THREADS=8), with hundreds of GB free, or with the 64 GB of the
+    # g6e.2xlarge it emulates: every vCPU.
+    @test JETSweep.worker_cap(8, 300GB) == 8
+    @test JETSweep.worker_cap(8, 64GB - 1GB - 32GB ÷ 10) == 8
+    @test JETSweep.worker_cap(48, 7 * 1024^3) == 2
+    @test JETSweep.worker_cap(8, 0) == JETSweep.worker_cap(0, 300GB) == 1   # at least one
+    @test 1 <= JETSweep.worker_cap() <= Sys.CPU_THREADS
+    @test SweepOptions().jobs == Sys.CPU_THREADS   # (the cap applies whatever `jobs` asks)
+end
+
+@testitem "Dispatches side by side share the process's slots" setup=[Execution] begin
+    load, peak, ran = Ref(0), Ref(0), String[]
+    loads, peaks = Dict(name => Ref(0) for name in ("a", "b")), Dict(name => Ref(0) for name in ("a", "b"))
+    # (A dispatch that an earlier item interrupted may still be releasing its slots.)
+    timedwait(() -> JETSweep._SHARED.used[] == 0, 60.0; pollint=0.01)
+    # Each dispatch asks for 3 slots, of the 4 the process has.
+    dispatch(name) = JETSweep._dispatch([execution_task("$name$i") for i in 1:6], 3; cap=() -> 4) do task
+        push!(ran, execution_name(task))
+        load[] += 1
+        loads[name][] += 1
+        peak[] = max(peak[], load[])
+        peaks[name][] = max(peaks[name][], loads[name][])
+        sleep(0.05)
+        load[] -= 1
+        loads[name][] -= 1
+        return JETSweep._Task[]
+    end
+    dispatches = [@async(dispatch(name)) for name in ("a", "b")]
+    timedwait(() -> all(istaskdone, dispatches), 60.0; pollint=0.01) === :ok || error("dispatch did not finish")
+    foreach(wait, dispatches)
+    @test sort(ran) == sort(["$name$i" for name in ("a", "b") for i in 1:6])
+    @test peak[] == 4
+    @test peaks["a"][] <= 3 && peaks["b"][] <= 3
+    @test JETSweep._SHARED.used[] == 0
+    # A task heavier than the process's slots is clamped to them and runs alone.
+    trace = execution_trace([execution_task("L", 1, (0, 1)), execution_task("H", 5, (0, 0))], 8; cap=() -> 2)
+    @test trace.events == ["start H", "end H", "start L", "end L"]
 end
 
 @testitem "A task that does not fit blocks later tasks" setup=[Execution] begin
@@ -225,7 +276,7 @@ end
     tasks = [execution_task("slow", 1, (0, 0)), execution_task("bad", 1, (0, 1)),
              (execution_task("rest$i", 1, (1, i)) for i in 1:3)...]
     failure = try
-        JETSweep._dispatch(tasks, 2) do task
+        JETSweep._dispatch(tasks, 2; cap=execution_uncapped) do task
             name = execution_name(task)
             push!(events, "start $name")
             name == "bad" && (notify(failed); error("step failed"))
@@ -251,7 +302,7 @@ end
         started = time()
         tasks = [execution_task("w$i", 1, (0, i)) for i in 1:3]
         failure = try
-            JETSweep._dispatch(tasks, 3) do task
+            JETSweep._dispatch(tasks, 3; cap=execution_uncapped) do task
                 name = execution_name(task)
                 name == "w3" && (sleep(1.0); throw(InterruptException()))
                 JETSweep.run_worker(execution_sh("echo \$\$ > \"\$1\"; exec sleep 60", joinpath(directory, name)),

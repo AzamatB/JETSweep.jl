@@ -3,11 +3,12 @@
 # suite with DispatchCheckup, so there is no checked run here and no original= file.
 #
 # Most of the time goes to the analysis and preparation workers that the sweeps and preparations start
-# themselves: up to 14 at once in the sweeps' item, the first item of 0_integration_tests.jl. ReTestItems starts
+# themselves, most in the sweeps' item, the first item of 0_integration_tests.jl: its four sweeps ask for 14 at
+# once and share the slots JETSweep allows a process, one per CPU thread and per 3 GiB of free memory
+# (`JETSweep.worker_cap`: 8 on an 8-vCPU slot here, 3 on the CI runner's 4 vCPUs and 16 GB). ReTestItems starts
 # its first worker on the first item of the files by name, so the sweeps start at once; the other workers take
 # the rest. That is ReTestItems 1.35's scheduling, not its API: after a ReTestItems upgrade, check that the log's
-# first `START (  1/...)` line is the sweeps' item, on worker 1. NWORKERS keeps the test workers, the analysis
-# workers and this process within 8 vCPUs and the 16 GB of the CI runner.
+# first `START (  1/...)` line is the sweeps' item, on worker 1.
 using JETSweep, ReTestItems
 
 const NWORKERS = 3   # measured at 2, 3, 4 and 6: see the report

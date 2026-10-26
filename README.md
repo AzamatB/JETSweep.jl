@@ -45,7 +45,7 @@ jetsweep --exclude vendor --exclude '**/generated/*.jl' DIRECTORY
 
 | Option | Meaning |
 | --- | --- |
-| `--jobs N` | Analyses run in parallel. Default: the CPU threads, at most one per 3 GiB of memory. |
+| `--jobs N` | Analyses run in parallel (default: the CPU threads), but at most one per CPU thread and per 3 GiB of free memory. |
 | `--threads N` | Threads for package and extension analyses, whose signature analysis is parallel (default 4). Other analyses run single-threaded. |
 | `--timeout SECONDS` | Time limit per analysis or environment, 0 for none (default 1800). JETLS's own limit on evaluating each top-level statement, which counts compilation and so grows with load, is 300 s instead of its editor default of 10 s, unless `.JETLSConfig.toml` sets `full_analysis.concretization_timeout`. |
 | `--gpus auto\|none\|LIST` | GPUs assigned round-robin through `CUDA_VISIBLE_DEVICES` (default `auto`: the visible devices). |
@@ -216,9 +216,11 @@ The scheduler prepares environments first, then starts the longest analyses, as 
 the latest report in `DIRECTORY/.jetsweep` if the same JETSweep version wrote it, or
 estimated from source size, and assigns GPUs round-robin. Each analysis takes one of the
 `--jobs` slots: package analyses run on `--threads` threads, but use little more than one core
-on average. Workers run with Julia's default code generation flags, so they share the
-package images of ordinary sessions. On Linux without a display, they share a virtual one
-when Xvfb is installed, so packages that open windows when they load, such as GLMakie, load.
+on average. Whatever `--jobs` asks, a process uses at most one slot per CPU thread
+(`Sys.CPU_THREADS`) and per 3 GiB of free memory (`Sys.free_memory()`, taken when it has no
+slot in use), and the sweeps it runs side by side share them. Workers run with Julia's
+default code generation flags, so they share the package images of ordinary sessions. On
+Linux without a display, they share a virtual one when Xvfb is installed, so packages that open windows when they load, such as GLMakie, load.
 Analysis is static, but it loads packages and runs their
 initialization, macros and generated functions, and the code JETLS evaluates to analyze
 scripts: use JETSweep only on code you trust.
