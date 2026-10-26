@@ -54,7 +54,8 @@ end
 paths = isempty(ARGS) ? [@__DIR__] : [joinpath(@__DIR__, f) for f in ARGS]
 # (No full garbage collection after each item: these workers' heaps are large, and measured side by side, the runs
 # without it were faster.) The item timeout, 1200 s, is above the sweeps' own 900 s limit per unit, so a unit that
-# hangs is reported by its sweep, and leaves the sweeps' item (about 300 s on 8 vCPUs) room on CI's 4 vCPUs.
+# hangs is reported by its sweep, and leaves the sweeps' item room on CI's runner: it takes about 270 s on 8 vCPUs, and
+# 570 s on 4 vCPUs with 4 slots (the runner's memory allows 3).
 ReTestItems.runtests(paths...; nworkers=NWORKERS, nworker_threads=1, retries=0, testitem_timeout=1200,
                      validate_paths=true, gc_between_testitems=false,
                      test_end_expr=Expr(:block, WRITE_COVERAGE, WORKER_CHECKS),
