@@ -3,6 +3,7 @@
 @testitem "workers: the main process's flags and package" begin
     @test Base.JLOptions().depwarn == 2
     @test Base.JLOptions().depwarn == Main.MAIN_DEPWARN
+    @test Base.JLOptions().check_bounds == 1   # --check-bounds=yes, which Pkg.test passes
     @test Base.JLOptions().check_bounds == Main.MAIN_CHECK_BOUNDS
     @test pathof(JETSweep) == Main.MAIN_PATHOF
 end
