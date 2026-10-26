@@ -10,12 +10,15 @@ all(in(TEST_FILES), SELECTED) || error("unknown test files: $(join(setdiff(SELEC
 # development mode, as prepared environments have it. Precompile one such environment while
 # test_execution.jl runs: the sweeps would otherwise compile it once per environment they
 # prepare at the same time, and the preparations in depots of their own again.
-analyzer = if any(in(SELECTED), ("test_environments.jl", "test_integration.jl"))
-    environment = JETSweep.prepare(JETSweep.Context("", "", false, Dict{String,String}()), mktempdir())
-    JETSweep.ready(environment) || error("cannot prepare an analysis environment: ", environment.message)
-    julia = joinpath(Sys.BINDIR, Base.julia_exename())
-    command = `$julia --startup-file=no --project=$(environment.dir) -e 'using Pkg; Pkg.precompile()'`
-    run(addenv(command, "JULIA_LOAD_PATH" => "@:@stdlib"); wait=false)
+# A failed precompile costs only time: the sweeps then compile the analyzer themselves.
+const ANALYZER = if any(in(SELECTED), ("test_environments.jl", "test_integration.jl"))
+    let environment = JETSweep.prepare(JETSweep.Context("", "", false, Dict{String,String}()), mktempdir())
+        JETSweep.ready(environment) || error("cannot prepare an analysis environment: ", environment.message)
+        julia = joinpath(Sys.BINDIR, Base.julia_exename())
+        command = `$julia --startup-file=no --project=$(environment.dir) -e 'using Pkg; Pkg.precompile()'`
+        process = run(addenv(command, "JULIA_LOAD_PATH" => "@:@stdlib"); wait=false)
+        @async success(process) || @warn "Precompiling the analyzer failed; the sweeps compile it themselves"
+    end
 end
 
 @testset "JETSweep" begin
@@ -24,7 +27,7 @@ end
     "test_execution.jl" in SELECTED && @testset "test_execution.jl" include("test_execution.jl")
     @sync for file in filter(!=("test_execution.jl"), SELECTED)
         @async begin
-            file in ("test_environments.jl", "test_integration.jl") && wait(analyzer)
+            file in ("test_environments.jl", "test_integration.jl") && wait(ANALYZER)
             @testset "$file" include(joinpath(@__DIR__, file))
         end
     end

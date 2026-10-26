@@ -76,6 +76,7 @@ working directory; `env` adds to the worker's environment variables.
 """
 function _prepare(context::Context, directory::String, options::SweepOptions;
                   env::Dict{String,String}=Dict{String,String}())
+    directory = abspath(directory)
     request = _write_toml(joinpath(directory, "request.toml"), Dict(
         "project" => context.project, "owner" => context.owner, "test" => context.test,
         "triggers" => context.triggers, "imports" => context.imports, "directory" => joinpath(directory, "env"),
