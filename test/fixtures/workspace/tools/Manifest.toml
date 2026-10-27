@@ -1,0 +1,16 @@
+# This file is machine-generated - editing it directly is not advised
+
+julia_version = "1.13.3"
+manifest_format = "2.1"
+project_hash = "3f98fe1c350169c24166f30f6435f1f50adfd336"
+
+[[deps.Witness]]
+path = "../Witness"
+uuid = "4b656040-21d6-4560-9bd0-3816743acc86"
+version = "0.1.0"
+
+    [deps.Witness.extensions]
+    WitnessTestExt = "Test"
+
+    [deps.Witness.weakdeps]
+    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
