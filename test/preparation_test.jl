@@ -793,6 +793,59 @@ end
     end
 end
 
+@testitem "workspace compatibility does not constrain the analyzer's private namesakes" setup=[Environments, Analyzer] begin
+    _environments_sandbox() do root, envs
+        jet, jet_uuid = _environments_package(joinpath(root, "checkouts"), "JET";
+            uuid="c3a54625-cd67-489e-a8e7-0a5a0ff4e31b", version="0.9.0")
+        parent, _ = _environments_package(root, "WorkspaceJETDeveloper";
+            workspace=Dict("projects" => ["test"]))
+        member = joinpath(parent, "test", "Project.toml")
+        function require_jet(bound)
+            _environments_write(member, Dict(
+                "deps" => Dict("JET" => jet_uuid),
+                "compat" => Dict("JET" => bound),
+                "sources" => Dict("JET" => Dict("path" => "../../checkouts/JET"))))
+        end
+        require_jet("=0.9.0")
+        before = _environments_snapshot(root)
+        environment = _environments_prepare(_environments_context(parent), joinpath(envs, "valid"))
+        @test environment == _environments_ready(joinpath(envs, "valid"))
+        @test _environments_snapshot(root) == before
+        if JETSweep.ready(environment)
+            manifest = _environments_manifest(environment)
+            vendored = _environments_tool("JET")
+            @test (manifest[UUID(jet_uuid)].version, _environments_path(environment, jet_uuid)) == (v"0.9.0", jet)
+            @test manifest[vendored.uuid].version == vendored.version
+            # Restoring the workspace bounds before recording the hash keeps the manifest current.
+            @test Pkg.Operations.is_manifest_current(Pkg.Types.EnvCache(joinpath(environment.dir, "Project.toml")))
+        end
+
+        # The member's bound still applies to its own JET, even though its private namesake is exempt.
+        require_jet("=0.8.0")
+        before = _environments_snapshot(root)
+        incompatible = _environments_prepare(_environments_context(parent), joinpath(envs, "invalid"))
+        @test incompatible.status === :failed
+        @test occursin("JET", incompatible.message) && occursin("0.8", incompatible.message)
+        @test _environments_snapshot(root) == before
+
+        # Re-resolution discovers this JET through a developed dependency after building
+        # its initial PackageSpecs. A workspace weakdep's bound must still be enforced.
+        _, container_uuid = _environments_package(root, "JETContainer";
+            deps=Dict("JET" => jet_uuid), sources=Dict("JET" => Dict("path" => "../checkouts/JET")))
+        weak_parent, _ = _environments_package(root, "WeakWorkspaceJETDeveloper";
+            deps=Dict("JETContainer" => container_uuid),
+            sources=Dict("JETContainer" => Dict("path" => "../JETContainer")),
+            workspace=Dict("projects" => ["test"]))
+        _environments_write(joinpath(weak_parent, "test", "Project.toml"), Dict(
+            "weakdeps" => Dict("JET" => jet_uuid), "compat" => Dict("JET" => "=0.8.0")))
+        before = _environments_snapshot(root)
+        weak = _environments_prepare(_environments_context(weak_parent), joinpath(envs, "weak"))
+        @test weak.status === :failed
+        @test occursin("JET", weak.message) && occursin("0.8", weak.message)
+        @test _environments_snapshot(root) == before
+    end
+end
+
 @testitem "preparation never runs dependency build scripts, including the re-resolve fallback" setup=[Environments, Analyzer] begin
     _environments_sandbox() do root, envs
         dependency_uuid = string(uuid4())

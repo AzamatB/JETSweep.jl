@@ -15,11 +15,11 @@ code and so on — and says plainly which analyses could not complete, and why.
 
 ## Install
 
-JETSweep requires Julia 1.13. It uses JETLS 2026.10.21, pinned to that release's commit
+JETSweep requires Julia 1.13. It uses JETLS 2026.10.26, pinned to that release's commit
 because the analysis entry points it drives are internal to JETLS, and JETLS's Revise-based
 package analysis, which only its development mode enables. JETLS releases leave out the
 Revise that mode loads, so JETSweep adds it. JETSweep's own environment has a Revise 3
-release no older than 3.17.3, the latest of the series JETLS's development branch uses; an
+release no older than 3.18.0, the latest of the series JETLS's development branch uses; an
 analyzed project keeps a Revise it locks from that series on, and otherwise gets JETSweep's.
 
 ```julia

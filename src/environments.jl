@@ -440,6 +440,48 @@ function lock_clones!()
     return nothing
 end
 
+"Resolve workspace bounds by UUID when the analyzer has a private package of the same name."
+function _resolve_workspace_versions!(ctx, packages)
+    hidden = Tuple{Pkg.Types.Project,String,Pkg.Types.Compat}[]
+    bounds = Dict{UUID,Pkg.Types.VersionSpec}()
+    try
+        # Pkg intersects workspace compat by name, including anonymous test projects.
+        # Keep each member's constraint on its own dependency, without constraining a
+        # private namesake such as JETLS's JET. Restore the members before Pkg records
+        # the manifest hash; the original workspace files are never written.
+        for project in values(ctx.env.workspace), (name, compat) in collect(project.compat)
+            name == "julia" && continue
+            uuid = get(project.deps, name, get(project.weakdeps, name, get(project.extras, name, nothing)))
+            uuid === nothing && continue
+            any(entry -> entry.name == name && entry.uuid != uuid, values(ctx.env.manifest)) || continue
+            push!(hidden, (project, name, pop!(project.compat, name)))
+            bounds[uuid] = intersect(get(bounds, uuid, Pkg.Types.VersionSpec()), compat.val)
+        end
+        for package in packages
+            bound = get(bounds, package.uuid, nothing)
+            bound === nothing && continue
+            allowed = intersect(package.version, bound)
+            isempty(allowed) && throw(Pkg.Resolve.ResolverError(
+                "$(package.name)@$(package.version) does not satisfy its workspace compatibility $bound"))
+            package.version isa VersionNumber || (package.version = allowed)
+        end
+        dependencies = Pkg.Operations.resolve_versions!(ctx.env, ctx.registries, packages, ctx.julia_version, false)
+        # Resolution can add transitive packages and refresh fixed versions from their
+        # sources. Check those final versions too, including workspace weak dependencies.
+        for package in packages
+            bound = get(bounds, package.uuid, nothing)
+            bound === nothing && continue
+            package.version in bound || throw(Pkg.Resolve.ResolverError(
+                "$(package.name)@$(package.version) does not satisfy its workspace compatibility $bound"))
+        end
+        return dependencies
+    finally
+        for (project, name, compat) in hidden
+            project.compat[name] = compat
+        end
+    end
+end
+
 """
 Resolve and download with Pkg's own stages, stopping before the build step that
 `Pkg.resolve` would run. `exact` keeps the seed manifest's versions.
@@ -468,7 +510,7 @@ function _resolve!(ctx::Pkg.Types.Context; exact::Bool, download::Bool)
     end
     packages = ops.load_direct_deps(ctx.env, packages; preserve=exact ? Pkg.PRESERVE_NONE : Pkg.PRESERVE_DIRECT)
     ops.check_registered(ctx.registries, packages)
-    dependencies = ops.resolve_versions!(ctx.env, ctx.registries, packages, ctx.julia_version, false)
+    dependencies = _resolve_workspace_versions!(ctx, packages)
     ops.update_manifest!(ctx.env, packages, dependencies, ctx.julia_version, ctx.registries)
     download && ops.download_source(ctx)
     ops.fixups_from_projectfile!(ctx)
