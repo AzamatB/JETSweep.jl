@@ -645,7 +645,7 @@ function sweep(root::AbstractString; options::SweepOptions=SweepOptions(), io::I
         end
         return [_task(unit, previous) for unit in followups]
     end
-    with_display(() -> _dispatch(step, [_task(context, members[context], previous) for context in contexts], options.jobs))
+    _dispatch(step, [_task(context, members[context], previous) for context in contexts], options.jobs)
     after = _snapshot(discover(root; exclude=options.exclude, config, output,
                                include_ignored=options.include_ignored, tracked_only=options.tracked_only), config)
     changed = sort!([file for file in union(keys(before), keys(after)) if get(before, file, "") != get(after, file, "")])
