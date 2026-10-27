@@ -3,3 +3,6 @@ Witness = "4b656040-21d6-4560-9bd0-3816743acc86"
 
 [sources]
 Witness = {path = "../Witness"}
+
+[compat]
+julia = "1.13.3"
