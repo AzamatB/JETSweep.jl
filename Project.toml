@@ -16,13 +16,13 @@ JETLS = {rev = "c24f9a1f40fbe2873919b7af7da22af594e3566d", url = "https://github
 
 [compat]
 JETLS = "=2026.10.26"
-LibGit2 = "1"
-Pkg = "1.13"
-ReTestItems = "1.35"
+LibGit2 = "1.11.0"
+Pkg = "1.13.0"
+ReTestItems = "1.35.3"
 Revise = "3.18.0"
-SHA = "1"
-TOML = "1"
-julia = "1.13"
+SHA = "1.0.0"
+TOML = "1.0.3"
+julia = "1.13.3"
 
 [apps.jetsweep]
 julia_flags = ["--startup-file=no", "--history-file=no"]
