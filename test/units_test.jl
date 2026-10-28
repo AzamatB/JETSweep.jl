@@ -687,21 +687,32 @@ end
         case = planning_file(package, "test/cases/case.jl", "@test true\n")
         environment = planning_project(root, "Pkg/validation")
         script = planning_file(environment, "corpus/build.jl")
-        whole = plan(discover(root))
+        # A test item that includes a script of its package, outside the test directory, gets what it imports.
+        sibling = planning_package(root, "Sibling", "Sibling")
+        planning_file(sibling, "src/Sibling.jl", "module Sibling\nend\n")
+        planning_file(package, "scripts/gate.jl", "using Sibling\n")
+        gate = planning_file(package, "test/gate_test.jl",
+                             "@testitem \"gate\" begin\n    include(joinpath(@__DIR__, \"..\", \"scripts\", \"gate.jl\"))\nend\n")
         planning_file(root, ".JETSweep.toml")
+        config = JETSweep.read_config(root)
+        whole = plan(discover(root; config), config)
+        @test planning_unit(whole, gate).context.imports == Dict("Sibling" => sibling)
         for part_of in ("Pkg/test", "Pkg/test/cases", "Pkg/validation/corpus", "Pkg/src/sub")
-            inventory = discover(joinpath(root, part_of); config=JETSweep.read_config(root))
+            inventory = discover(joinpath(root, part_of); config)
             # The projects above the directory are those the sweep is in, not packages it leaves out.
             @test package in (project.dir for project in inventory.projects)
             @test !any(tier -> any(project -> project.dir == package, tier), inventory.available)
-            units = plan(inventory)
+            units = plan(inventory, config)
             @test !isempty(units)
             for unit in units
                 same = planning_unit(whole, unit.entry)
-                @test (unit.kind, unit.context, unit.driver, unit.expected) ==
-                      (same.kind, same.context, same.driver, filter(in(unit.expected), same.expected))
+                @test (unit.kind, unit.context.project, unit.context.owner, unit.context.test, unit.driver, unit.expected) ==
+                      (same.kind, same.context.project, same.context.owner, same.context.test, same.driver,
+                       filter(in(unit.expected), same.expected))
             end
         end
+        @test planning_unit(plan(discover(joinpath(package, "test"); config), config), gate).context.imports ==
+              Dict("Sibling" => sibling)
         # The package of a sweep of part of its sources is analyzed, as its entry loads them.
         @test only(plan(discover(joinpath(package, "src", "sub")))).entry == entry
         @test planning_unit(plan(discover(joinpath(package, "test", "cases"))), case).driver == driver

@@ -884,8 +884,10 @@ end)
 """
 Whether the top-level code `frame` infers returns only through its current block: whether that
 block dominates every `return` that a path from its entry reaches without calling `throw` or
-`rethrow`. Lowering ends the code a `finally` block runs before an exception propagates with a
-`rethrow` and a `return` that never runs.
+`rethrow`, and, in code without loops, which inference reaches in the order of its blocks,
+through the earlier blocks inference reached. Lowering ends the code a `finally` block runs
+before an exception propagates with a `rethrow` and a `return` that never runs, and in a `try`
+block with a `finally` block of its own, sets a flag after that `rethrow` that leads to another.
 """
 function returns_through(frame::CC.InferenceState)
     code, blocks = frame.src.code, frame.cfg.blocks
@@ -897,10 +899,12 @@ function returns_through(frame::CC.InferenceState)
         return f isa GlobalRef && f.name in (:throw, :rethrow) && isdefinedglobal(f.mod, f.name) &&
             getglobal(f.mod, f.name) in (throw, rethrow)
     end
+    ordered = all(b -> all(>(b), blocks[b].succs), eachindex(blocks))
     reached, pending = Set([1]), [1]
     domtree = CC.construct_domtree(frame.cfg)
     while !isempty(pending)
         b = pop!(pending)
+        ordered && b < frame.currbb && frame.bb_vartables[b] === nothing && continue
         any(pc -> throws(code[pc]), blocks[b].stmts) && continue
         code[last(blocks[b].stmts)] isa Core.ReturnNode && !CC.dominates(domtree, frame.currbb, b) && return false
         foreach(s -> s in reached || (push!(reached, s); push!(pending, s)), blocks[b].succs)

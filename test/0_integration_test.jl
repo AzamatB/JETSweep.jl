@@ -683,7 +683,8 @@
                     lib_field() = Spot(1).y
                     lib_failure() = sin("lib")
                     """)
-                # A global assigned the value of a `try` block with a `finally` block is defined after it.
+                # A global assigned the value of a `try` block with a `finally` block is defined after it,
+                # also when the block holds one of its own.
                 write(joinpath(root, "finally.jl"), """
                     flag = try
                         rand(Bool)
@@ -691,6 +692,18 @@
                         nothing
                     end
                     println(!flag)
+                    nested = try
+                        try
+                            rand(Bool)
+                        catch
+                            false
+                        finally
+                            nothing
+                        end
+                    finally
+                        nothing
+                    end
+                    println(!nested)
                     const ONE = try 1 finally nothing end
                     println(ONE + "one")
                     if rand(Bool)
@@ -789,7 +802,7 @@
                 @test [(f.line, f.code) for f in unit("Tested/test/triple_test.jl").findings] == [(3, "inference/method-error")]
                 @test sort!([(basename(f.file), f.line, f.code) for f in unit("configs/a/main.jl").findings]) ==
                       [("lib.jl", 4, "inference/field-error"), ("main.jl", 6, "inference/method-error")]
-                @test errors("finally.jl") == [8] && [f.line for f in undefined("finally.jl")] == [12]
+                @test errors("finally.jl") == [20] && [f.line for f in undefined("finally.jl")] == [24]
                 @test status("uses_sibling.jl") === :findings
                 sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
                 @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)

@@ -776,6 +776,14 @@ end
         base, data = execution_jetls(execution_unit(driver; setup=[setup]), root)
         @test execution_concretized(data, "const DIR = @__DIR__", files, base) == [driver]
         @test execution_concretized(data, "const MODE = \"fast\"", files, base) == [setup]
+
+        # A file outside JETLS's root, as one a test of part of a package includes, by its absolute path.
+        mktempdir() do outside
+            far = execution_touch(joinpath(outside, "far[1].jl"), "const FAR = 1\n")
+            _, data = execution_jetls(execution_unit(driver; setup=[far]), root)
+            paths = [path for (pattern, path) in execution_patterns(data) if pattern == "const FAR = 1"]
+            @test execution_selected(paths, [far, joinpath(outside, "far1.jl")], root) == [far]
+        end
     end
 end
 

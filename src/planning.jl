@@ -84,9 +84,10 @@ function _exported!(exports::Dict{String,Dict{Symbol,String}}, syntax::Dict{Stri
 end
 
 """
-The include facts of every inventoried source. An include that names a path through a
-constant another file defines, as `include(joinpath(LIBDIR, "x.jl"))` after including the
-file that defines `LIBDIR`, resolves on a second pass.
+The include facts of every inventoried source, and of the files they include from outside the
+sweep. An include that names a path through a constant another file defines, as
+`include(joinpath(LIBDIR, "x.jl"))` after including the file that defines `LIBDIR`, resolves
+on a second pass.
 """
 function source_syntax(inventory::Inventory)
     projects = Dict(project.dir => project for project in inventory.projects)
@@ -98,6 +99,15 @@ function source_syntax(inventory::Inventory)
     for source in inventory.sources
         any(include -> isempty(include.target), syntax[source.path].includes) &&
             (syntax[source.path] = parse_source(source.path, _packages(source, projects); exports))
+    end
+    # Files the sources include from outside the sweep, as the tests of a sweep of a package's test
+    # directory may include its scripts: what they include and import counts as in a sweep of all.
+    pending = [(include.target, source) for source in inventory.sources for include in syntax[source.path].includes]
+    while !isempty(pending)
+        file, source = pop!(pending)
+        (isempty(file) || haskey(syntax, file) || !isfile(file)) && continue
+        syntax[file] = parse_source(file, _packages(source, projects); exports)
+        append!(pending, ((include.target, source) for include in syntax[file].includes))
     end
     return syntax
 end

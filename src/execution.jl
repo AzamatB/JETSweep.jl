@@ -308,8 +308,9 @@ function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separ
         # A test file can read the modules its drivers' prelude imports.
         modules = isempty(drivers) ? Set{Symbol}() : prelude_modules(drivers, unit.entry; packages=_owner(unit, sweep.inventory))
         for file in sort!(collect(loaded))
-            isfile(file) && _within(file, root) || continue
-            path = _glob_literal(relpath(file, root))
+            isfile(file) || continue
+            # JETLS matches a file outside its root by its absolute path.
+            path = _glob_literal(_within(file, root) ? relpath(file, root) : file)
             key = (file, sort!(collect(modules)))
             for pattern in get!(() -> concretization_patterns(file; modules), sweep.patterns, key)
                 push!(patterns, Dict("pattern" => pattern, "path" => path))
