@@ -999,6 +999,15 @@ Core.eval(LS.JET, quote
     end
 end)
 
+# JETLS applies the concretization patterns of its configuration only to files below its root,
+# though it matches severity patterns and analysis overrides by their absolute paths outside it.
+# A unit's configuration names the files it loads from outside its root so, as a sweep of part of
+# a package does those of the rest of it (`JETSweep._write_jetls_config`): match them alike.
+Core.eval(LS, quote
+    relative_workspace_path_for_config(server::Server, filename::AbstractString) =
+        glob_candidate_path(filename, server.state.root_path)
+end)
+
 # JETLS dispatches in the world it was loaded in, to stay clear of analyzed code.
 LS.advance_server_world!()
 

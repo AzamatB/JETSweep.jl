@@ -905,8 +905,9 @@ end
         OTHER && Base.deprecate(Base, :old_name)
         const REPLACEMENT = string(:new_value, get(ENV, "SUFFIX", ""))
         Base.@deprecate_binding old_value new_value false string(", use ", REPLACEMENT, " instead.")
-        # A run-dependent function named qualified is one too.
+        # A run-dependent name written qualified is one too.
         const SETTINGS = TOML.parsefile(joinpath(@__DIR__, "settings.toml"))
+        const MODE = get(Base.ENV, "MODE", "")
         const ENTRIES = Base.readdir.([@__DIR__])
         const SETTINGS_FILE = Base.joinpath(@__DIR__, "settings.toml")
         """

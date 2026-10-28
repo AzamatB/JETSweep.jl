@@ -409,8 +409,8 @@ const _PROCESS_NAMES = Set([:ARGS, :ENV, :PROGRAM_FILE])
 const _RUN_DEPENDENT = Set([:abspath, :realpath, :pwd, :readdir, :read, :readlines, :readchomp, :parsefile])
 "The modules whose pure functions calls may name qualified, as `TOML.parsefile`."
 const _PURE_MODULES = (:Base, :Sys, :Meta, :TOML)
-"The names `_evaluated_symbols!` gives the run-dependent functions it finds named qualified, such as `TOML.parsefile`."
-const _QUALIFIED_RUN_DEPENDENT = Set(Symbol(m, '.', f) for m in _PURE_MODULES for f in _RUN_DEPENDENT)
+"The names `_evaluated_symbols!` gives the run-dependent names it finds qualified, such as `TOML.parsefile` or `Base.ENV`."
+const _QUALIFIED_RUN_DEPENDENT = Set(Symbol(m, '.', f) for m in _PURE_MODULES for f in union(_PROCESS_NAMES, _RUN_DEPENDENT))
 const _PURE_CALLS = Set(Symbol.(split("""
     joinpath normpath dirname basename splitext splitdir splitpath relpath isabspath isfile isdir
     ispath readdir read readlines readchomp parseall parsefile abspath realpath pwd pkgdir pathof string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
@@ -911,7 +911,7 @@ end
 
 """
 Symbols `ex` evaluates: those outside quoted code, and those interpolated into it, with a
-run-dependent function named qualified, as `TOML.parsefile`, as `_QUALIFIED_RUN_DEPENDENT` names it.
+run-dependent name written qualified, as `TOML.parsefile`, as `_QUALIFIED_RUN_DEPENDENT` names it.
 """
 function _evaluated_symbols!(names::Set{Symbol}, ex, quoted::Bool=false)
     if ex isa Symbol

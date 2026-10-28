@@ -929,6 +929,21 @@
             end
         end
 
+        @async @testset "a sweep of part of a workspace concretizes what it includes from the rest" begin
+            mktempdir() do directory
+                workspace = mkpath(joinpath(realpath(directory), "workspace"))
+                file(path, text) = (mkpath(dirname(joinpath(workspace, path))); write(joinpath(workspace, path), text))
+                # Outside the swept directory, and so outside JETLS's root, a file includes what a constant names.
+                file("lib/helper.jl", "const DATA = joinpath(@__DIR__, \"data\")\ninclude(joinpath(DATA, \"more.jl\"))\n")
+                file("lib/data/more.jl", "more() = sin(\"more\")\n")
+                file("run/main.jl", "include(joinpath(@__DIR__, \"..\", \"lib\", \"helper.jl\"))\nmore()\n")
+                result = integration_sweep(joinpath(workspace, "run"), joinpath(directory, "report"))
+                @test only(result.results).status === :findings
+                @test [(relpath(f.file, workspace), f.line, f.code) for f in only(result.results).findings] ==
+                      [(joinpath("lib", "data", "more.jl"), 1, "inference/method-error")]
+            end
+        end
+
         @async @testset "plan only" begin
             mktempdir() do directory
                 root = integration_copy(directory)

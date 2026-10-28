@@ -245,6 +245,9 @@ end
 "A path as a literal glob: JETLS matches configured paths with escapes enabled."
 _glob_literal(path::AbstractString) = replace(_slash(path), r"([\\*?\[\]])" => s"\\\1")
 
+"The glob that names `file` in a JETLS configuration: its path relative to `root`, or outside it, its absolute path."
+_config_path(file::String, root::String) = _glob_literal(_within(file, root) ? relpath(file, root) : file)
+
 const _PATH_SETTINGS = (("diagnostic", "patterns"), ("full_analysis", "concretization_patterns"),
                         ("initialization_options", "analysis_overrides"))
 
@@ -309,8 +312,7 @@ function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separ
         modules = isempty(drivers) ? Set{Symbol}() : prelude_modules(drivers, unit.entry; packages=_owner(unit, sweep.inventory))
         for file in sort!(collect(loaded))
             isfile(file) || continue
-            # JETLS matches a file outside its root by its absolute path.
-            path = _glob_literal(_within(file, root) ? relpath(file, root) : file)
+            path = _config_path(file, root)
             key = (file, sort!(collect(modules)))
             for pattern in get!(() -> concretization_patterns(file; modules), sweep.patterns, key)
                 push!(patterns, Dict("pattern" => pattern, "path" => path))
@@ -320,7 +322,7 @@ function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separ
     if !isempty(separate)
         overrides = get!(get!(data, "initialization_options", Dict{String,Any}()), "analysis_overrides", Any[])
         for file in separate
-            push!(overrides, Dict("path" => _glob_literal(relpath(file, root)), "on_include" => "skip"))
+            push!(overrides, Dict("path" => _config_path(file, root), "on_include" => "skip"))
         end
     end
     return dirname(_write_toml(joinpath(directory, "config", ".JETLSConfig.toml"), data)), root

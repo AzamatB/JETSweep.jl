@@ -230,8 +230,9 @@ out, and those the configuration excludes, as a fixture's copy of a package may 
 there leave the name to the registry. If
 they cannot all be added, the environment gets those of the workspace alone, or failing that
 none; the units' notes name the packages added and those left out, and those from the
-registry that compat bounds hold back by a breaking release, which may not load or not as
-the code expects. Modules the tree defines
+registry that compat bounds or locked versions hold back by a breaking release, below the
+newest release or, offline, the newest installed one, which may not load or not as the code
+expects. Modules the tree defines
 that are not packages, as scripts load through `LOAD_PATH`, are not looked up. With
 `--offline`, resolution considers installed versions only. Each environment is then
 precompiled once for all its units; packages that fail to precompile, or that a timeout
