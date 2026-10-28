@@ -11,13 +11,18 @@ using JETLS, TOML
 
 const LS = Base.require(JETLS, :JETLSCore)
 const CC = LS.JET.CC
+const JS = LS.JS
+
+canonical(path::AbstractString) = ispath(path) ? realpath(path) : abspath(path)
 
 # JET outlines a test expression into a thunk when it defines an anonymous function in a
 # conditional branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, because realizing a
 # closure there concretely executes the conditions before it: the test itself, in JET's
 # interpreter. Generators and comprehensions define closures too, so treat them alike;
-# otherwise `@test r.ok && [a.b for a in r.items] == [1]` runs whatever computes `r`.
-# `JETSweep._outlined` mirrors these rules.
+# otherwise `@test r.ok && [a.b for a in r.items] == [1]` runs whatever computes `r`. And a
+# `let` block binds only names of its own, so a test of one can be outlined as its body can,
+# as `@test let t = t; t.ok && all(k -> t.x[k] > 0, ks) end`. `JETSweep._outlined` mirrors
+# these rules.
 Core.eval(LS.JET, quote
     # A generator's ranges are evaluated where it stands, so it can be outlined only if they can.
     function outlinable_generator(@nospecialize(ex))
@@ -39,6 +44,27 @@ Core.eval(LS.JET, quote
             sig = first(sig.args)
         end
         return isexpr(sig, :tuple)
+    end
+    function is_test_expression_thunk_safe(@nospecialize(ex))
+        ex isa Expr || return true
+        isexpr(ex, (:quote, :inert)) && return true
+        is_anonymous_test_function(ex) && return true
+        if isexpr(ex, :do, 2)
+            call, closure = ex.args
+            return is_test_expression_thunk_safe(call) &&
+                is_anonymous_test_function(closure)
+        end
+        if isexpr(ex, :let, 2)
+            bindings = isexpr(first(ex.args), :block) ? first(ex.args).args : Any[first(ex.args)]
+            safe(b) = b isa Union{Symbol,LineNumberNode} ||
+                (isexpr(b, :(=), 2) && first(b.args) isa Symbol && is_test_expression_thunk_safe(last(b.args)))
+            return all(safe, bindings) && is_test_expression_thunk_safe(last(ex.args))
+        end
+        (ex.head ∈ THUNK_SAFE_TEST_CALL_HEADS ||
+         ex.head ∈ THUNK_SAFE_TEST_CONTROL_HEADS ||
+         ex.head ∈ THUNK_SAFE_TEST_LITERAL_HEADS ||
+         ex.head ∈ THUNK_SAFE_TEST_TYPE_HEADS) || return false
+        return all(is_test_expression_thunk_safe, ex.args)
     end
 end)
 """
@@ -74,7 +100,8 @@ flow and captured values JET may run to define it there.
 """
 function controlled_function(ex, controlled::Bool=false; nested::Bool=false)
     ex isa Expr && !(ex.head in (:quote, :inert)) || return false
-    (ex.head in (:->, :function, :generator) || (ex.head === :(=) && signature(first(ex.args)))) && return controlled
+    (ex.head in (:->, :function, :generator) || (ex.head === :(=) && signature(first(ex.args))) ||
+     (ex.head === :macrocall && macro_name(ex) in CLOSURE_MACROS)) && return controlled
     if ex.head in (:if, :elseif, :&&, :||)
         return controlled_function(first(ex.args), controlled; nested) ||
             any(arg -> controlled_function(arg, true; nested), ex.args[2:end])
@@ -83,6 +110,8 @@ function controlled_function(ex, controlled::Bool=false; nested::Bool=false)
     return any(arg -> controlled_function(arg, controlled; nested), ex.args)
 end
 signature(ex) = ex isa Expr && (ex.head === :call || (ex.head in (:where, :(::)) && signature(first(ex.args))))
+"Macros that wrap their code in a closure, as `@async` does in a task."
+const CLOSURE_MACROS = Set(Symbol.(["@async", "@task", "@spawn", "@threads"]))
 imports(ex) = ex isa Expr && !(ex.head in (:quote, :inert)) && (ex.head in (:using, :import) || any(imports, ex.args))
 
 """
@@ -291,6 +320,280 @@ function outline_statements(ex, outlined::Vector{Any},
     return Expr(:block, statements...)
 end
 
+# ReTestItems
+# ===========
+#
+# ReTestItems' `@testsetup` and `@testitem` keep their code for `runtests` to run later, so
+# JET, which analyzes what top-level code does where it stands, analyzed none of it and
+# followed none of its includes. The worker analyzes the code as ReTestItems runs it: a test
+# setup as a module of `Main`, here the unit's module, and a test item as the top-level code
+# of a module of its own, which imports `Test` and the package of the nearest project unless
+# it sets `default_imports=false`, and then the setups it names, each statement in soft scope,
+# as at the REPL. A test item is a test set whose `failfast=` applies as a `@testset`'s does. A
+# file's test items run after the rest of it, as ReTestItems runs them once it has included
+# every test file, and those of a file that the unit includes for the setups it defines are
+# left to that file's own unit. `Main` in setups and items is the unit's module, which, as the
+# workers' `Main`, holds what the driver's `worker_init_expr` defines (see `JETSweep.prelude`).
+
+"The files the unit includes for the test setups they define, whose test items it leaves out."
+const SETUP_FILES = Set{String}()
+"The modules of the test setups the analysis meets."
+const SETUP_MODULES = Base.IdSet{JS.SyntaxNode}()
+"`Main`, as code in a module of the unit names it: the unit's module."
+const IMPORT_MAIN = Expr(:import, Expr(:., :., :., :Main))
+"Those of them that have test items, which this analysis does not cover."
+const PARTIAL = Set{String}()
+
+"""
+The ReTestItems macro the top-level statement `node` calls, `:testitem` or `:testsetup`, if it
+has the form ReTestItems accepts: `@testitem "name" options... begin ... end` or
+`@testsetup module Name ... end`. `JETSweep._retest_macro` mirrors this.
+"""
+function retest_macro(node::JS.SyntaxNode)
+    n = JS.numchildren(node)
+    JS.kind(node) === JS.K"macrocall" && n >= 2 || return nothing
+    callee = node[1]
+    JS.kind(callee) === JS.K"." && JS.numchildren(callee) >= 1 && (callee = callee[JS.numchildren(callee)])
+    JS.kind(callee) === JS.K"macro_name" && JS.numchildren(callee) == 1 || return nothing
+    data, title, body = callee[1].data, node[2], node[n]
+    name = data === nothing ? nothing : data.val
+    name === :testsetup && n == 2 && JS.kind(body) === JS.K"module" && return :testsetup
+    name === :testitem && n >= 3 && JS.kind(title) === JS.K"string" && JS.kind(body) === JS.K"block" &&
+        all(i -> JS.kind(title[i]) === JS.K"String", 1:JS.numchildren(title)) && return :testitem
+    return nothing
+end
+
+"The names of projects by directory, which ReTestItems finds a test item's package by."
+const PROJECT_NAMES = Dict{String,Union{Nothing,String}}()
+
+"The name of the nearest project at or above `directory`, whose package ReTestItems imports into test items."
+function project_name(directory::String)
+    haskey(PROJECT_NAMES, directory) && return PROJECT_NAMES[directory]
+    found = findfirst(name -> isfile(joinpath(directory, name)), Base.project_names)
+    name = found !== nothing ? get(TOML.parsefile(joinpath(directory, Base.project_names[found])), "name", nothing) :
+        dirname(directory) == directory ? nothing : project_name(dirname(directory))
+    return PROJECT_NAMES[directory] = name isa String ? name : nothing
+end
+
+"""
+The module ReTestItems runs the test item `node` of `file` in, with the imports it adds before
+the item's statements, which `push_vnode_stack!` adds where they are.
+"""
+function item_module(node::JS.SyntaxNode, file::String)
+    item = Expr(node)
+    options = Dict{Any,Any}(first(option.args) => last(option.args)
+                            for option in item.args[4:end-1] if Meta.isexpr(option, :(=), 2))
+    imports = Any[copy(IMPORT_MAIN)]
+    if get(options, :default_imports, true) !== false
+        push!(imports, :(using Test))
+        package = project_name(dirname(file))
+        package === nothing || push!(imports, Expr(:using, Expr(:., Symbol(package))))
+    end
+    setups = get(options, :setup, nothing)
+    for setup in (Meta.isexpr(setups, :vect) ? setups.args : ())
+        setup isa Symbol && push!(imports, Expr(:using, Expr(:., :., :., setup)))
+    end
+    return Expr(:module, true, Symbol("#", item.args[3]),
+                Expr(:block, LineNumberNode(JS.source_line(node), Symbol(file)), imports...))
+end
+
+"The fail-fast mode of the test item `node` in code of mode `failfast`: as `JET.testset_failfast` takes a `@testset`'s."
+function item_failfast(node::JS.SyntaxNode, failfast::Union{Nothing,Bool})
+    failfast === nothing && return nothing
+    for i in 3:JS.numchildren(node)-1
+        option = Expr(node[i])
+        Meta.isexpr(option, :(=), 2) && first(option.args) === :failfast && (failfast = last(option.args) === true)
+    end
+    return failfast
+end
+
+"The statements of test items, which ReTestItems runs in soft scope; the worker does so where JET desugars them."
+const SOFT = Base.IdSet{Expr}()
+soft!(ex::Expr) = (push!(SOFT, ex); ex)
+
+"Whether `ex` is a definition with a docstring: a call of `Core.@doc`."
+documented(ex) =
+    Meta.isexpr(ex, :macrocall) && (f = first(ex.args); f isa GlobalRef && f.mod === Core && f.name === Symbol("@doc"))
+
+"A statement in soft scope, as `REPL.softscope`, which ReTestItems copies, puts it."
+softscope(@nospecialize ex) =
+    !(ex isa Expr) || ex.head in (:meta, :import, :using, :export, :module, :error, :incomplete, :thunk) ||
+    (ex.head === :global && all(arg -> arg isa Symbol, ex.args)) ? ex :
+    ex.head === :toplevel ? Expr(:toplevel, map(softscope, ex.args)...) : Expr(:block, Expr(:softscope, true), ex)
+
+Core.eval(LS.JET, quote
+    function push_vnode_stack!(vnodes::Vector{VNode}, newnode::JS.SyntaxNode, force_concretize::Bool)
+        statements, items = VNode[], VNode[]
+        file = something(JS.sourcefile(newnode).filename, "")
+        for i = 1:JS.numchildren(newnode)
+            node = newnode[i]
+            macro_kind = $retest_macro(node)
+            if macro_kind === :testsetup
+                push!($SETUP_MODULES, node[2])
+                push!(statements, VNode(node[2], force_concretize))
+            elseif macro_kind === :testitem
+                path = $canonical(file)
+                path in $SETUP_FILES ? push!($PARTIAL, path) :
+                    push!(items, VNode(node, $item_module(node, file), force_concretize))
+            else
+                push!(statements, VNode(node, force_concretize))
+            end
+        end
+        append!(statements, items)
+        for i = length(statements):-1:1
+            push!(vnodes, statements[i])
+        end
+        return vnodes
+    end
+    # A test item's module holds its imports; its statements follow, each at its own line.
+    function push_vnode_stack!(vnodes::Vector{VNode}, node::JS.SyntaxNode, newex::Expr, force_concretize::Bool)
+        statements = VNode[VNode(node, arg, force_concretize) for arg in newex.args]
+        if $retest_macro(node) === :testitem
+            body = node[JS.numchildren(node)]
+            for i = 1:JS.numchildren(body)
+                statement = body[i]
+                ex = Expr(statement)
+                # A documented definition has no soft scope, and JET handles `@doc` where it stands.
+                plain = $softscope(ex) === ex || $documented(ex)
+                push!(statements, plain ? VNode(statement, force_concretize) : VNode(statement, $soft!(ex), force_concretize))
+            end
+        end
+        for i = length(statements):-1:1
+            push!(vnodes, statements[i])
+        end
+        return vnodes
+    end
+    # The module of a test item is its own, not one defined in it.
+    function find_module_node(node::JS.SyntaxNode)
+        $retest_macro(node) === :testitem && return nothing
+        for i in 1:JS.numchildren(node)
+            child = node[i]
+            JS.kind(child) === K"module" && return child
+            return @something find_module_node(child) continue
+        end
+        nothing
+    end
+end)
+
+"The files and lines of the modules the analysis reached, test setups' and test items' among them."
+const REACHED = Set{Tuple{String,Int}}()
+
+# JETLS reports what it finds in a module only where the ranges of a file's modules name it.
+Core.eval(LS.Interpreter, quote
+    function JET._virtual_process!(interp::LSInterpreter, toplevelnode::JS.SyntaxNode;
+                                   force_concretize::Bool=false, overrideex::Union{Nothing,Expr}=nothing)
+        state = JET.InterpretationState(interp)
+        if overrideex !== nothing && $retest_macro(toplevelnode) === :testitem
+            failfast = $item_failfast(toplevelnode, state.failfast)
+            if failfast !== state.failfast
+                state = JET.InterpretationState(state; failfast)
+                interp = JET.ConcreteInterpreter(interp, state)
+            end
+            source = JS.sourcefile(toplevelnode)
+            lines = JS.source_line(source, JS.first_byte(toplevelnode)):JS.source_line(source, JS.last_byte(toplevelnode))
+            info = get!(JET.AnalyzedFileInfo, state.res.analyzed_files, state.filename)
+            push!(info.module_range_infos, lines => state.context)
+            push!($REACHED, ($canonical(state.filename), first(lines)))
+        elseif JS.kind(toplevelnode) === JS.K"module"
+            push!($REACHED, ($canonical(state.filename), JS.source_line(toplevelnode)))
+            toplevelnode in $SETUP_MODULES && Core.eval(state.context, $(QuoteNode(IMPORT_MAIN)))
+        end
+        return @invoke JET._virtual_process!(interp::JET.ConcreteInterpreter, toplevelnode::JS.SyntaxNode;
+                                             force_concretize, overrideex)
+    end
+end)
+
+"The statements of test items in JETLS's syntax trees, which it lowers in soft scope."
+const SOFT_TREES = Base.IdSet{Any}()
+
+"""
+The statements JETLS lowers in place of the top-level statement `st0` of its syntax tree, if it
+is ReTestItems code the analysis reached: a test setup's module, or a test item's statements.
+"""
+function retest_tree(st0::LS.SyntaxTree)
+    n = JS.numchildren(st0)
+    reached(st) = (canonical(JS.filename(st)), JS.source_line(st)) in REACHED
+    if LS.is_macrocall_st0(st0, "@testsetup", "ReTestItems.@testsetup")
+        n == 3 && JS.head(st0[3]) === :module && reached(st0[3]) && return [st0[3]]
+    elseif LS.is_macrocall_st0(st0, "@testitem", "ReTestItems.@testitem")
+        body = st0[n]
+        if n >= 4 && LS.is_string_literal(st0[3]) && JS.head(body) === :block && reached(st0)
+            statements = [body[i] for i in 1:JS.numchildren(body)]
+            union!(SOFT_TREES, statements)
+            return statements
+        end
+    end
+    return nothing
+end
+
+# JETLS lowers each top-level statement for its lowering diagnostics, such as unused imports, in
+# the module the analysis found at its line, and a call of a macro it does not know as a block
+# of its arguments. A module does not lower in a block, so JETLS found none of the names a test
+# setup uses and reported its imports unused, and a test item's statements were not lowered in
+# its module, nor in the soft scope they run in. Lower them as the worker analyzes them.
+Core.eval(LS, quote
+    function iterate_toplevel_tree(callback, st0_top::SyntaxTree)
+        retval = nothing
+        sl = SyntaxTree[st0_top]
+        while !isempty(sl)
+            st0 = pop!(sl)
+            if JS.head(st0) === :toplevel
+                for i = JS.numchildren(st0):-1:1 # reversed since we use `pop!`
+                    push!(sl, st0[i])
+                end
+            elseif JS.head(st0) === :module
+                # The body `:block` is typically the last child, but trailing
+                # `:error` nodes from incomplete code can push it earlier.
+                stblk_idx = @something findlast(i::Int -> JS.head(st0[i]) === :block,
+                    1:JS.numchildren(st0)) continue
+                stblk = st0[stblk_idx]
+                for i = JS.numchildren(stblk):-1:1 # reversed since we use `pop!`
+                    push!(sl, stblk[i])
+                end
+            elseif is_doc0_any(st0) && !is_unsplittable_doc0(st0)
+                for i = JS.numchildren(st0):-1:3 # reversed since we use `pop!`
+                    push!(sl, st0[i])
+                end
+            elseif (code = $retest_tree(st0)) !== nothing
+                for i = length(code):-1:1 # reversed since we use `pop!`
+                    push!(sl, code[i])
+                end
+            else # st0 is lowerable tree
+                ret = callback(st0)
+                if ret isa TraversalReturn
+                    retval = ret.val
+                    ret.terminate ? break : continue
+                end
+                ret === traversal_terminator && break
+            end
+        end
+        return retval
+    end
+    function jl_lower_for_scope_resolution(
+            context_module::Module, world::UInt, st0::SyntaxTree;
+            trim_error_nodes::Bool = true,
+            recover_from_macro_errors::Bool = true,
+            convert_closures::Bool = false,
+            soft_scope::Bool = false,
+        )
+        soft_scope |= st0 in $SOFT_TREES
+        if trim_error_nodes
+            st0 = JETLSCore.trim_error_nodes(st0)
+        end
+        st1 = try
+            st0 = JL.rebase_layers(st0, context_module)
+            JL.expand_forms_1(st0, world, true)
+        catch err
+            recover_from_macro_errors || rethrow(err)
+            is_user_lowering_error(err) || report_lowering_bug(err)
+            st0 = remove_macrocalls(context_module, world, st0)
+            st0 = JL.rebase_layers(st0, context_module)
+            JL.expand_forms_1(st0, world, true)
+        end
+        return _jl_lower_for_scope_resolution(st0, st1, world; convert_closures, soft_scope)
+    end
+end)
+
 # JET analyzes any top-level expression it can outline the same way, such as
 # `x === nothing || atexit(() -> close(x))`, which would otherwise make it evaluate `x`, and
 # local scopes, and conditionals of tests. A conditional that binds names, such as a test
@@ -299,15 +602,18 @@ end
 # needs no condition: the tests of a branch its condition does not take are analyzed too.
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
+        soft = x in $SOFT && (delete!($SOFT, x); true)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
         if $outlinable(x)
             thunk = gensym($(QuoteNode(OUTLINED)))
             return Expr(:let, Expr(:block), Expr(:block, Expr(:function, Expr(:call, thunk), Expr(:block, x)), Expr(:call, thunk)))
         end
-        isexpr(x, :if) || return x
-        outlined = Any[]
-        x = $outline_statements(x, outlined)
-        return isempty(outlined) ? x : Expr(:block, outlined..., x)
+        if isexpr(x, :if)
+            outlined = Any[]
+            x = $outline_statements(x, outlined)
+            isempty(outlined) || (x = Expr(:block, outlined..., x))
+        end
+        return soft ? $softscope(x) : x
     end
 end)
 
@@ -391,8 +697,8 @@ in a thunk of its own.
 function definition(code::Vector{Any}, pc::Int)
     stmt = code[pc]
     Meta.isexpr(stmt, :method, 1) && return only(stmt.args) isa GlobalRef ? only(stmt.args) : nothing
-    if Meta.isexpr(stmt, :thunk, 1) && only(stmt.args) isa Core.CodeInfo
-        thunk = only(stmt.args).code
+    if Meta.isexpr(stmt, :thunk, 1) && (source = only(stmt.args)) isa Core.CodeInfo
+        thunk = source.code
         i = findfirst(i -> definition(thunk, i) !== nothing, eachindex(thunk))
         return i === nothing ? nothing : definition(thunk, i)
     end
@@ -639,8 +945,6 @@ function Base.CoreLogging.handle_message(log::ErrorLog, level, message, _module,
     return Base.CoreLogging.handle_message(log.parent, level, message, _module, args...; kwargs...)
 end
 
-canonical(path::AbstractString) = ispath(path) ? realpath(path) : abspath(path)
-
 "Load a package, or an extension with its parent and triggers, and return its module."
 function load(request, log::ErrorLog)
     package = Base.PkgId(Base.UUID(request["uuid"]), request["package"])
@@ -824,6 +1128,7 @@ function analyze(request, log::ErrorLog)
     # A script runs as the program, so `abspath(PROGRAM_FILE) == @__FILE__` holds as it would.
     kind in ("test", "script", "orphan") && (Base.PROGRAM_FILE = request["entry"])
     merge!(ENV, request["env"])
+    union!(SETUP_FILES, canonical.(request["setups"]))
     LS.FULL_ANALYSIS_CONTEXT[] = CONTEXT
     target = nothing
     if kind in ("package", "extension", "orphan")
@@ -882,7 +1187,7 @@ function analyze(request, log::ErrorLog)
             LS.apply_diagnostic_config!(list, server.state.config_manager, uri, request["root"])
         end
         timings["lowering"] = time() - mark
-        return Dict{String,Any}("analyzed" => sort!(filter(!=(generated), files)),
+        return Dict{String,Any}("analyzed" => sort!(filter(file -> file != generated && !(file in PARTIAL), files)),
                                 "findings" => findings(diagnostics, generated, server.state.encoding),
                                 "reasons" => unique!(reasons),
                                 "timings" => timings)

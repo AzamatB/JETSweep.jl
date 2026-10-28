@@ -97,6 +97,23 @@ including the files analyzed separately. A test file analyzed by itself is fail-
 top-level code, as below, even when its driver includes it in a test set that is not, such as
 one with `failfast=false`.
 
+[ReTestItems](https://github.com/JuliaTesting/ReTestItems.jl)' `@testitem` and `@testsetup`
+keep their code for `runtests` to run later, so JETLS by itself analyzes none of it. JETSweep
+analyzes it as ReTestItems runs it: a test setup as a module of the unit, and a test item as
+the top-level code of a module of its own, which imports `Test` and the package of the nearest
+project, unless the item sets `default_imports=false`, and the setups it names, each of its
+statements in soft scope, as at the REPL. A test item is a test set whose `failfast=` applies
+as a `@testset`'s does, below. A file's test items are analyzed after the rest of it, and what
+items and setups include is part of their unit. Their `Main` is the unit's module, where the
+prelude defines, after the driver's statements, the constants the driver's `worker_init_expr`
+defines in the `Main` of each ReTestItems worker, with what it interpolates in their values. A
+test file whose items name a setup that another test file of the package defines is analyzed
+after that file, whose own test items are left to its unit, which alone counts as covering it.
+The lowering diagnostics of setups and items, such as unused imports, are computed in their
+modules, and those of items in soft scope: JETLS by itself lowers a call of a macro it does not
+know as a block of its arguments, where a module does not lower, so it found none of the names
+a setup uses and reported its imports unused.
+
 Script analysis evaluates definitions, imports, includes and the deprecations of bindings,
 as `@deprecate_binding` declares them, but not assignments, so any of these that needs an
 assigned value stops JETLS (`toplevel/missing-concretization`), and other code sees assigned
@@ -137,8 +154,9 @@ function body, may still find a global that a conditional assigns undefined.
 
 JETSweep extends one JETLS rule. To define a closure in a branch, JETLS evaluates the
 branch's condition, and with it everything the condition depends on: in a test set, the
-test itself. So JETLS analyzes a `@test` expression that defines an anonymous function in a
-branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, inside a closure of its own.
+test itself; a closure may be one that `@async`, `@task`, `Threads.@spawn` or
+`Threads.@threads` makes of its code. So JETLS analyzes a `@test` expression that defines an
+anonymous function in a branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, inside a closure of its own.
 JETSweep treats generators and comprehensions alike, as in
 `@test r.ok && [a.b for a in r.items] == [1]`, which would otherwise run the whole test set in
 JETLS's interpreter; any other top-level expression that assigns nothing, as in
@@ -307,12 +325,13 @@ Loading JETSweep does not load JETLS; only analysis workers do.
 ## Development
 
 ```sh
-julia --project --depwarn=error -e 'using Pkg; Pkg.test()'
-julia --project --depwarn=error -e 'using Pkg; Pkg.test(test_args=["units_test.jl"])'
+julia --project --check-bounds=yes --depwarn=error -e 'using Pkg; Pkg.test()'
+julia --project --check-bounds=yes --depwarn=error -e 'using Pkg; Pkg.test(test_args=["units_test.jl"])'
 ```
 
 The test items of `test/*_test.jl` run on [ReTestItems](https://github.com/JuliaTesting/ReTestItems.jl)
-worker processes; `test_args` names the files whose items run.
+worker processes; `test_args` names the files whose items run. `Pkg.test` runs them with the
+session's bounds checking, which the suite checks is on.
 
 To move to another JETLS release, set its commit and version in `Project.toml`. Then raise
 Revise's `[compat]` lower bound to the latest release of the series `[compat]` in

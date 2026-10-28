@@ -926,6 +926,10 @@ end
     @test !JETSweep._outlined(:(ready || foreach(xs) do x::Row; x; end))
     @test !JETSweep._outlined(:(ready || foreach(function (x::T) where {T}; x; end, xs)))
     @test JETSweep._outlined(:(ready || foreach((x=Row()) -> x, xs)))
+    # A `let` block binds names of its own only.
+    @test JETSweep._outlined(:(let t = t; t.ok && all(k -> k > 0, t.ks); end))
+    @test JETSweep._thunk_safe(:(let t = t, u = f(t); t.ok && all(k -> k > u, t.ks); end))
+    @test !JETSweep._thunk_safe(:(let (a, b) = t; a && all(k -> k > b, a); end))
     # A conditional of tests binds nothing either, unless a branch does at its own level.
     @test JETSweep._outlined(:(if get(ENV, "X", "") == "1"; f(); @testset "t" begin; y = 1; foreach(x -> x + y, 1:2); end; end))
     @test !JETSweep._outlined(:(if get(ENV, "X", "") == "1"; y = 1; @testset "t" begin; foreach(x -> x, 1:2); end; end))
@@ -940,6 +944,16 @@ end
     @test JETSweep._outlined(:(if ON; for n in 1:2; try; foreach(x -> x + n, 1:2); catch; end; end; end))
     @test JETSweep._outlined(:(if abspath(PROGRAM_FILE) == @__FILE__; let a = ARGS[1]; open(io -> write(io, a), a); end; end))
     @test !JETSweep._outlined(:(if ON; @time foreach(x -> x, 1:2); else; @info "skipped"; end))
+    # `@async` and the like define a closure too, which a test driver may start in a branch.
+    @test JETSweep._outlined(:(if any(in(SELECTED), ("a",)); let r = f(); @async wait(r); end; else; touch("b"); end))
+    @test JETSweep._outlined(:(if ON; let; Threads.@spawn g(); end; end))
+    @test syntax_patterns("""
+        const ASKED = isempty(ARGS) ? ["x"] : ARGS
+        if "x" in ASKED
+            const MODE = "x"
+            Threads.@spawn println(MODE)
+        end
+        """) == ["const ASKED = isempty(ARGS) ? [\"x\"] : ARGS"]
     # A local scope defines types and imports globally, as in a function it cannot.
     @test !JETSweep._outlined(:(if ON; let; struct S end; ready && map(x -> x, 1:2); end; end))
     @test !JETSweep._outlined(:(if ON; let; @enum E a; ready && map(x -> x, 1:2); end; end))
@@ -1311,4 +1325,81 @@ end
         end
         """)
     @test parsed.syntax.imports == ["A", "B", "D", "F", "Generated", "Conditional"]
+end
+
+@testitem "parse_source analyzes ReTestItems test items and setups as the modules they run in" setup=[Syntax] begin
+    parsed = syntax_parse("""
+        @testsetup module Shared
+        include("setup.jl")
+        end
+        @testitem "item" setup=[Shared, Other] default_imports=false begin
+            const DATA = joinpath(@__DIR__, "data")
+            include(joinpath(DATA, "item.jl"))
+        end
+        ReTestItems.@testitem "qualified" begin
+            include("qualified.jl")
+        end
+        @testitem "rooted" begin
+            ROOT = @__DIR__
+        end
+        include(joinpath(ROOT, "top.jl"))
+        """)
+    @test [(isempty(i.target) ? "" : relpath(i.target, parsed.dir), i.depth, i.followed) for i in parsed.syntax.includes] ==
+          [("setup.jl", 1, true), (joinpath("data", "item.jl"), 1, true), ("qualified.jl", 1, true), ("", 0, true)]
+    @test parsed.syntax.notes == [syntax_dynamic(parsed.file, 14)]
+    @test (parsed.syntax.setups, parsed.syntax.uses, parsed.syntax.modules) == (["Shared"], ["Shared", "Other"], ["Shared"])
+    # Forms ReTestItems rejects are other macro calls.
+    rejected = syntax_parse("""
+        @testitem "named \$(x)" begin
+            include("interpolated.jl")
+        end
+        @testsetup begin
+            include("block.jl")
+        end
+        """)
+    @test [i.depth for i in rejected.syntax.includes] == [0, 0]
+    @test isempty(rejected.syntax.setups)
+end
+
+@testitem "concretization_patterns covers the statements of test items and setups" setup=[Syntax] begin
+    @test syntax_patterns("""
+        @testsetup module Shared
+        const ROOT = joinpath(@__DIR__, "fixtures")
+        include(joinpath(ROOT, "shared.jl"))
+        end
+        @testitem "item" begin
+            const DATA = joinpath(@__DIR__, "data")
+            include(joinpath(DATA, "item.jl"))
+        end
+        """) == ["const ROOT = joinpath(@__DIR__, \"fixtures\")", "const DATA = joinpath(@__DIR__, \"data\")"]
+end
+
+@testitem "prelude sets up the Main of ReTestItems' workers as the driver's worker_init_expr does" setup=[Syntax] begin
+    mktempdir() do directory
+        dir = realpath(directory)
+        driver = syntax_write(dir, "test/runtests.jl", """
+            using ReTestItems, Pkg
+            const READY = joinpath(mktempdir(), "ready")
+            const UNUSED = 1
+            isempty(ARGS) || ReTestItems.runtests(@__DIR__; nworkers=2,
+                worker_init_expr=:(const SCRATCH = \$(mktempdir()); const READY = \$READY; const OTHER = 2))
+            """)
+        setup = syntax_write(dir, "test/shared_testsetup.jl", "@testsetup module Shared\nready() = isfile(Main.READY)\nend\n")
+        target = syntax_write(dir, "test/items_test.jl", "@testitem \"t\" setup=[Shared] begin\n    @test Main.SCRATCH isa String\nend\n")
+        text = JETSweep.prelude([driver], target; setups=[setup])
+        # A constant of the driver's own value is the driver's; what nothing refers to is left out.
+        @test text == """
+            #= $driver:1 =#
+            using ReTestItems, Pkg
+            #= $driver:2 =#
+            const READY = joinpath(mktempdir(), "ready")
+            #= $driver:4 =#
+            const SCRATCH = mktempdir()
+            """
+        # Without the setup, nothing refers to the driver's constant.
+        @test !occursin("READY", JETSweep.prelude([driver], target))
+    end
+    # `Main.x` reads the analyzed code's own global, pure when `x` is known.
+    @test syntax_patterns("const A = \"a\"\nconst B = joinpath(Main.A, \"x\")\nconst C = joinpath(Main.UNKNOWN, \"x\")\n") ==
+          ["const A = \"a\"", "const B = joinpath(Main.A, \"x\")"]
 end

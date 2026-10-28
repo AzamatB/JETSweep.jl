@@ -1025,3 +1025,37 @@ end
         @test JETSweep._worker_error(log, 1) === nothing
     end
 end
+
+@testitem "A test unit includes the files that define the ReTestItems setups its test items name" setup=[Execution] begin
+    mktempdir() do directory
+        root = realpath(directory)
+        package = joinpath(root, "Pkg")
+        execution_touch(joinpath(package, "Project.toml"),
+                        "name = \"Pkg\"\nuuid = \"6a1f4f3e-2d5b-4c6e-8f7a-9b0c1d2e3f40\"\nversion = \"0.1.0\"\n")
+        execution_touch(joinpath(package, "src", "Pkg.jl"), "module Pkg\nend\n")
+        shared = execution_touch(joinpath(package, "test", "shared_testsetup.jl"),
+                                 "@testsetup module Shared\nconst ROOT = joinpath(@__DIR__, \"fixtures\")\nend\n")
+        other = execution_touch(joinpath(package, "test", "sub", "other_test.jl"),
+                                "@testsetup module Other\nend\n@testitem \"other\" setup=[Other] begin\nend\n")
+        items = execution_touch(joinpath(package, "test", "items_test.jl"),
+                                "@testsetup module Local\nend\n@testitem \"items\" setup=[Shared, Local, Other] begin\nend\n")
+        plain = execution_touch(joinpath(package, "test", "plain_test.jl"), "@testitem \"plain\" begin\nend\n")
+        inventory = discover(root)
+        sweep = JETSweep._Sweep(inventory, root, SweepOptions(), JETSweep.source_syntax(inventory),
+                                Dict{String,JETSweep.Unit}(), Dict{String,Vector{String}}(),
+                                Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
+        context = JETSweep.Context(package, package, true, Dict{String,String}())
+        unit(entry) = JETSweep.Unit("test-unit", :test, entry, context, [entry], "", "", JETSweep.Overrides(), String[])
+        # Setups the unit defines itself need no file; nor do those of no test item.
+        setups = JETSweep._setup_files(unit(items), sweep)
+        @test setups == [shared, other]
+        @test isempty(JETSweep._setup_files(unit(plain), sweep)) && isempty(JETSweep._setup_files(unit(shared), sweep))
+        # They come before the entry, and their statements are concretized as the entry's are.
+        @test endswith(JETSweep._generated_entry(unit(items), String[], inventory, setups),
+                       "include($(repr(shared)))\ninclude($(repr(other)))\ninclude($(repr(items)))\n")
+        output = mktempdir()
+        config = JETSweep._write_jetls_config(unit(items), output, sweep, String[], String[], setups)
+        data = TOML.parsefile(joinpath(config, ".JETLSConfig.toml"))
+        @test ("const ROOT = joinpath(@__DIR__, \"fixtures\")", "Pkg/test/shared_testsetup.jl") in execution_patterns(data)
+    end
+end

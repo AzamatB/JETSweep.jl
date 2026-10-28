@@ -1,6 +1,6 @@
 name = "JETSweep"
 uuid = "18e08a99-dc2d-4e8e-aade-23241d8adbd6"
-version = "0.5.3"
+version = "0.6.0"
 authors = ["Azamat Berdyshev <aberdysh@gmail.com>"]
 
 [deps]

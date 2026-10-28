@@ -269,7 +269,8 @@
                     end
                     """)
                 write(joinpath(root, "Preluded", "test", "wrapped.jl"), "@test Wrapper(1).x == 1\n")
-                # A generator in a branch of a `@test` expression does not make JETLS run the test.
+                # A generator in a branch of a `@test` expression does not make JETLS run the test, nor a
+                # closure in a branch of a `let` block it tests.
                 write(joinpath(root, "outlined.jl"), """
                     using Test
                     const MARKER = joinpath(@__DIR__, "ran.marker")
@@ -277,6 +278,9 @@
                     @testset "outlined" begin
                         r = setup()
                         @test r.ok && [a.b for a in r.items] == [1]
+                        @test let r = r
+                            r.ok && all(a -> a.b > 0, r.items)
+                        end
                     end
                     """)
                 # Tiers whose other branch logs, or whose tests stand in a `let` block, are analyzed
@@ -529,6 +533,89 @@
                     end
                     total() = sum(RESULT)
                     """)
+                # A closure `@async` makes in a branch does not make JETLS stop for the selection that
+                # chooses the branch, nor run it; one in a branch that binds names has its condition evaluated.
+                write(joinpath(root, "spawned.jl"), """
+                    const PICKED = isempty(ARGS) ? filter(endswith(".jl"), readdir(@__DIR__)) : ARGS
+                    if any(in(PICKED), ("spawned.jl",))
+                        let ready = joinpath(@__DIR__, "spawned.marker")
+                            @async touch(ready)
+                        end
+                    end
+                    const ASKED = isempty(ARGS) ? ["x"] : ARGS
+                    if "x" in ASKED
+                        const MODE = "x"
+                        Threads.@spawn println(MODE)
+                    end
+                    after() = 1 + "one"
+                    """)
+                # ReTestItems' test items and setups are analyzed as ReTestItems runs them, with what they
+                # include, a setup that another file defines too, the items' loops in soft scope, and `Main`
+                # holding what the driver's `worker_init_expr` defines.
+                mkpath(joinpath(root, "Itemized", "src"))
+                mkpath(joinpath(root, "Itemized", "test"))
+                write(joinpath(root, "Itemized", "Project.toml"), """
+                    name = "Itemized"
+                    uuid = "2e8c4b1a-6f3d-4a59-b7c2-8d1e0f9a3b64"
+                    version = "0.1.0"
+                    [extras]
+                    ReTestItems = "817f1d60-ba6b-4fd5-9520-3cf149f6a823"
+                    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+                    [targets]
+                    test = ["ReTestItems", "Test"]
+                    """)
+                write(joinpath(root, "Itemized", "src", "Itemized.jl"), "module Itemized\nexport double\ndouble(x::Int) = 2x\nend\n")
+                write(joinpath(root, "Itemized", "test", "runtests.jl"),
+                      "using Itemized, ReTestItems\nruntests(Itemized; worker_init_expr=:(const SCRATCH = \$(mktempdir())))\n")
+                write(joinpath(root, "Itemized", "test", "shared_testsetup.jl"), """
+                    @testsetup module Shared
+                    using Base: Fix1, Fix2
+                    include(joinpath(@__DIR__, "fixture.jl"))
+                    const OFFSET = Fix1(+, 1)(0)
+                    const PLACE = joinpath(Main.SCRATCH, "place")
+                    export OFFSET, PLACE, fixture
+                    end
+                    """)
+                write(joinpath(root, "Itemized", "test", "fixture.jl"), "fixture() = 1\nfixture_failure() = sin(\"fixture\")\n")
+                write(joinpath(root, "Itemized", "test", "items_test.jl"), """
+                    @testitem "items" setup=[Shared, Other] begin
+                        @test double(fixture()) == 2 + OFFSET - 1
+                        @test other_value() == 5 && PLACE isa String && Main.SCRATCH isa String
+                        total = 0
+                        for x in 1:3
+                            total += x
+                        end
+                        @test total == 6
+                        cos("item")
+                    end
+
+                    @testitem "includes" begin
+                        include(joinpath(@__DIR__, "body.jl"))
+                    end
+
+                    @testitem "documented" begin
+                        "A documented helper."
+                        helper() = 1
+                        @test helper() == 1
+                    end
+                    """)
+                write(joinpath(root, "Itemized", "test", "body.jl"), """
+                    @testset "included by a test item" begin
+                        @test double(2) == 4
+                        tan("body")
+                    end
+                    """)
+                write(joinpath(root, "Itemized", "test", "other_test.jl"), """
+                    @testsetup module Other
+                    other_value() = 5
+                    export other_value
+                    end
+
+                    @testitem "other" setup=[Other] begin
+                        @test other_value() == 5
+                        sin("other")
+                    end
+                    """)
                 output = joinpath(root, ".jetsweep", "report")
                 io = IOBuffer()
                 result = integration_sweep(root, output; io, fail_on=:none, jobs=6)
@@ -597,6 +684,22 @@
                 @test reasons("Preluded/test/wrapped.jl") == reasons("Preluded/test/runtests.jl")
                 @test any(reason -> occursin("Preluded/test/runtests.jl:5 [toplevel/error]", reason),
                           reasons("Preluded/test/wrapped.jl"))
+                @test status("spawned.jl") === :findings && errors("spawned.jl") == [12] &&
+                      !isfile(joinpath(root, "spawned.marker"))
+                itemized(name) = unit("Itemized/test/$name")
+                found(name) = sort!([(basename(f.file), f.line, f.code) for f in itemized(name).findings])
+                @test all(name -> status("Itemized/test/$name") === :findings,
+                          ["items_test.jl", "other_test.jl", "shared_testsetup.jl"])
+                @test found("items_test.jl") == [("body.jl", 3, "inference/method-error"),
+                                                 ("fixture.jl", 2, "inference/method-error"),
+                                                 ("items_test.jl", 9, "inference/method-error"),
+                                                 ("shared_testsetup.jl", 2, "lowering/unused-import")]
+                @test only(f.message for f in itemized("shared_testsetup.jl").findings if f.code == "lowering/unused-import") ==
+                      "Unused import `Fix2`"
+                # The test items of the file that defines a setup are analyzed by its own unit, which alone covers it.
+                @test found("other_test.jl") == [("other_test.jl", 8, "inference/method-error")]
+                @test !(realpath(joinpath(root, "Itemized", "test", "other_test.jl")) in itemized("items_test.jl").analyzed)
+                @test !any(u -> occursin("Itemized", u.entry) && basename(u.entry) in ("body.jl", "fixture.jl"), result.units)
                 @test status("uses_sibling.jl") === :findings
                 sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
                 @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)
