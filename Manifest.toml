@@ -169,7 +169,7 @@ version = "0.1.0"
 deps = ["JETLS", "LibGit2", "Pkg", "Revise", "SHA", "TOML"]
 path = "."
 uuid = "18e08a99-dc2d-4e8e-aade-23241d8adbd6"
-version = "0.5.2"
+version = "0.5.3"
 
 [[deps.JSON3]]
 deps = ["Dates", "Mmap", "Parsers", "PrecompileTools", "StructTypes", "UUIDs"]
