@@ -117,7 +117,9 @@ applies as a `@testset`'s does, below. A file's test items are analyzed after th
 and what items and setups include is part of their unit. Their `Main` is the unit's module,
 where the prelude defines, after the driver's statements, the constants the driver's
 `worker_init_expr` defines in the `Main` of each ReTestItems worker, with what it interpolates
-in their values. A test file whose items name a setup that another test file of the package
+in their values, and the driver's locations for the `@__DIR__`, `@__FILE__` and relative include
+paths in them: the workers run it as code of the driver's file, in the directory `Pkg.test` runs
+the driver in. A test file whose items name a setup that another test file of the package
 defines is analyzed after that file, whose own test items are left to its unit, which alone
 counts as covering it. The lowering diagnostics of setups and items, such as unused imports,
 are computed in their modules, and those of items in soft scope: JETLS by itself lowers a call

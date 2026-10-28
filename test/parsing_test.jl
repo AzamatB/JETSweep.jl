@@ -66,9 +66,9 @@ syntax_broken(ex) = ex isa Expr && (ex.head in (:error, :incomplete) || any(synt
 
 syntax_parses(text::String) = !syntax_broken(Meta.parseall(text))
 
-"Load `text` as a file of its own directory into a fresh module: the module, or the error."
+"Load `text` as a file of its own directory into a fresh module, which has `include`: the module, or the error."
 function syntax_load(text::String)
-    sandbox = Module(:SyntaxSandbox)
+    sandbox = Core.eval(Module(:SyntaxParent), :(module SyntaxSandbox end))
     mktempdir() do directory
         file = syntax_write(realpath(directory), "entry.jl", text)
         try
@@ -1426,4 +1426,33 @@ end
     # `Main.x` reads the analyzed code's own global, pure when `x` is known.
     @test syntax_patterns("const A = \"a\"\nconst B = joinpath(Main.A, \"x\")\nconst C = joinpath(Main.UNKNOWN, \"x\")\n") ==
           ["const A = \"a\"", "const B = joinpath(Main.A, \"x\")"]
+end
+
+@testitem "prelude pins the locations a worker_init_expr depends on to the driver" setup=[Syntax] begin
+    # Workers run the expression as code of the driver's file, in the driver's directory, and
+    # the driver evaluates what it interpolates.
+    driver = """
+        using ReTestItems
+        runtests(@__DIR__; nworkers=1, worker_init_expr=quote
+            const ROOT = \$(@__DIR__)
+            const DATA = joinpath(@__DIR__, "data")
+            const SELF = Base.@__FILE__
+            const VALUE = include("sub/value.jl")
+        end)
+        """
+    target = "@testitem \"t\" begin\n    @test dirname(Main.SELF) == Main.ROOT && isdir(Main.DATA) && Main.VALUE == 1\nend\n"
+    files = ("test/runtests.jl" => driver, "test/sub/value.jl" => "1\n", "test/items_test.jl" => target)
+    syntax_prelude(files...; target="test/items_test.jl") do text, dir
+        tests = joinpath(dir, "test")
+        @test !occursin("@__", text)
+        # Loaded from a file of another directory, as a unit's generated entry is.
+        sandbox = syntax_load(text)
+        @test sandbox isa Module
+        if sandbox isa Module
+            @test syntax_value(sandbox, :ROOT) == tests
+            @test syntax_value(sandbox, :DATA) == joinpath(tests, "data")
+            @test syntax_value(sandbox, :SELF) == joinpath(tests, "runtests.jl")
+            @test syntax_value(sandbox, :VALUE) == 1
+        end
+    end
 end

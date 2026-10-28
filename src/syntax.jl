@@ -1314,7 +1314,7 @@ end
 # conditionals are wrapped in `@eval`, which analysis always evaluates, since concretization
 # patterns cannot apply to the generated file. A driver that runs ReTestItems sets up the
 # `Main` of its workers with the constants its `worker_init_expr` defines, so they count as
-# its assignments.
+# its assignments, with their locations pinned to the driver too.
 
 function _macro_identifier(node::JS.SyntaxNode)
     JS.kind(node) == JS.K"macrocall" || return nothing
@@ -1365,6 +1365,19 @@ function _relocated(node::JS.SyntaxNode, text::String, file::String)
     end
     write(io, view(bytes, position:last(JS.byte_range(node))))
     return String(take!(io))
+end
+
+"`ex`, code of `file`, with the locations it depends on pinned to `file`, as `_relocations!` pins them in source text."
+function _relocated(ex, file::String)
+    ex isa Expr || return ex
+    if ex.head === :macrocall
+        _macro_name(ex) == "@__DIR__" && return dirname(file)
+        _macro_name(ex) == "@__FILE__" && return file
+    end
+    ex = Expr(ex.head, (_relocated(arg, file) for arg in ex.args)...)
+    _is_include(ex) && last(ex.args) isa String && !isabspath(last(ex.args)) &&
+        (ex.args[end] = normpath(dirname(file), last(ex.args)))
+    return ex
 end
 
 "A statement of a test driver that a prelude may copy, with where it is from and its source text."
@@ -1426,6 +1439,9 @@ function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text
         end
         _is_include(ex) && continue
         for init in _worker_init(ex)
+            # Its locations are the driver's: a worker runs it as code of the driver's file, in the
+            # directory `Pkg.test` runs the driver in, and the driver evaluates what it interpolates.
+            init = _relocated(init, file)
             assignment = _assignment(init)
             assignment === nothing && continue
             # A worker's constant of the driver's value of the same name is the driver's.
