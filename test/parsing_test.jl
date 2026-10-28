@@ -1372,6 +1372,24 @@ end
             include(joinpath(DATA, "item.jl"))
         end
         """) == ["const ROOT = joinpath(@__DIR__, \"fixtures\")", "const DATA = joinpath(@__DIR__, \"data\")"]
+    # In soft scope, an item's loops and `try` blocks assign its globals; a file's loops do not.
+    @test syntax_patterns("""
+        n = 0
+        for i in 1:3
+            n += i
+        end
+        top = n
+        @testitem "item" begin
+            k = 0
+            for i in 1:3
+                try
+                    k += i
+                catch
+                end
+            end
+            total = k
+        end
+        """) == ["n = 0", "top = n", "k = 0"]
 end
 
 @testitem "prelude sets up the Main of ReTestItems' workers as the driver's worker_init_expr does" setup=[Syntax] begin

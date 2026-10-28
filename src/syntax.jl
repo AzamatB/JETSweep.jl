@@ -297,6 +297,10 @@ function _retest_statements(node::JS.SyntaxNode)
     return nothing
 end
 
+"Whether `node` is a statement of a test item that `_retest_statements` accepts."
+_item_statement(node::JS.SyntaxNode) = (body = node.parent) !== nothing && (item = body.parent) !== nothing &&
+    _macro_identifier(item) === :testitem && _retest_statements(item) !== nothing
+
 _source_text(node::JS.SyntaxNode, text::String) = String(codeunits(text)[JS.byte_range(node)])
 
 _assignees(lhs::Symbol) = [lhs]
@@ -536,16 +540,21 @@ function _pure_generator(ex::Expr, scope::_Scope)
     return _pure(body, inner) && (condition === nothing || _pure(condition, inner))
 end
 
-"Names a top-level statement binds globally: assignments outside local scopes, definitions and imports."
-function _binds!(names::Set{Symbol}, ex)
+"""
+Names a top-level statement binds globally: assignments outside local scopes, definitions and
+imports, and with `soft`, as in soft scope, the assignments of its loops and `try` blocks too.
+"""
+function _binds!(names::Set{Symbol}, ex; soft::Bool=false)
     ex isa Expr || return names
     assignment = _assignment(ex)
     if assignment !== nothing
         union!(names, first(assignment))
     elseif ex.head in _UPDATES
         union!(names, _assignees(first(ex.args)))
-    elseif ex.head in (:block, :toplevel, :if, :elseif, :&&, :||)
-        foreach(arg -> _binds!(names, arg), ex.args)
+    elseif ex.head in (:block, :toplevel, :if, :elseif, :&&, :||) || (soft && ex.head === :try)
+        foreach(arg -> _binds!(names, arg; soft), ex.args)
+    elseif soft && ex.head in (:for, :while)
+        _binds!(names, last(ex.args); soft)
     elseif ex.head === :macrocall
         union!(names, _bound_names(ex))
         _macro_name(ex) == "@static" && foreach(arg -> _binds!(names, arg), ex.args)
@@ -1154,11 +1163,13 @@ end
 Indices of the statements that analysis may evaluate. Run-dependent statements are evaluated
 only where needed, or where JETLS evaluates part of them anyway; impure assignments only
 where `include` and `eval` calls need them. A need selects the binding of a name that
-reaches the statement needing it. `excluded` statements are not evaluated.
+reaches the statement needing it. `excluded` statements are not evaluated, and `soft` ones
+run in soft scope.
 """
-function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set{Symbol}=Set{Symbol}())
+function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set{Symbol}=Set{Symbol}(),
+                      soft::Set{Int}=Set{Int}())
     shadowed = Set{Symbol}()
-    foreach(ex -> (_binds!(shadowed, ex); _globals!(shadowed, ex)), expressions)
+    foreach(((i, ex),) -> (_binds!(shadowed, ex; soft=i in soft); _globals!(shadowed, ex)), pairs(expressions))
     scope = _Scope(setdiff(modules, shadowed), Set{Symbol}(), shadowed)
     variable = setdiff(union(_PROCESS_NAMES, _RUN_DEPENDENT), shadowed)
     bound = Set{Symbol}()
@@ -1170,7 +1181,7 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set
     need!(names, i, forced) = foreach(name -> push!(needs, (name, i, forced)), names)
     bindings = Dict{Symbol,Vector{Int}}()
     for (i, ex) in pairs(expressions)
-        binds = _binds!(Set{Symbol}(), ex)
+        binds = _binds!(Set{Symbol}(), ex; soft=i in soft)
         assignment = _assignment(ex)
         reads = _evaluated_symbols!(Set{Symbol}(), assignment === nothing ? ex : last(assignment))
         known = i in excluded ? nothing : _evaluable(ex, scope, bound)
@@ -1266,9 +1277,11 @@ imports, such as a test driver's prelude.
 function concretization_patterns(file::String; modules::Set{Symbol}=Set{Symbol}())
     text, statements = _statements(file; modules=true, blocks=false)
     expressions = Any[last(statement) for statement in statements]
+    # ReTestItems runs a test item's statements in soft scope.
+    soft = Set(i for (i, (node, _)) in pairs(statements) if _item_statement(node))
     excluded = Set{Int}()
     while true
-        selected = _concretized(expressions, excluded, modules)
+        selected = _concretized(expressions, excluded, modules, soft)
         # A pattern selects every statement of its file that it matches.
         conflicts = filter(i -> any(j -> !(j in selected) && _may_match(expressions[i], expressions[j]),
                                     eachindex(expressions)), selected)

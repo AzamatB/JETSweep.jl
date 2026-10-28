@@ -156,10 +156,12 @@ JETSweep extends one JETLS rule. To define a closure in a branch, JETLS evaluate
 branch's condition, and with it everything the condition depends on: in a test set, the
 test itself; a closure may be one that `@async`, `@task`, `Threads.@spawn` or
 `Threads.@threads` makes of its code. So JETLS analyzes a `@test` expression that defines an
-anonymous function in a branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, inside a closure of its own.
-JETSweep treats generators and comprehensions alike, as in
+anonymous function in a branch, as in `@test isnothing(x) || all(y -> y > 0, x)`, inside a
+closure of its own. JETSweep treats generators and comprehensions alike, as in
 `@test r.ok && [a.b for a in r.items] == [1]`, which would otherwise run the whole test set in
-JETLS's interpreter; any other top-level expression that assigns nothing, as in
+JETLS's interpreter, and tests of `let` blocks, which bind names of their own only, as in
+`@test let t = t; t.ok && all(k -> k > 0, t.ks) end`; any other top-level expression that
+assigns nothing, as in
 `lock === nothing || atexit(() -> close(lock))`; loops, `let` and `try` blocks and test sets,
 whose bodies are local scopes already, where they define a function under control flow, in a
 branch or loop inside them, which JETLS would run, with the values the function captures, to
