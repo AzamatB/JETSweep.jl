@@ -598,6 +598,22 @@
                         helper() = 1
                         @test helper() == 1
                     end
+
+                    @testitem "enum" begin
+                        @enum Fruit apple banana
+                        @test Int(banana) == 1
+                        sin(apple)
+                    end
+
+                    @testitem "finally" begin
+                        value = try
+                            1
+                        finally
+                            nothing
+                        end
+                        @test value == 1
+                        value + "one"
+                    end
                     """)
                 write(joinpath(root, "Itemized", "test", "body.jl"), """
                     @testset "included by a test item" begin
@@ -615,6 +631,85 @@
                         @test other_value() == 5
                         sin("other")
                     end
+                    """)
+                # The test items of a package with a test project of its own import the package, as
+                # ReTestItems runs them from the package's project.
+                mkpath(joinpath(root, "Tested", "src"))
+                mkpath(joinpath(root, "Tested", "test"))
+                write(joinpath(root, "Tested", "Project.toml"),
+                      "name = \"Tested\"\nuuid = \"4b7d9e2c-1a3f-4c8e-9d6b-5e2f1a0c3b79\"\nversion = \"0.1.0\"\n")
+                write(joinpath(root, "Tested", "src", "Tested.jl"), "module Tested\nexport triple\ntriple(x::Int) = 3x\nend\n")
+                write(joinpath(root, "Tested", "test", "Project.toml"), """
+                    [deps]
+                    ReTestItems = "817f1d60-ba6b-4fd5-9520-3cf149f6a823"
+                    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+                    Tested = "4b7d9e2c-1a3f-4c8e-9d6b-5e2f1a0c3b79"
+
+                    [sources]
+                    Tested = {path = ".."}
+                    """)
+                write(joinpath(root, "Tested", "test", "runtests.jl"), "using ReTestItems, Tested\nruntests(dirname(@__DIR__))\n")
+                write(joinpath(root, "Tested", "test", "triple_test.jl"), """
+                    @testitem "triple" begin
+                        @test triple(2) == 6
+                        triple("two")
+                    end
+                    """)
+                # Each diagnostic is judged by the configuration nearest its file, whichever unit reports it.
+                mkpath(joinpath(root, "configs", "a"))
+                mkpath(joinpath(root, "configs", "b"))
+                switched_off(code, path="") = """
+                    [[diagnostic.patterns]]
+                    pattern = "$code"
+                    match_by = "code"
+                    match_type = "literal"
+                    severity = "off"
+                    $(isempty(path) ? "" : "path = \"$path\"")
+                    """
+                write(joinpath(root, "configs", "a", ".JETLSConfig.toml"), switched_off("inference/field-error"))
+                write(joinpath(root, "configs", "b", ".JETLSConfig.toml"), switched_off("inference/method-error", "lib.jl"))
+                write(joinpath(root, "configs", "a", "main.jl"), """
+                    include(joinpath(@__DIR__, "..", "b", "lib.jl"))
+                    struct Point
+                        x::Int
+                    end
+                    main_field() = Point(1).y
+                    main_failure() = sin("main")
+                    """)
+                write(joinpath(root, "configs", "b", "lib.jl"), """
+                    struct Spot
+                        x::Int
+                    end
+                    lib_field() = Spot(1).y
+                    lib_failure() = sin("lib")
+                    """)
+                # A global assigned the value of a `try` block with a `finally` block is defined after it,
+                # also when the block holds one of its own.
+                write(joinpath(root, "finally.jl"), """
+                    flag = try
+                        rand(Bool)
+                    finally
+                        nothing
+                    end
+                    println(!flag)
+                    nested = try
+                        try
+                            rand(Bool)
+                        catch
+                            false
+                        finally
+                            nothing
+                        end
+                    finally
+                        nothing
+                    end
+                    println(!nested)
+                    const ONE = try 1 finally nothing end
+                    println(ONE + "one")
+                    if rand(Bool)
+                        sometimes = 1
+                    end
+                    println(sometimes)
                     """)
                 output = joinpath(root, ".jetsweep", "report")
                 io = IOBuffer()
@@ -690,9 +785,12 @@
                 found(name) = sort!([(basename(f.file), f.line, f.code) for f in itemized(name).findings])
                 @test all(name -> status("Itemized/test/$name") === :findings,
                           ["items_test.jl", "other_test.jl", "shared_testsetup.jl"])
+                # What `@enum` defines in an item, and a value its `try` block assigns, are defined.
                 @test found("items_test.jl") == [("body.jl", 3, "inference/method-error"),
                                                  ("fixture.jl", 2, "inference/method-error"),
                                                  ("items_test.jl", 9, "inference/method-error"),
+                                                 ("items_test.jl", 25, "inference/method-error"),
+                                                 ("items_test.jl", 35, "inference/method-error"),
                                                  ("shared_testsetup.jl", 2, "lowering/unused-import")]
                 @test only(f.message for f in itemized("shared_testsetup.jl").findings if f.code == "lowering/unused-import") ==
                       "Unused import `Fix2`"
@@ -700,6 +798,11 @@
                 @test found("other_test.jl") == [("other_test.jl", 8, "inference/method-error")]
                 @test !(realpath(joinpath(root, "Itemized", "test", "other_test.jl")) in itemized("items_test.jl").analyzed)
                 @test !any(u -> occursin("Itemized", u.entry) && basename(u.entry) in ("body.jl", "fixture.jl"), result.units)
+                @test status("Tested/test/triple_test.jl") === :findings
+                @test [(f.line, f.code) for f in unit("Tested/test/triple_test.jl").findings] == [(3, "inference/method-error")]
+                @test sort!([(basename(f.file), f.line, f.code) for f in unit("configs/a/main.jl").findings]) ==
+                      [("lib.jl", 4, "inference/field-error"), ("main.jl", 6, "inference/method-error")]
+                @test errors("finally.jl") == [20] && [f.line for f in undefined("finally.jl")] == [24]
                 @test status("uses_sibling.jl") === :findings
                 sibling = only(r for (u, r) in zip(result.units, result.results) if endswith(u.entry, "uses_sibling.jl"))
                 @test any(note -> occursin("It adds packages imported without being declared: Sibling.", note), sibling.notes)
@@ -823,6 +926,21 @@
                 # The result of Crasher's first run is not reported for its second.
                 @test unit("Crasher").status === :failed && again("Crasher", joinpath(root, "Crasher", "LocalPreferences.toml"))
                 @test startswith(only(unit("Crasher").reasons), "worker exited with code 7 without a result")
+            end
+        end
+
+        @async @testset "a sweep of part of a workspace concretizes what it includes from the rest" begin
+            mktempdir() do directory
+                workspace = mkpath(joinpath(realpath(directory), "workspace"))
+                file(path, text) = (mkpath(dirname(joinpath(workspace, path))); write(joinpath(workspace, path), text))
+                # Outside the swept directory, and so outside JETLS's root, a file includes what a constant names.
+                file("lib/helper.jl", "const DATA = joinpath(@__DIR__, \"data\")\ninclude(joinpath(DATA, \"more.jl\"))\n")
+                file("lib/data/more.jl", "more() = sin(\"more\")\n")
+                file("run/main.jl", "include(joinpath(@__DIR__, \"..\", \"lib\", \"helper.jl\"))\nmore()\n")
+                result = integration_sweep(joinpath(workspace, "run"), joinpath(directory, "report"))
+                @test only(result.results).status === :findings
+                @test [(relpath(f.file, workspace), f.line, f.code) for f in only(result.results).findings] ==
+                      [(joinpath("lib", "data", "more.jl"), 1, "inference/method-error")]
             end
         end
 

@@ -955,3 +955,19 @@ end
         @test readdir(occupied) == ["keep"]
     end
 end
+
+@testitem "a package from the registry that compat bounds hold back by a breaking release is noted" begin
+    @test JETSweep._held_back("SnoopCompile", v"1.0.2", v"3.2.10") == "SnoopCompile resolves to 1.0.2, below its " *
+          "newest release, 3.2.10: the compat bounds or locked versions of this environment hold it back."
+    # Offline, resolution considers the installed releases alone.
+    @test occursin("below its newest installed release, 3.2.10:",
+                   JETSweep._held_back("SnoopCompile", v"1.0.2", v"3.2.10"; installed=true)::String)
+    @test JETSweep._held_back("JET", v"0.12.3", v"0.13.1") isa String
+    @test JETSweep._held_back("SnoopCompile", v"3.1.0", v"3.2.10") === nothing
+    @test JETSweep._held_back("SnoopCompile", v"3.2.10", v"3.2.10") === nothing
+    @test JETSweep._held_back("Unregistered", v"1.0.0", nothing) === nothing
+    # ReTestItems, which the suite runs on, is registered and installed: at least the release of its compat bound.
+    retestitems = Base.UUID("817f1d60-ba6b-4fd5-9520-3cf149f6a823")
+    @test JETSweep._newest(retestitems) >= JETSweep._newest(retestitems; installed=true) >= v"1.35.3"
+    @test JETSweep._newest(Base.UUID("00000000-0000-0000-0000-000000000001")) === nothing
+end

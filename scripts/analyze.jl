@@ -327,13 +327,14 @@ end
 # JET, which analyzes what top-level code does where it stands, analyzed none of it and
 # followed none of its includes. The worker analyzes the code as ReTestItems runs it: a test
 # setup as a module of `Main`, here the unit's module, and a test item as the top-level code
-# of a module of its own, which imports `Test` and the package of the nearest project unless
-# it sets `default_imports=false`, and then the setups it names, each statement in soft scope,
-# as at the REPL. A test item is a test set whose `failfast=` applies as a `@testset`'s does. A
-# file's test items run after the rest of it, as ReTestItems runs them once it has included
-# every test file, and those of a file that the unit includes for the setups it defines are
-# left to that file's own unit. `Main` in setups and items is the unit's module, which, as the
-# workers' `Main`, holds what the driver's `worker_init_expr` defines (see `JETSweep.prelude`).
+# of a module of its own, which imports `Test` and the package of the project ReTestItems runs it
+# for (see `project_name`) unless it sets `default_imports=false`, and then the setups it names,
+# each statement in soft scope, as at the REPL. A test item is a test set whose `failfast=`
+# applies as a `@testset`'s does. A file's test items run after the rest of it, as ReTestItems
+# runs them once it has included every test file, and those of a file that the unit includes for
+# the setups it defines are left to that file's own unit. `Main` in setups and items is the
+# unit's module, which, as the workers' `Main`, holds what the driver's `worker_init_expr`
+# defines (see `JETSweep.prelude`).
 
 "The files the unit includes for the test setups they define, whose test items it leaves out."
 const SETUP_FILES = Set{String}()
@@ -366,12 +367,25 @@ end
 "The names of projects by directory, which ReTestItems finds a test item's package by."
 const PROJECT_NAMES = Dict{String,Union{Nothing,String}}()
 
-"The name of the nearest project at or above `directory`, whose package ReTestItems imports into test items."
+"""
+The name of the project ReTestItems runs the test items of the files in `directory` for, whose
+package it imports into them: the project of the first path `runtests` is given, the nearest at or
+above it. That is the nearest project at or above `directory`, but for a package's test project,
+`test/Project.toml`: ReTestItems counts it as part of the package's project, and runs no test item
+for it unless it is a package itself, since TestEnv cannot activate the test environment of another.
+"""
 function project_name(directory::String)
     haskey(PROJECT_NAMES, directory) && return PROJECT_NAMES[directory]
     found = findfirst(name -> isfile(joinpath(directory, name)), Base.project_names)
-    name = found !== nothing ? get(TOML.parsefile(joinpath(directory, Base.project_names[found])), "name", nothing) :
+    name = if found === nothing
         dirname(directory) == directory ? nothing : project_name(dirname(directory))
+    else
+        project = TOML.parsefile(joinpath(directory, Base.project_names[found]))
+        tests = basename(directory) == "test" && Base.project_names[found] == "Project.toml" &&
+            !(haskey(project, "name") && haskey(project, "uuid")) &&
+            any(name -> isfile(joinpath(dirname(directory), name)), Base.project_names)
+        tests ? project_name(dirname(directory)) : get(project, "name", nothing)
+    end
     return PROJECT_NAMES[directory] = name isa String ? name : nothing
 end
 
@@ -407,13 +421,11 @@ function item_failfast(node::JS.SyntaxNode, failfast::Union{Nothing,Bool})
     return failfast
 end
 
-"The statements of test items, which ReTestItems runs in soft scope; the worker does so where JET desugars them."
-const SOFT = Base.IdSet{Expr}()
-soft!(ex::Expr) = (push!(SOFT, ex); ex)
-
-"Whether `ex` is a definition with a docstring: a call of `Core.@doc`."
-documented(ex) =
-    Meta.isexpr(ex, :macrocall) && (f = first(ex.args); f isa GlobalRef && f.mod === Core && f.name === Symbol("@doc"))
+"""
+The statements of test items, which ReTestItems runs in soft scope. The worker lowers them so, and
+what they expand to, after JET has expanded and flattened their macros, as `@enum`'s top-level code.
+"""
+const SOFT = Base.IdSet{JS.SyntaxNode}()
 
 "A statement in soft scope, as `REPL.softscope`, which ReTestItems copies, puts it."
 softscope(@nospecialize ex) =
@@ -451,11 +463,8 @@ Core.eval(LS.JET, quote
         if $retest_macro(node) === :testitem
             body = node[JS.numchildren(node)]
             for i = 1:JS.numchildren(body)
-                statement = body[i]
-                ex = Expr(statement)
-                # A documented definition has no soft scope, and JET handles `@doc` where it stands.
-                plain = $softscope(ex) === ex || $documented(ex)
-                push!(statements, plain ? VNode(statement, force_concretize) : VNode(statement, $soft!(ex), force_concretize))
+                push!($SOFT, body[i])
+                push!(statements, VNode(body[i], force_concretize))
             end
         end
         for i = length(statements):-1:1
@@ -602,7 +611,6 @@ end)
 # needs no condition: the tests of a branch its condition does not take are analyzed too.
 Core.eval(LS.JET, quote
     function desugar_main_macrocall(x::Expr)
-        soft = x in $SOFT && (delete!($SOFT, x); true)
         x = invoke(desugar_main_macrocall, Tuple{Any}, x)
         if $outlinable(x)
             thunk = gensym($(QuoteNode(OUTLINED)))
@@ -613,7 +621,7 @@ Core.eval(LS.JET, quote
             x = $outline_statements(x, outlined)
             isempty(outlined) || (x = Expr(:block, outlined..., x))
         end
-        return soft ? $softscope(x) : x
+        return x
     end
 end)
 
@@ -628,11 +636,16 @@ end
 
 # JET lowers each top-level statement after the line node of its first line. An outlined
 # function starts there too, so that what is reported in it has its location: its loop
-# header or `let` bindings where they stand, and its body where that is.
+# header or `let` bindings where they stand, and its body where that is. A test item's
+# statements, which a function does not hold, are lowered in soft scope.
 Core.eval(LS.Interpreter, quote
     function JET.lower_with_err_handling(interp::LSInterpreter, node::JS.SyntaxNode, xblk::Expr)
         body = $outlined_body(last(xblk.args))
-        body === nothing || !(first(xblk.args) isa LineNumberNode) || pushfirst!(body.args, first(xblk.args))
+        if body !== nothing
+            first(xblk.args) isa LineNumberNode && pushfirst!(body.args, first(xblk.args))
+        elseif node in $SOFT
+            xblk.args[end] = $softscope(xblk.args[end])
+        end
         interp.current_node[] = node
         @invoke JET.lower_with_err_handling(interp::JET.ConcreteInterpreter, node::JS.SyntaxNode, xblk::Expr)
     end
@@ -868,6 +881,83 @@ Core.eval(LS.JET, quote
     end
 end)
 
+"""
+Whether the top-level code `frame` infers returns only through its current block: whether that
+block dominates every `return` that a path from its entry reaches without calling `throw` or
+`rethrow`, and, in code without loops, which inference reaches in the order of its blocks,
+through the earlier blocks inference reached. Lowering ends the code a `finally` block runs
+before an exception propagates with a `rethrow` and a `return` that never runs, and in a `try`
+block with a `finally` block of its own, sets a flag after that `rethrow` that leads to another.
+"""
+function returns_through(frame::CC.InferenceState)
+    code, blocks = frame.src.code, frame.cfg.blocks
+    function throws(stmt)
+        Meta.isexpr(stmt, :(=), 2) && (stmt = last(stmt.args))
+        Meta.isexpr(stmt, :call) || return false
+        f = first(stmt.args)
+        f isa Core.SSAValue && (f = code[f.id])
+        return f isa GlobalRef && f.name in (:throw, :rethrow) && isdefinedglobal(f.mod, f.name) &&
+            getglobal(f.mod, f.name) in (throw, rethrow)
+    end
+    ordered = all(b -> all(>(b), blocks[b].succs), eachindex(blocks))
+    reached, pending = Set([1]), [1]
+    domtree = CC.construct_domtree(frame.cfg)
+    while !isempty(pending)
+        b = pop!(pending)
+        ordered && b < frame.currbb && frame.bb_vartables[b] === nothing && continue
+        any(pc -> throws(code[pc]), blocks[b].stmts) && continue
+        code[last(blocks[b].stmts)] isa Core.ReturnNode && !CC.dominates(domtree, frame.currbb, b) && return false
+        foreach(s -> s in reached || (push!(reached, s); push!(pending, s)), blocks[b].succs)
+    end
+    return true
+end
+
+"""
+Record the global `gr`, or the constant of type `typ`, that the top-level code `frame` assigns
+where it returns only through as defined: JET records it as possibly undefined unless the
+assignment postdominates the code's entry, which no assignment of the value of a `try` block with
+a `finally` block does.
+"""
+function assigned!(analyzer, frame::CC.InferenceState, gr::GlobalRef, @nospecialize(typ=nothing))
+    LS.JET.istoplevelframe(frame) || return nothing
+    states = LS.JET.get_binding_states(analyzer)
+    @lock states.lock if typ === nothing
+        partition = Base.lookup_binding_partition(CC.get_inference_world(analyzer), gr)
+        state = LS.JET.find_binding_state(states.bindings, partition)
+        state !== nothing && !state.isconst && state.maybeundef && returns_through(frame) &&
+            (states.bindings[partition] = LS.JET.AbstractBindingState(false, false; state.assignment))
+    else
+        # JET has just defined the constant as its state, in a world of its own.
+        partition = Base.lookup_binding_partition(Base.get_world_counter(), gr)
+        state = CC.partition_restriction(partition)
+        if CC.is_defined_const_binding(CC.binding_kind(partition)) && state isa LS.JET.AbstractBindingState &&
+           state.maybeundef && returns_through(frame)
+            defined = LS.JET.AbstractBindingState(true, false, typ; state.assignment)
+            Core.eval(gr.mod, Expr(:const, gr.name, defined))
+            states.bindings[Base.lookup_binding_partition(Base.get_world_counter(), gr)] = defined
+        end
+    end
+    return nothing
+end
+
+Core.eval(LS.Analyzer, quote
+    function CC.global_assignment_rt_exct(analyzer::LSAnalyzer, sv::CC.InferenceState, saw_latestworld::Bool,
+                                          g::GlobalRef, @nospecialize(newty))
+        ret = @invoke CC.global_assignment_rt_exct(analyzer::JET.ToplevelAbstractAnalyzer, sv::CC.InferenceState,
+                                                   saw_latestworld::Bool, g::GlobalRef, newty::Any)
+        saw_latestworld || JET.isconcretized(analyzer, sv) || first(ret) === Union{} || $assigned!(analyzer, sv, g)
+        return ret
+    end
+    function JET.const_assignment_rt_exct(analyzer::LSAnalyzer, sv::CC.InferenceState, saw_latestworld::Bool,
+                                          gr::GlobalRef, @nospecialize(new_binding_typ))
+        ret = @invoke JET.const_assignment_rt_exct(analyzer::JET.ToplevelAbstractAnalyzer, sv::CC.InferenceState,
+                                                   saw_latestworld::Bool, gr::GlobalRef, new_binding_typ::Any)
+        saw_latestworld || first(first(ret)) === Union{} || new_binding_typ === nothing ||
+            $assigned!(analyzer, sv, gr, new_binding_typ)
+        return ret
+    end
+end)
+
 # JET evaluates every `eval` call, since it may define anything; `include_string` calls too.
 Core.eval(LS.JET, quote
     known_names(func::Symbol) = func === :eval ? (:eval, :include_string) : (func,)
@@ -907,6 +997,15 @@ Core.eval(LS.JET, quote
         s = replace(s, virtual * "." => "", virtual => "Main")
         return replace(s, $CONTEXT_PATH => context -> endswith(context, ".") ? "" : "Main")
     end
+end)
+
+# JETLS applies the concretization patterns of its configuration only to files below its root,
+# though it matches severity patterns and analysis overrides by their absolute paths outside it.
+# A unit's configuration names the files it loads from outside its root so, as a sweep of part of
+# a package does those of the rest of it (`JETSweep._write_jetls_config`): match them alike.
+Core.eval(LS, quote
+    relative_workspace_path_for_config(server::Server, filename::AbstractString) =
+        glob_candidate_path(filename, server.state.root_path)
 end)
 
 # JETLS dispatches in the world it was loaded in, to stay clear of analyzed code.
@@ -1112,6 +1211,31 @@ function original(file::String, line::Int)
     return source, parse(Int, start) + clamp(line - marker - 1 - evaluated, 0, span - 1 - 2evaluated)
 end
 
+"The severity configurations of diagnostics, by the `.JETLSConfig.toml` they are read from."
+const DIAGNOSTIC_CONFIGS = Dict{String,Any}()
+
+"""
+The severity configuration that judges the diagnostics of `file`, and the directory its paths are
+relative to: that of the nearest `.JETLSConfig.toml` at or above the file, as JETLS reads it in a
+workspace there, with diagnostics enabled, as JETSweep keeps them.
+"""
+function diagnostic_config(file::String)
+    directory = dirname(file)
+    while !isfile(joinpath(directory, ".JETLSConfig.toml")) && dirname(directory) != directory
+        directory = dirname(directory)
+    end
+    path = joinpath(directory, ".JETLSConfig.toml")
+    manager = get!(DIAGNOSTIC_CONFIGS, path) do
+        data = LS.validate_config_data(isfile(path) ? TOML.parsefile(path) : Dict{String,Any}())
+        LS.migrate_deprecated_config!(data)
+        settings = merge(get(data, "diagnostic", Dict{String,Any}()), Dict{String,Any}("enabled" => true))
+        config = LS.parse_config_dict(Dict{String,Any}("diagnostic" => settings), path)
+        config isa LS.JETLSConfig || error(config)
+        LS.ConfigManager(LS.ConfigManagerData(config, LS.EMPTY_CONFIG, path, true))
+    end
+    return manager, directory
+end
+
 function analyze(request, log::ErrorLog)
     timings = Dict{String,Float64}()
     started = time()
@@ -1184,7 +1308,10 @@ function analyze(request, log::ErrorLog)
                 first(split(LS.get_raw_message(diagnostic), '\n')))
         end
         for (uri, list) in diagnostics
-            LS.apply_diagnostic_config!(list, server.state.config_manager, uri, request["root"])
+            file = LS.uri2filepath(uri)
+            manager, root = request["configured"] || file === nothing ?
+                (server.state.config_manager, request["root"]) : diagnostic_config(file)
+            LS.apply_diagnostic_config!(list, manager, uri, root)
         end
         timings["lowering"] = time() - mark
         return Dict{String,Any}("analyzed" => sort!(filter(file -> file != generated && !(file in PARTIAL), files)),

@@ -66,9 +66,9 @@ syntax_broken(ex) = ex isa Expr && (ex.head in (:error, :incomplete) || any(synt
 
 syntax_parses(text::String) = !syntax_broken(Meta.parseall(text))
 
-"Load `text` as a file of its own directory into a fresh module: the module, or the error."
+"Load `text` as a file of its own directory into a fresh module, which has `include`: the module, or the error."
 function syntax_load(text::String)
-    sandbox = Module(:SyntaxSandbox)
+    sandbox = Core.eval(Module(:SyntaxParent), :(module SyntaxSandbox end))
     mktempdir() do directory
         file = syntax_write(realpath(directory), "entry.jl", text)
         try
@@ -905,13 +905,19 @@ end
         OTHER && Base.deprecate(Base, :old_name)
         const REPLACEMENT = string(:new_value, get(ENV, "SUFFIX", ""))
         Base.@deprecate_binding old_value new_value false string(", use ", REPLACEMENT, " instead.")
+        # A run-dependent name written qualified is one too.
+        const SETTINGS = TOML.parsefile(joinpath(@__DIR__, "settings.toml"))
+        const MODE = get(Base.ENV, "MODE", "")
+        const ENTRIES = Base.readdir.([@__DIR__])
+        const SETTINGS_FILE = Base.joinpath(@__DIR__, "settings.toml")
         """
     @test syntax_patterns(code) == ["const LEVEL = isempty(ARGS) ? 1 : 2",
         "const ASKED = isempty(ARGS) ? split(get(ENV, \"TESTS\", \"\"), \",\"; keepempty=false) : ARGS",
         "const PICKED = isempty(ASKED) ? [\"a\"] : filter(f -> f in ASKED, [\"a\"])",
         "const MEASURE = get(ARGS, 1, \"\") == \"--measure\"", "if MEASURE\n    using Statistics\nend",
         "const LEGACY = get(ENV, \"LEGACY\", \"\") == \"1\"",
-        "const REPLACEMENT = string(:new_value, get(ENV, \"SUFFIX\", \"\"))"]
+        "const REPLACEMENT = string(:new_value, get(ENV, \"SUFFIX\", \"\"))",
+        "const SETTINGS_FILE = Base.joinpath(@__DIR__, \"settings.toml\")"]
 end
 
 @testitem "concretization_patterns follows what JETLS outlines, includes and imports" setup=[Syntax] begin
@@ -1420,4 +1426,62 @@ end
     # `Main.x` reads the analyzed code's own global, pure when `x` is known.
     @test syntax_patterns("const A = \"a\"\nconst B = joinpath(Main.A, \"x\")\nconst C = joinpath(Main.UNKNOWN, \"x\")\n") ==
           ["const A = \"a\"", "const B = joinpath(Main.A, \"x\")"]
+end
+
+@testitem "prelude pins the locations a worker_init_expr depends on to the driver" setup=[Syntax] begin
+    # Workers run the expression as code of the driver's file, in the driver's directory, and
+    # the driver evaluates what it interpolates.
+    driver = """
+        using ReTestItems
+        runtests(@__DIR__; nworkers=1, worker_init_expr=quote
+            const ROOT = \$(@__DIR__)
+            const DATA = joinpath(@__DIR__, "data")
+            const SELF = Base.@__FILE__
+            const VALUE = include("sub/value.jl")
+        end)
+        """
+    target = "@testitem \"t\" begin\n    @test dirname(Main.SELF) == Main.ROOT && isdir(Main.DATA) && Main.VALUE == 1\nend\n"
+    files = ("test/runtests.jl" => driver, "test/sub/value.jl" => "1\n", "test/items_test.jl" => target)
+    syntax_prelude(files...; target="test/items_test.jl") do text, dir
+        tests = joinpath(dir, "test")
+        @test !occursin("@__", text)
+        # Loaded from a file of another directory, as a unit's generated entry is.
+        sandbox = syntax_load(text)
+        @test sandbox isa Module
+        if sandbox isa Module
+            @test syntax_value(sandbox, :ROOT) == tests
+            @test syntax_value(sandbox, :DATA) == joinpath(tests, "data")
+            @test syntax_value(sandbox, :SELF) == joinpath(tests, "runtests.jl")
+            @test syntax_value(sandbox, :VALUE) == 1
+        end
+    end
+end
+
+@testitem "prelude resolves a worker_init_expr's relative includes where Pkg.test runs the tests" setup=[Syntax] begin
+    # Workers start in the directory of the outermost driver, where `Pkg.test` runs it, whichever file
+    # calls `runtests`, and `@__DIR__` names that file's directory.
+    init = """
+        runtests(@__DIR__; nworkers=1, worker_init_expr=quote
+            const HERE = @__DIR__
+            const VALUE = include("sub/value.jl")
+        end)
+        """
+    target = "@testitem \"t\" begin\n    @test isdir(Main.HERE) && Main.VALUE == 1\nend\n"
+    # The call in a file the driver includes statically, and in a nested driver it includes at run time.
+    layouts = [(("test/runtests.jl" => "using ReTestItems\ninclude(\"integration/run.jl\")\n",
+                 "test/integration/run.jl" => init), ["test/runtests.jl"]),
+               (("test/runtests.jl" => "for d in (\"integration\",)\n    include(joinpath(d, \"runtests.jl\"))\nend\n",
+                 "test/integration/runtests.jl" => "using ReTestItems\n" * init),
+                ["test/runtests.jl", "test/integration/runtests.jl"])]
+    for (files, drivers) in layouts
+        files = (files..., "test/sub/value.jl" => "1\n", "test/integration/items_test.jl" => target)
+        syntax_prelude(files...; drivers, target="test/integration/items_test.jl") do text, dir
+            sandbox = syntax_load(text)
+            @test sandbox isa Module
+            if sandbox isa Module
+                @test syntax_value(sandbox, :HERE) == joinpath(dir, "test", "integration")
+                @test syntax_value(sandbox, :VALUE) == 1
+            end
+        end
+    end
 end

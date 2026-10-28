@@ -465,6 +465,9 @@ end
         @test planning_overrides(config.contexts[2]) == PLANNING_NONE
         @test config.contexts[2].keys == Set(["match", "project"])
         @test config.contexts[3].project == joinpath(root, "tools/env")
+        write(default, "[[context]]\nmatch = \"tools/check.jl\"\nproject = \"\"\n")
+        @test only(JETSweep.read_config(root).contexts).project == ""
+        @test only(JETSweep.read_config(root).contexts).keys == Set(["match", "project"])
 
         relocated = planning_file(root, "settings/sweep.toml",
                                   "[[context]]\nmatch = \"tools/check.jl\"\nsetup = [\"local.jl\"]\n")
@@ -546,10 +549,12 @@ end
         configured = planning_unit(units, check)
         @test configured.context == planning_context(environment, "")
         @test planning_overrides(configured.overrides) == ([setup], ["--fast"], Dict("MODE" => "analysis"), jetls)
+        # A test given an environment of its own runs there alone, as a script outside its package's tests.
         test_unit = planning_unit(units, test_file)
-        @test test_unit.context == planning_context(environment, package, true)
+        @test (test_unit.kind, test_unit.driver) == (:script, "")
+        @test test_unit.context == planning_context(environment, "")
         @test test_unit.overrides.args == ["--test"]
-        @test test_unit.id == planning_unit(plan(inventory), test_file).id
+        @test test_unit.id == JETSweep._unit_id(:script, test_file, root)
         @test planning_unit(units, extension).context ==
               planning_context(environment, package, false, Dict("Dates" => PLANNING_DATES))
         for file in (setup, other, loose, entry)
@@ -558,6 +563,15 @@ end
         @test planning_unit(units, other).context == planning_context("", "")
         @test planning_unit(units, entry).context == planning_context(package, package)
         planning_invariants(inventory, units)
+
+        # A package's own script, in its test environment, given an environment of its own or none.
+        script = planning_file(package, "scripts/trace.jl")
+        @test planning_unit(last(planning_plan(root)), script).context == planning_context(package, package, true)
+        for (project, context) in (("tools/env", planning_context(environment, "")), ("", planning_context("", "")))
+            planning_file(root, ".JETSweep.toml", "[[context]]\nmatch = \"Pkg/scripts/trace.jl\"\nproject = \"$project\"\n")
+            unit = planning_unit(last(planning_plan(root)), script)
+            @test (unit.kind, unit.context) == (:script, context)
+        end
 
         planning_file(root, ".JETSweep.toml", "[[context]]\nmatch = \"*.jl\"\nargs = [\"--all\"]\n")
         _, units = planning_plan(root)
@@ -660,5 +674,82 @@ end
         @test planning_unit(last(planning_plan(host, file)), test).context.imports == imports
         @test planning_unit(plan(discover(host; exclude=["fixtures"])), test).context.imports ==
               merge(imports, Dict("Sibling" => copy))
+    end
+end
+
+@testitem "a sweep of part of a project plans its files as a sweep of the whole does" setup=[Planning] begin
+    mktempdir() do directory
+        root = realpath(directory)
+        package = planning_package(root, "Pkg", "Pkg"; extras=Dict("Test" => PLANNING_TEST), targets=Dict("test" => ["Test"]))
+        entry = planning_file(package, "src/Pkg.jl", "module Pkg\ninclude(\"sub/part.jl\")\nend\n")
+        planning_file(package, "src/sub/part.jl")
+        driver = planning_file(package, "test/runtests.jl", "using Test, Pkg\nfor file in ARGS\n    include(file)\nend\n")
+        case = planning_file(package, "test/cases/case.jl", "@test true\n")
+        environment = planning_project(root, "Pkg/validation")
+        planning_file(environment, "corpus/build.jl")
+        # A test item that includes a script of its package, outside the test directory, gets what it imports.
+        sibling = planning_package(root, "Sibling", "Sibling")
+        planning_file(sibling, "src/Sibling.jl", "module Sibling\nend\n")
+        planning_file(package, "scripts/gate.jl", "using Sibling\n")
+        gate = planning_file(package, "test/gate_test.jl",
+                             "@testitem \"gate\" begin\n    include(joinpath(@__DIR__, \"..\", \"scripts\", \"gate.jl\"))\nend\n")
+        planning_file(root, ".JETSweep.toml")
+        config = JETSweep.read_config(root)
+        whole = plan(discover(root; config), config)
+        @test planning_unit(whole, gate).context.imports == Dict("Sibling" => sibling)
+        for part_of in ("Pkg/test", "Pkg/test/cases", "Pkg/validation/corpus", "Pkg/src/sub")
+            inventory = discover(joinpath(root, part_of); config)
+            # The projects above the directory are those the sweep is in, not packages it leaves out.
+            @test package in (project.dir for project in inventory.projects)
+            @test !any(tier -> any(project -> project.dir == package, tier), inventory.available)
+            units = plan(inventory, config)
+            @test !isempty(units)
+            for unit in units
+                same = planning_unit(whole, unit.entry)
+                @test (unit.kind, unit.context.project, unit.context.owner, unit.context.test, unit.driver, unit.expected) ==
+                      (same.kind, same.context.project, same.context.owner, same.context.test, same.driver,
+                       filter(in(unit.expected), same.expected))
+            end
+        end
+        @test planning_unit(plan(discover(joinpath(package, "test"); config), config), gate).context.imports ==
+              Dict("Sibling" => sibling)
+        # The package of a sweep of part of its sources is analyzed, as its entry loads them.
+        @test only(plan(discover(joinpath(package, "src", "sub")))).entry == entry
+        @test planning_unit(plan(discover(joinpath(package, "test", "cases"))), case).driver == driver
+    end
+end
+
+@testitem "a test-only package loads in the environment of the project that sources it" setup=[Planning] begin
+    mktempdir() do directory
+        root = realpath(directory)
+        parent_uuid, helper_uuid, other_uuid = string(uuid4()), string(uuid4()), string(uuid4())
+        parent = planning_project(root, "Parent", Dict{String,Any}(
+            "name" => "Parent", "uuid" => parent_uuid, "deps" => Dict("Other" => other_uuid),
+            "extras" => Dict("Helper" => helper_uuid), "targets" => Dict("test" => ["Helper"]),
+            "sources" => Dict("Helper" => Dict("path" => "test/helper"), "Other" => Dict("url" => "https://example.com/Other.jl"),
+                              "Stray" => Dict("path" => "test/stray"), "Sourced" => Dict("path" => "test/sourced"))))
+        planning_file(parent, "src/Parent.jl", "module Parent\nend\n")
+        # It depends on its parent, or on a package its parent sources, and sources neither.
+        for (name, deps) in (("helper", Dict("Parent" => parent_uuid)), ("stray", Dict("Other" => other_uuid)))
+            helper = planning_project(parent, "test/$name", Dict{String,Any}(
+                "name" => titlecase(name), "uuid" => name == "helper" ? helper_uuid : string(uuid4()), "deps" => deps))
+            planning_file(helper, "src/$(titlecase(name)).jl", "module $(titlecase(name))\nend\n")
+        end
+        # One that sources what it depends on, or that its parent does not source, loads alone.
+        sourced = planning_project(parent, "test/sourced", Dict{String,Any}(
+            "name" => "Sourced", "uuid" => string(uuid4()), "deps" => Dict("Parent" => parent_uuid),
+            "sources" => Dict("Parent" => Dict("path" => "../.."))))
+        planning_file(sourced, "src/Sourced.jl", "module Sourced\nend\n")
+        loose = planning_project(parent, "test/loose", Dict{String,Any}(
+            "name" => "Loose", "uuid" => string(uuid4()), "deps" => Dict("Parent" => parent_uuid)))
+        planning_file(loose, "src/Loose.jl", "module Loose\nend\n")
+        inventory, units = planning_plan(root)
+        context(name) = planning_unit(units, joinpath(parent, "test", lowercase(name), "src", "$name.jl")).context
+        @test context("Helper") == planning_context(parent, joinpath(parent, "test", "helper"))
+        @test context("Stray") == planning_context(parent, joinpath(parent, "test", "stray"))
+        @test context("Sourced") == planning_context(sourced, sourced)
+        @test context("Loose") == planning_context(loose, loose)
+        @test planning_unit(units, joinpath(parent, "src", "Parent.jl")).context == planning_context(parent, parent)
+        planning_invariants(inventory, units)
     end
 end

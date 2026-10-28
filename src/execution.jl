@@ -230,20 +230,23 @@ struct _Sweep
     patterns::Dict{Tuple{String,Vector{Symbol}},Vector{String}}
 end
 
-"The `.JETLSConfig.toml` that applies to a unit: configured, or the nearest above its entry."
-function _jetls_config(unit::Unit, root::String)
+"The `.JETLSConfig.toml` a unit analyzes with: configured, or the nearest at or above its entry."
+function _jetls_config(unit::Unit)
     isempty(unit.overrides.jetls_config) || return unit.overrides.jetls_config
     directory = dirname(unit.entry)
     while true
         file = joinpath(directory, ".JETLSConfig.toml")
         isfile(file) && return file
-        (directory == root || !_within(directory, root)) && return ""
+        dirname(directory) == directory && return ""
         directory = dirname(directory)
     end
 end
 
 "A path as a literal glob: JETLS matches configured paths with escapes enabled."
 _glob_literal(path::AbstractString) = replace(_slash(path), r"([\\*?\[\]])" => s"\\\1")
+
+"The glob that names `file` in a JETLS configuration: its path relative to `root`, or outside it, its absolute path."
+_config_path(file::String, root::String) = _glob_literal(_within(file, root) ? relpath(file, root) : file)
 
 const _PATH_SETTINGS = (("diagnostic", "patterns"), ("full_analysis", "concretization_patterns"),
                         ("initialization_options", "analysis_overrides"))
@@ -274,9 +277,10 @@ function _drivers(unit::Unit, sweep::_Sweep)
 end
 
 """
-Write the unit's JETLS configuration and return its directory. The user's configuration
-applies with its paths rebased from its own directory to the sweep root, plus the settings
-a sweep requires, and a batch default for `concretization_timeout`.
+Write the unit's JETLS configuration and return its directory, and the root its paths are
+relative to: the sweep root, or the directory of the user's configuration where that holds the
+root. The user's configuration applies with its paths rebased from its own directory to that
+root, plus the settings a sweep requires, and a batch default for `concretization_timeout`.
 
 Script analysis also evaluates the statements of the files it loads that are free of side
 effects, and those `include` and `eval` calls need (`concretization_patterns`), so that
@@ -285,8 +289,8 @@ including the files it includes at run time that are analyzed as their own units
 """
 function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separate::Vector{String},
                              drivers::Vector{String}=String[], setups::Vector{String}=String[])
-    root = sweep.inventory.root
-    source = _jetls_config(unit, root)
+    source = _jetls_config(unit)
+    root = !isempty(source) && _within(sweep.inventory.root, dirname(source)) ? dirname(source) : sweep.inventory.root
     data = isempty(source) ? Dict{String,Any}() : TOML.parsefile(source)
     prefix = isempty(source) ? "." : relpath(dirname(source), root)
     for (section, key) in _PATH_SETTINGS, entry in get(get(data, section, Dict()), key, Any[])
@@ -307,8 +311,8 @@ function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separ
         # A test file can read the modules its drivers' prelude imports.
         modules = isempty(drivers) ? Set{Symbol}() : prelude_modules(drivers, unit.entry; packages=_owner(unit, sweep.inventory))
         for file in sort!(collect(loaded))
-            isfile(file) && _within(file, root) || continue
-            path = _glob_literal(relpath(file, root))
+            isfile(file) || continue
+            path = _config_path(file, root)
             key = (file, sort!(collect(modules)))
             for pattern in get!(() -> concretization_patterns(file; modules), sweep.patterns, key)
                 push!(patterns, Dict("pattern" => pattern, "path" => path))
@@ -318,10 +322,10 @@ function _write_jetls_config(unit::Unit, directory::String, sweep::_Sweep, separ
     if !isempty(separate)
         overrides = get!(get!(data, "initialization_options", Dict{String,Any}()), "analysis_overrides", Any[])
         for file in separate
-            push!(overrides, Dict("path" => _glob_literal(relpath(file, root)), "on_include" => "skip"))
+            push!(overrides, Dict("path" => _config_path(file, root), "on_include" => "skip"))
         end
     end
-    return dirname(_write_toml(joinpath(directory, "config", ".JETLSConfig.toml"), data))
+    return dirname(_write_toml(joinpath(directory, "config", ".JETLSConfig.toml"), data)), root
 end
 
 "The package a unit belongs to, by name, whose `pkgdir` and `pathof` its files may name."
@@ -415,10 +419,12 @@ function _analyze(unit::Unit, environment::Environment, sweep::_Sweep, gpu::Unio
     # files load only its prelude.
     separate = get(sweep.separate, unit.entry, String[])
     name, uuid = _package(unit, sweep.inventory)
+    config, root = _write_jetls_config(unit, directory, sweep, separate, drivers, setups)
+    # Diagnostics are judged by the configuration nearest their file, unless one is configured for the unit.
     request = _write_toml(joinpath(directory, "request.toml"), Dict(
         "kind" => String(unit.kind), "entry" => unit.entry, "environment" => environment.dir,
-        "generated" => generated, "config" => _write_jetls_config(unit, directory, sweep, separate, drivers, setups),
-        "root" => sweep.inventory.root, "package" => name, "uuid" => uuid, "extension" => unit.extension,
+        "generated" => generated, "config" => config, "configured" => !isempty(unit.overrides.jetls_config),
+        "root" => root, "package" => name, "uuid" => uuid, "extension" => unit.extension,
         "triggers" => unit.context.triggers, "args" => unit.overrides.args, "env" => unit.overrides.env,
         "setups" => setups))
     # A unit that runs again in an environment prepared again (see `sweep`) must not report its first result.

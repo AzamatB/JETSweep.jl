@@ -38,10 +38,12 @@ _absolute(base::String, path::String) = (path = normpath(abspath(base, path)); l
     read_config(root, file="") -> Config
 
 Read `file`, or `root/.JETSweep.toml` when it exists. `project`, `setup` and `jetls_config`
-are paths relative to the file. Globs are relative to the file's directory when `root` is in
-it, else to `root`: `exclude` patterns follow the `--exclude` rules there, and each `match` is
-a glob a unit's entry path must match whole. `setup` applies to tests and scripts, not to
-package, extension and orphan analyses, which load the package itself. When several
+are paths relative to the file; `project = ""` names no project. Globs are relative to the
+file's directory when `root` is in it, else to `root`: `exclude` patterns follow the `--exclude`
+rules there, and each `match` is a glob a unit's entry path must match whole. `project` is the
+environment a test or script runs in, alone; package, extension and orphan analyses load their
+package in it. `setup` applies to tests and scripts, not to package, extension and orphan
+analyses, which load the package itself. When several
 `[[context]]` tables match a unit, each key a later table sets overrides it, except `env`,
 whose variables merge.
 
@@ -80,7 +82,8 @@ function read_config(root::AbstractString, file::AbstractString="")
         match isa String || throw(ArgumentError("$config_file: each [[context]] needs a `match` glob"))
         project = get(table, "project", "")
         project isa String || throw(ArgumentError("$config_file: `project` must be a path"))
-        if haskey(table, "project")
+        # `project = ""` is none: an environment of the packages the unit imports.
+        if !isempty(project)
             project = _absolute(base, project)
             basename(project) in _PROJECT_FILES && (project = dirname(project))
             any(isfile, joinpath.(project, _PROJECT_FILES)) ||

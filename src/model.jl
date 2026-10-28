@@ -23,7 +23,7 @@ struct Source
     owner::String
 end
 
-"Every Julia project and source below a root, with the paths excluded from discovery."
+"Every Julia project and source below a root, the projects above it, and the paths excluded from discovery."
 struct Inventory
     root::String
     projects::Vector{Project}

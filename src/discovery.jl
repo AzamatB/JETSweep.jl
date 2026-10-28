@@ -204,7 +204,10 @@ skipped unless Git tracks files inside them, as are `node_modules` and `__pycach
 always directories a `CACHEDIR.TAG` marks as caches, such as earlier reports. Symlinks are
 not followed: inside the root they are aliases of what discovery reaches anyway, or of what
 it excludes. `exclude` holds globs relative to `root`, and `config` exclusions relative to
-its directory. `output` names a report directory to skip.
+its directory. `output` names a report directory to skip. The projects above `root`, as far
+as Julia looks for an enclosing project, up to the home directory, are inventoried too, so
+that a sweep of part of a project, such as a package's test directory, finds its sources in
+the projects and packages they are in, as a sweep of the whole does.
 
 The packages of directories the sweep leaves out are still inventoried, without their
 sources or issues, as `available` packages that other code may load: those of excluded
@@ -328,8 +331,16 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], config
     finally
         foreach(close, repositories)
     end
+    # The projects above the root, as `--project=@.` looks for one.
+    directory = root
+    while directory != homedir() && dirname(directory) != directory
+        directory = dirname(directory)
+        found = findfirst(isfile, joinpath.(directory, _PROJECT_FILES))
+        found === nothing || push!(project_files[1], joinpath(directory, _PROJECT_FILES[found]))
+    end
     projects = [_read_project(file, issues) for file in sort!(project_files[1])]
-    available = [filter(ispackage, [_read_project(file, String[]) for file in sort!(tier)]) for tier in project_files[2:3]]
+    available = [filter(project -> ispackage(project) && !(project.file in project_files[1]),
+                        [_read_project(file, String[]) for file in sort!(tier)]) for tier in project_files[2:3]]
     # Deepest projects first, so the first match is the nearest enclosing project. A named
     # project bounds package ownership even when its metadata is otherwise broken.
     nearest = sort(projects; by=project -> (-length(project.dir), project.dir))

@@ -407,6 +407,10 @@ const _PURE_NAMES = Set([:nothing, :missing, :true, :false, :Inf, :NaN, :pi, :π
 const _PROCESS_NAMES = Set([:ARGS, :ENV, :PROGRAM_FILE])
 "Pure functions whose values depend on where the program runs: its directory and files."
 const _RUN_DEPENDENT = Set([:abspath, :realpath, :pwd, :readdir, :read, :readlines, :readchomp, :parsefile])
+"The modules whose pure functions calls may name qualified, as `TOML.parsefile`."
+const _PURE_MODULES = (:Base, :Sys, :Meta, :TOML)
+"The names `_evaluated_symbols!` gives the run-dependent names it finds qualified, such as `TOML.parsefile` or `Base.ENV`."
+const _QUALIFIED_RUN_DEPENDENT = Set(Symbol(m, '.', f) for m in _PURE_MODULES for f in union(_PROCESS_NAMES, _RUN_DEPENDENT))
 const _PURE_CALLS = Set(Symbol.(split("""
     joinpath normpath dirname basename splitext splitdir splitpath relpath isabspath isfile isdir
     ispath readdir read readlines readchomp parseall parsefile abspath realpath pwd pkgdir pathof string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
@@ -454,7 +458,7 @@ function _pure_callee(f, scope::_Scope)
     f isa Symbol && return (f in _PURE_CALLS || f === :isdefined) && !(f in scope.shadowed)
     f isa Expr || return false
     f.head === :curly && return _pure_callee(first(f.args), scope) && all(arg -> _pure_type(arg, scope), f.args[2:end])
-    return f.head === :. && first(f.args) in (:Base, :Sys, :Meta, :TOML) && Symbol(_name(f)) in _PURE_CALLS
+    return f.head === :. && first(f.args) in _PURE_MODULES && Symbol(_name(f)) in _PURE_CALLS
 end
 
 "A type parameter: the file's own types count, since naming a type runs no code."
@@ -905,12 +909,19 @@ function _closure(ex)
     return signature isa Expr && signature.head === :tuple
 end
 
-"Symbols `ex` evaluates: those outside quoted code, and those interpolated into it."
+"""
+Symbols `ex` evaluates: those outside quoted code, and those interpolated into it, with a
+run-dependent name written qualified, as `TOML.parsefile`, as `_QUALIFIED_RUN_DEPENDENT` names it.
+"""
 function _evaluated_symbols!(names::Set{Symbol}, ex, quoted::Bool=false)
     if ex isa Symbol
         quoted || push!(names, ex)
     elseif ex isa Expr
         quoted = ex.head === :quote ? true : ex.head === :$ ? false : quoted
+        if !quoted && ex.head === :. && length(ex.args) == 2 && last(ex.args) isa QuoteNode
+            name = Symbol(first(ex.args), '.', last(ex.args).value)
+            name in _QUALIFIED_RUN_DEPENDENT && push!(names, name)
+        end
         foreach(arg -> _evaluated_symbols!(names, arg, quoted), (quoted ? ex : something(_command(ex), ex)).args)
     end
     return names
@@ -1171,7 +1182,7 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set
     shadowed = Set{Symbol}()
     foreach(((i, ex),) -> (_binds!(shadowed, ex; soft=i in soft); _globals!(shadowed, ex)), pairs(expressions))
     scope = _Scope(setdiff(modules, shadowed), Set{Symbol}(), shadowed)
-    variable = setdiff(union(_PROCESS_NAMES, _RUN_DEPENDENT), shadowed)
+    variable = union(setdiff(union(_PROCESS_NAMES, _RUN_DEPENDENT), shadowed), _QUALIFIED_RUN_DEPENDENT)
     bound = Set{Symbol}()
     selected = Set{Int}()
     # Statements to evaluate where needed, with what they read and whether they are pure.
@@ -1303,7 +1314,8 @@ end
 # conditionals are wrapped in `@eval`, which analysis always evaluates, since concretization
 # patterns cannot apply to the generated file. A driver that runs ReTestItems sets up the
 # `Main` of its workers with the constants its `worker_init_expr` defines, so they count as
-# its assignments.
+# its assignments, with `@__DIR__` and `@__FILE__` pinned to the file that calls `runtests`
+# and relative include paths to the directory the workers run in.
 
 function _macro_identifier(node::JS.SyntaxNode)
     JS.kind(node) == JS.K"macrocall" || return nothing
@@ -1356,6 +1368,24 @@ function _relocated(node::JS.SyntaxNode, text::String, file::String)
     return String(take!(io))
 end
 
+"""
+`ex`, an expression `file` gives a ReTestItems worker to run, with the locations it depends on
+pinned: `@__DIR__` and `@__FILE__` to `file`, whose code it is, as `_relocations!` pins them in
+source text, and relative include paths to `directory`, the worker's working directory, from
+which `include` resolves them outside a file.
+"""
+function _worker_relocated(ex, file::String, directory::String)
+    ex isa Expr || return ex
+    if ex.head === :macrocall
+        _macro_name(ex) == "@__DIR__" && return dirname(file)
+        _macro_name(ex) == "@__FILE__" && return file
+    end
+    ex = Expr(ex.head, (_worker_relocated(arg, file, directory) for arg in ex.args)...)
+    _is_include(ex) && last(ex.args) isa String && !isabspath(last(ex.args)) &&
+        (ex.args[end] = normpath(directory, last(ex.args)))
+    return ex
+end
+
 "A statement of a test driver that a prelude may copy, with where it is from and its source text."
 struct _DriverStatement
     file::String
@@ -1376,18 +1406,20 @@ end
 """
 Collect the statements of `file` that set up what it includes as `next`: those before the
 include of `next`, or before its first run-time include, also from the files it includes
-statically before then. Returns whether that include was reached.
+statically before then. Returns whether that include was reached. `directory` is the one the
+outermost driver runs in, where the workers of a ReTestItems `runtests` call run too.
 """
 function _driver_statements!(statements::Vector{_DriverStatement}, file::String, next::String, seen::Set{String},
-                             packages::Dict{String,Project})
+                             packages::Dict{String,Project}, directory::String)
     file in seen && return false
     push!(seen, file)
     text, nodes = _statements(file)
-    return _driver_nodes!(statements, file, text, nodes, next, seen, packages, Dict{Symbol,String}())
+    return _driver_nodes!(statements, file, text, nodes, next, seen, packages, directory, Dict{Symbol,String}())
 end
 
 function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text::String, nodes, next::String,
-                        seen::Set{String}, packages::Dict{String,Project}, bindings::Dict{Symbol,String})
+                        seen::Set{String}, packages::Dict{String,Project}, directory::String,
+                        bindings::Dict{Symbol,String})
     # The include of `next`, or a run-time include, which may be of `next`, ends the setup.
     function stops(ex)
         for include in _nested_includes!(Expr[], ex)
@@ -1401,7 +1433,7 @@ function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text
         # it reaches the include sets the included file up.
         branch = _reaching_branch(node, ex, stops)
         branch === nothing ||
-            return _driver_nodes!(statements, file, text, branch, next, seen, packages, bindings)
+            return _driver_nodes!(statements, file, text, branch, next, seen, packages, directory, bindings)
         # Top-level includes set up context, as helpers do. Included files run at top level
         # wherever the call is, but other includes are test files, except nested drivers
         # included inside a `@testset`, say.
@@ -1411,10 +1443,14 @@ function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text
             path = normpath(dirname(file), path)
             path == next && return true
             (_is_include(ex) || basename(path) == "runtests.jl") && isfile(path) &&
-                _driver_statements!(statements, path, next, seen, packages) && return true
+                _driver_statements!(statements, path, next, seen, packages, directory) && return true
         end
         _is_include(ex) && continue
         for init in _worker_init(ex)
+            # Its `@__DIR__` and `@__FILE__` name this file, whose code it is and which evaluates what
+            # it interpolates, and a worker includes its relative paths from its working directory:
+            # that of the outermost driver, where `Pkg.test` runs it.
+            init = _worker_relocated(init, file, directory)
             assignment = _assignment(init)
             assignment === nothing && continue
             # A worker's constant of the driver's value of the same name is the driver's.
@@ -1497,9 +1533,12 @@ end
 
 function _drivers_statements(drivers::Vector{String}, target::String, packages::Dict{String,Project})
     statements = _DriverStatement[]
+    isempty(drivers) && return statements
     seen = Set{String}()
+    # `Pkg.test` runs the outermost driver in its directory, and ReTestItems' workers start there.
+    directory = dirname(first(drivers))
     for (i, driver) in pairs(drivers)
-        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen, packages)
+        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen, packages, directory)
     end
     return statements
 end
