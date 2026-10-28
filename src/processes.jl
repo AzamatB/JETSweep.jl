@@ -69,48 +69,13 @@ function _terminate_all()
     end
 end
 
-"The display workers use, when `with_display` provides one."
-const _DISPLAY = Base.ScopedValues.ScopedValue("")
-
-"""
-Run `f()` with a virtual display for workers when there is none on Linux and Xvfb is
-installed, so that packages that need a display to load, such as GLMakie, load. The server
-dies with this process.
-"""
-function with_display(f)
-    Sys.islinux() && isempty(get(ENV, "DISPLAY", "")) || return f()
-    xvfb = Sys.which("Xvfb")
-    xvfb === nothing && return f()
-    command = `$xvfb -displayfd 1 -nolisten tcp -screen 0 1280x1024x24`
-    setpriv = Sys.which("setpriv")
-    setpriv === nothing || (command = `$setpriv --pdeathsig KILL -- $command`)
-    output = Pipe()
-    server = run(pipeline(Cmd(command; detach=true); stdin=devnull, stdout=output, stderr=devnull); wait=false)
-    close(output.in)
-    try
-        # Xvfb writes its display number once it accepts connections.
-        number = Ref("")
-        reader = @async number[] = readline(output)
-        timedwait(() -> istaskdone(reader), 30.0; pollint=0.05)
-        if !occursin(r"^\d+$", number[])
-            process_exited(server) || kill(server)
-            @warn "Xvfb did not start; workers run without a display"
-            return f()
-        end
-        return Base.ScopedValues.@with _DISPLAY => ":" * number[] f()
-    finally
-        process_exited(server) || kill(server)
-    end
-end
-
 """
 The worker Julia command. Workers use Julia's default code generation flags, whatever this
 process runs with (`--check-bounds=yes` under `Pkg.test`, say), so they share the package
 images of ordinary sessions and analyze code as it normally runs. With `compile=false` a
 worker uses existing package images only, loading a package from source otherwise, since
 environment preparation already precompiled what can be. Workers have no interactive
-thread, so a single-threaded analysis runs on the first thread, where packages such as
-GLMakie must initialize.
+thread, so each runs exactly `threads` threads.
 """
 function julia_command(script::String, args::Vector{String}; project::String, threads::Int,
                        compile::Bool=true, env::Dict{String,String}=Dict{String,String}())
@@ -121,7 +86,6 @@ function julia_command(script::String, args::Vector{String}; project::String, th
     variables = merge(Dict(ENV), Dict(
         "JULIA_LOAD_PATH" => "@:@stdlib", "JULIA_PKG_PRECOMPILE_AUTO" => "0",
         "OPENBLAS_NUM_THREADS" => "1", "OMP_NUM_THREADS" => "1", "JULIA_NUM_PRECOMPILE_TASKS" => "4"))
-    isempty(_DISPLAY[]) || (variables["DISPLAY"] = _DISPLAY[])
     merge!(variables, env)
     delete!(variables, "JULIA_PROJECT")
     return setenv(command, variables)

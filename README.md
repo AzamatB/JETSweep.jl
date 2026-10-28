@@ -219,11 +219,10 @@ estimated from source size, and assigns GPUs round-robin. Each analysis takes on
 on average. Whatever `--jobs` asks, a process uses at most one slot per CPU thread
 (`Sys.CPU_THREADS`) and per 3 GiB of free memory (`Sys.free_memory()`, taken when it has no
 slot in use), and the sweeps it runs side by side share them. Workers run with Julia's
-default code generation flags, so they share the package images of ordinary sessions. On
-Linux without a display, they share a virtual one when Xvfb is installed, so packages that open windows when they load, such as GLMakie, load.
-Analysis is static, but it loads packages and runs their
-initialization, macros and generated functions, and the code JETLS evaluates to analyze
-scripts: use JETSweep only on code you trust.
+default code generation flags, so they share the package images of ordinary sessions.
+Analysis is static, but it loads packages and runs their initialization, macros and
+generated functions, and the code JETLS evaluates to analyze scripts: use JETSweep only on
+code you trust.
 
 ## Configuration
 

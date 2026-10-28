@@ -359,20 +359,6 @@ end
     end
 end
 
-@testitem "Workers get a virtual display when there is none" setup=[Execution] begin
-    if Sys.islinux() && Sys.which("Xvfb") !== nothing
-        withenv("DISPLAY" => nothing) do
-            # Workers get the display; this process's environment stays as it was.
-            command, environment = JETSweep.with_display() do
-                JETSweep.julia_command("/scripts/worker.jl", String[]; project="/environment", threads=1), copy(ENV)
-            end
-            @test any(variable -> occursin(r"^DISPLAY=:\d+$", variable), command.env)
-            @test !haskey(environment, "DISPLAY") && isempty(JETSweep._DISPLAY[])
-        end
-        @test withenv(() -> JETSweep.with_display(() -> JETSweep._DISPLAY[]), "DISPLAY" => ":7") == ""
-    end
-end
-
 @testitem "Worker Julia command" setup=[Execution] begin
     command = withenv("JULIA_PROJECT" => "/elsewhere", "JULIA_LOAD_PATH" => "/elsewhere",
                       "OMP_NUM_THREADS" => "8", "JETSWEEP_EXECUTION_MARK" => "inherited") do
