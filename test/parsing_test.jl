@@ -1456,3 +1456,32 @@ end
         end
     end
 end
+
+@testitem "prelude resolves a worker_init_expr's relative includes where Pkg.test runs the tests" setup=[Syntax] begin
+    # Workers start in the directory of the outermost driver, where `Pkg.test` runs it, whichever file
+    # calls `runtests`, and `@__DIR__` names that file's directory.
+    init = """
+        runtests(@__DIR__; nworkers=1, worker_init_expr=quote
+            const HERE = @__DIR__
+            const VALUE = include("sub/value.jl")
+        end)
+        """
+    target = "@testitem \"t\" begin\n    @test isdir(Main.HERE) && Main.VALUE == 1\nend\n"
+    # The call in a file the driver includes statically, and in a nested driver it includes at run time.
+    layouts = [(("test/runtests.jl" => "using ReTestItems\ninclude(\"integration/run.jl\")\n",
+                 "test/integration/run.jl" => init), ["test/runtests.jl"]),
+               (("test/runtests.jl" => "for d in (\"integration\",)\n    include(joinpath(d, \"runtests.jl\"))\nend\n",
+                 "test/integration/runtests.jl" => "using ReTestItems\n" * init),
+                ["test/runtests.jl", "test/integration/runtests.jl"])]
+    for (files, drivers) in layouts
+        files = (files..., "test/sub/value.jl" => "1\n", "test/integration/items_test.jl" => target)
+        syntax_prelude(files...; drivers, target="test/integration/items_test.jl") do text, dir
+            sandbox = syntax_load(text)
+            @test sandbox isa Module
+            if sandbox isa Module
+                @test syntax_value(sandbox, :HERE) == joinpath(dir, "test", "integration")
+                @test syntax_value(sandbox, :VALUE) == 1
+            end
+        end
+    end
+end

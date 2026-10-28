@@ -117,14 +117,15 @@ applies as a `@testset`'s does, below. A file's test items are analyzed after th
 and what items and setups include is part of their unit. Their `Main` is the unit's module,
 where the prelude defines, after the driver's statements, the constants the driver's
 `worker_init_expr` defines in the `Main` of each ReTestItems worker, with what it interpolates
-in their values, and the driver's locations for the `@__DIR__`, `@__FILE__` and relative include
-paths in them: the workers run it as code of the driver's file, in the directory `Pkg.test` runs
-the driver in. A test file whose items name a setup that another test file of the package
-defines is analyzed after that file, whose own test items are left to its unit, which alone
-counts as covering it. The lowering diagnostics of setups and items, such as unused imports,
-are computed in their modules, and those of items in soft scope: JETLS by itself lowers a call
-of a macro it does not know as a block of its arguments, where a module does not lower, so it
-found none of the names a setup uses and reported its imports unused.
+in their values. In them, `@__DIR__` and `@__FILE__` name the file that calls `runtests`, whose
+code the workers run, and relative include paths resolve in the directory of the outermost
+driver, where `Pkg.test` runs the tests and the workers start. A test file whose items name a
+setup that another test file of the package defines is analyzed after that file, whose own
+test items are left to its unit, which alone counts as covering it. The lowering diagnostics
+of setups and items, such as unused imports, are computed in their modules, and those of items
+in soft scope: JETLS by itself lowers a call of a macro it does not know as a block of its
+arguments, where a module does not lower, so it found none of the names a setup uses and
+reported its imports unused.
 
 Script analysis evaluates definitions, imports, includes and the deprecations of bindings,
 as `@deprecate_binding` declares them, but not assignments, so any of these that needs an

@@ -1314,7 +1314,8 @@ end
 # conditionals are wrapped in `@eval`, which analysis always evaluates, since concretization
 # patterns cannot apply to the generated file. A driver that runs ReTestItems sets up the
 # `Main` of its workers with the constants its `worker_init_expr` defines, so they count as
-# its assignments, with their locations pinned to the driver too.
+# its assignments, with `@__DIR__` and `@__FILE__` pinned to the file that calls `runtests`
+# and relative include paths to the directory the workers run in.
 
 function _macro_identifier(node::JS.SyntaxNode)
     JS.kind(node) == JS.K"macrocall" || return nothing
@@ -1367,16 +1368,21 @@ function _relocated(node::JS.SyntaxNode, text::String, file::String)
     return String(take!(io))
 end
 
-"`ex`, code of `file`, with the locations it depends on pinned to `file`, as `_relocations!` pins them in source text."
-function _relocated(ex, file::String)
+"""
+`ex`, an expression `file` gives a ReTestItems worker to run, with the locations it depends on
+pinned: `@__DIR__` and `@__FILE__` to `file`, whose code it is, as `_relocations!` pins them in
+source text, and relative include paths to `directory`, the worker's working directory, from
+which `include` resolves them outside a file.
+"""
+function _worker_relocated(ex, file::String, directory::String)
     ex isa Expr || return ex
     if ex.head === :macrocall
         _macro_name(ex) == "@__DIR__" && return dirname(file)
         _macro_name(ex) == "@__FILE__" && return file
     end
-    ex = Expr(ex.head, (_relocated(arg, file) for arg in ex.args)...)
+    ex = Expr(ex.head, (_worker_relocated(arg, file, directory) for arg in ex.args)...)
     _is_include(ex) && last(ex.args) isa String && !isabspath(last(ex.args)) &&
-        (ex.args[end] = normpath(dirname(file), last(ex.args)))
+        (ex.args[end] = normpath(directory, last(ex.args)))
     return ex
 end
 
@@ -1400,18 +1406,20 @@ end
 """
 Collect the statements of `file` that set up what it includes as `next`: those before the
 include of `next`, or before its first run-time include, also from the files it includes
-statically before then. Returns whether that include was reached.
+statically before then. Returns whether that include was reached. `directory` is the one the
+outermost driver runs in, where the workers of a ReTestItems `runtests` call run too.
 """
 function _driver_statements!(statements::Vector{_DriverStatement}, file::String, next::String, seen::Set{String},
-                             packages::Dict{String,Project})
+                             packages::Dict{String,Project}, directory::String)
     file in seen && return false
     push!(seen, file)
     text, nodes = _statements(file)
-    return _driver_nodes!(statements, file, text, nodes, next, seen, packages, Dict{Symbol,String}())
+    return _driver_nodes!(statements, file, text, nodes, next, seen, packages, directory, Dict{Symbol,String}())
 end
 
 function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text::String, nodes, next::String,
-                        seen::Set{String}, packages::Dict{String,Project}, bindings::Dict{Symbol,String})
+                        seen::Set{String}, packages::Dict{String,Project}, directory::String,
+                        bindings::Dict{Symbol,String})
     # The include of `next`, or a run-time include, which may be of `next`, ends the setup.
     function stops(ex)
         for include in _nested_includes!(Expr[], ex)
@@ -1425,7 +1433,7 @@ function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text
         # it reaches the include sets the included file up.
         branch = _reaching_branch(node, ex, stops)
         branch === nothing ||
-            return _driver_nodes!(statements, file, text, branch, next, seen, packages, bindings)
+            return _driver_nodes!(statements, file, text, branch, next, seen, packages, directory, bindings)
         # Top-level includes set up context, as helpers do. Included files run at top level
         # wherever the call is, but other includes are test files, except nested drivers
         # included inside a `@testset`, say.
@@ -1435,13 +1443,14 @@ function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text
             path = normpath(dirname(file), path)
             path == next && return true
             (_is_include(ex) || basename(path) == "runtests.jl") && isfile(path) &&
-                _driver_statements!(statements, path, next, seen, packages) && return true
+                _driver_statements!(statements, path, next, seen, packages, directory) && return true
         end
         _is_include(ex) && continue
         for init in _worker_init(ex)
-            # Its locations are the driver's: a worker runs it as code of the driver's file, in the
-            # directory `Pkg.test` runs the driver in, and the driver evaluates what it interpolates.
-            init = _relocated(init, file)
+            # Its `@__DIR__` and `@__FILE__` name this file, whose code it is and which evaluates what
+            # it interpolates, and a worker includes its relative paths from its working directory:
+            # that of the outermost driver, where `Pkg.test` runs it.
+            init = _worker_relocated(init, file, directory)
             assignment = _assignment(init)
             assignment === nothing && continue
             # A worker's constant of the driver's value of the same name is the driver's.
@@ -1524,9 +1533,12 @@ end
 
 function _drivers_statements(drivers::Vector{String}, target::String, packages::Dict{String,Project})
     statements = _DriverStatement[]
+    isempty(drivers) && return statements
     seen = Set{String}()
+    # `Pkg.test` runs the outermost driver in its directory, and ReTestItems' workers start there.
+    directory = dirname(first(drivers))
     for (i, driver) in pairs(drivers)
-        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen, packages)
+        _driver_statements!(statements, driver, i < length(drivers) ? drivers[i+1] : target, seen, packages, directory)
     end
     return statements
 end
