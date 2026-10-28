@@ -72,12 +72,17 @@ directories stay available, without their sources or metadata problems, so that 
 loading them finds them, as it would without the exclusion; so do those of the rest of the
 configuration's directory when `DIRECTORY` is part of it. Discovery walks those directories
 for their packages, reading only directory entries, unless they are hidden, caches or
-dependencies, or Git ignores them. The files are
-then grouped into analysis units, each covering its entry file and the files it includes:
+dependencies, or Git ignores them. The projects above `DIRECTORY` count too, as far as Julia
+looks for an enclosing project, up to the home directory: a sweep of part of a project, such as
+a package's `test` directory or a subdirectory of a script environment, analyzes its files in
+the projects, packages and test environments they are in, after the drivers that run them, as
+a sweep of the whole does, and a sweep of part of a package's sources analyzes the package. The
+files are then grouped into analysis units, each covering its entry file and the files it
+includes:
 
 | Unit | Entry | Analysis |
 | --- | --- | --- |
-| Package | `src/Name.jl`, or the project's `entryfile` | The package is loaded and every method signature is analyzed, closures where the types of their arguments are known (JETLS's Revise-based package analysis); its structs are checked for abstract fields. |
+| Package | `src/Name.jl`, or the project's `entryfile` | The package is loaded and every method signature is analyzed, closures where the types of their arguments are known (JETLS's Revise-based package analysis); its structs are checked for abstract fields. A package that an enclosing project sources by path and leaves that project the source of a dependency, being it or sourcing it, as a test-only package of its parent's tests does, loads in that project's environment, as it does when used. |
 | Extension | `ext/Name.jl` or `ext/Name/Name.jl` | Loaded with its parent package and trigger packages, then analyzed like a package. |
 | Test driver | `test/runtests.jl` | Script analysis in the package's test environment. A nested `runtests.jl` its driver includes statically is part of its unit; one included at run time is a driver run by the one above it. |
 | Test file | any other test file | Script analysis after a prelude from the drivers that run it, for test files a driver includes at run time. |
@@ -100,19 +105,24 @@ one with `failfast=false`.
 [ReTestItems](https://github.com/JuliaTesting/ReTestItems.jl)' `@testitem` and `@testsetup`
 keep their code for `runtests` to run later, so JETLS by itself analyzes none of it. JETSweep
 analyzes it as ReTestItems runs it: a test setup as a module of the unit, and a test item as
-the top-level code of a module of its own, which imports `Test` and the package of the nearest
-project, unless the item sets `default_imports=false`, and the setups it names, each of its
-statements in soft scope, as at the REPL. A test item is a test set whose `failfast=` applies
-as a `@testset`'s does, below. A file's test items are analyzed after the rest of it, and what
-items and setups include is part of their unit. Their `Main` is the unit's module, where the
-prelude defines, after the driver's statements, the constants the driver's `worker_init_expr`
-defines in the `Main` of each ReTestItems worker, with what it interpolates in their values. A
-test file whose items name a setup that another test file of the package defines is analyzed
-after that file, whose own test items are left to its unit, which alone counts as covering it.
-The lowering diagnostics of setups and items, such as unused imports, are computed in their
-modules, and those of items in soft scope: JETLS by itself lowers a call of a macro it does not
-know as a block of its arguments, where a module does not lower, so it found none of the names
-a setup uses and reported its imports unused.
+the top-level code of a module of its own, which imports `Test` and the package of the project
+ReTestItems runs it for, unless the item sets `default_imports=false`, and the setups it names,
+each of its statements in soft scope, as at the REPL, after its macros expand. That project is
+the nearest one of the first path the driver passes to `runtests`, under which the item's file
+must be: the nearest project of the file, except that ReTestItems counts a package's
+`test/Project.toml` as part of the package's project, and runs the items there only for the
+package, since TestEnv activates the test environment of a package alone. So the items of a
+package with a test project import the package. A test item is a test set whose `failfast=`
+applies as a `@testset`'s does, below. A file's test items are analyzed after the rest of it,
+and what items and setups include is part of their unit. Their `Main` is the unit's module,
+where the prelude defines, after the driver's statements, the constants the driver's
+`worker_init_expr` defines in the `Main` of each ReTestItems worker, with what it interpolates
+in their values. A test file whose items name a setup that another test file of the package
+defines is analyzed after that file, whose own test items are left to its unit, which alone
+counts as covering it. The lowering diagnostics of setups and items, such as unused imports,
+are computed in their modules, and those of items in soft scope: JETLS by itself lowers a call
+of a macro it does not know as a block of its arguments, where a module does not lower, so it
+found none of the names a setup uses and reported its imports unused.
 
 Script analysis evaluates definitions, imports, includes and the deprecations of bindings,
 as `@deprecate_binding` declares them, but not assignments, so any of these that needs an
@@ -150,7 +160,10 @@ before the read finds it defined: as the type JETLS knows of it, or as an unknow
 JETLS did not evaluate the definition, as for the functions and types of a branch the
 analysis does not take. JETLS by itself reports such a read as possibly or wholly undefined,
 and analyzes nothing after a read it finds undefined. Code that runs later, such as a
-function body, may still find a global that a conditional assigns undefined.
+function body, may still find a global that a conditional assigns undefined, but not one that
+its statement assigns wherever it ends without an exception, as one assigned the value of a
+`try` block with a `finally` block, which JETLS by itself counts as conditional, for the path
+on which the `finally` block rethrows.
 
 JETSweep extends one JETLS rule. To define a closure in a branch, JETLS evaluates the
 branch's condition, and with it everything the condition depends on: in a test set, the
@@ -216,7 +229,9 @@ decides: the packages the sweep analyzes, those of the configuration's directory
 out, and those the configuration excludes, as a fixture's copy of a package may be; two
 there leave the name to the registry. If
 they cannot all be added, the environment gets those of the workspace alone, or failing that
-none; the units' notes name the packages added and those left out. Modules the tree defines
+none; the units' notes name the packages added and those left out, and those from the
+registry that compat bounds hold back by a breaking release, which may not load or not as
+the code expects. Modules the tree defines
 that are not packages, as scripts load through `LOAD_PATH`, are not looked up. With
 `--offline`, resolution considers installed versions only. Each environment is then
 precompiled once for all its units; packages that fail to precompile, or that a timeout
@@ -246,11 +261,13 @@ code you trust.
 
 ## Configuration
 
-`.JETLSConfig.toml` files are respected: each unit uses the nearest one at or above its
-entry, with paths relative to its directory, as in the editor, so severity overrides and
-concretization patterns apply. JETSweep prepares environments itself, so it sets
-`full_analysis.auto_instantiate = "never"`; it keeps diagnostics enabled for all files, and
-defaults `full_analysis.concretization_timeout` as `--timeout` describes.
+`.JETLSConfig.toml` files are respected, with paths relative to their directories, as in the
+editor: each diagnostic is judged by the severity overrides of the one nearest at or above its
+file, wherever the unit that reports it is, and each unit is analyzed with the other settings,
+such as concretization patterns, of the one nearest at or above its entry, or with a configured
+`jetls_config`, which also judges all its diagnostics. JETSweep prepares environments itself,
+so it sets `full_analysis.auto_instantiate = "never"`; it keeps diagnostics enabled for all
+files, and defaults `full_analysis.concretization_timeout` as `--timeout` describes.
 
 An optional `.JETSweep.toml` at the root adds exclusions and context for units that need it,
 such as scripts that expect arguments or a different environment. `project`, `setup` and
@@ -263,8 +280,12 @@ and that sweep's code finds the packages of the rest of the workspace. Each `mat
 select a planned unit, or, where `--exclude` or a narrower `DIRECTORY` leaves out what it selects, a
 unit of the full sweep, of the configuration's directory without `--exclude`, and the summary
 notes the context; a `match` that selects no unit of the full sweep either is an error.
-`setup` files are included before the entry of a test or script; package, extension and
-orphan analyses load the package itself, so their units do not apply `setup`, and note so.
+`project` is the environment a test or script is analyzed in, alone, as a script outside its
+package's tests; `project = ""` names none, as for an environment that a preparation step makes,
+so the unit gets the packages it imports. A package, extension or orphan analysis loads its
+package in the environment. `setup` files are included before the entry of a test or script;
+package, extension and orphan analyses load the package itself, so their units do not apply
+`setup`, and note so.
 When several tables match a unit, each key a later table sets overrides earlier ones, except
 `env`, whose variables merge. Follow-up units inherit the context and settings of the unit
 they follow.
@@ -274,7 +295,7 @@ exclude = ["vendor", "**/generated/*.jl"]
 
 [[context]]
 match = "tools/check.jl"        # units whose entry matches
-project = "tools"               # environment to analyze in
+project = "tools"               # environment to analyze in, "" for none
 setup = ["tools/setup.jl"]      # files included before the entry
 args = ["--fast"]               # ARGS during analysis, which runs in the entry's directory
 env = { MODE = "analysis" }     # environment variables during analysis

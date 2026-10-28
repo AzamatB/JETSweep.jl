@@ -905,13 +905,18 @@ end
         OTHER && Base.deprecate(Base, :old_name)
         const REPLACEMENT = string(:new_value, get(ENV, "SUFFIX", ""))
         Base.@deprecate_binding old_value new_value false string(", use ", REPLACEMENT, " instead.")
+        # A run-dependent function named qualified is one too.
+        const SETTINGS = TOML.parsefile(joinpath(@__DIR__, "settings.toml"))
+        const ENTRIES = Base.readdir.([@__DIR__])
+        const SETTINGS_FILE = Base.joinpath(@__DIR__, "settings.toml")
         """
     @test syntax_patterns(code) == ["const LEVEL = isempty(ARGS) ? 1 : 2",
         "const ASKED = isempty(ARGS) ? split(get(ENV, \"TESTS\", \"\"), \",\"; keepempty=false) : ARGS",
         "const PICKED = isempty(ASKED) ? [\"a\"] : filter(f -> f in ASKED, [\"a\"])",
         "const MEASURE = get(ARGS, 1, \"\") == \"--measure\"", "if MEASURE\n    using Statistics\nend",
         "const LEGACY = get(ENV, \"LEGACY\", \"\") == \"1\"",
-        "const REPLACEMENT = string(:new_value, get(ENV, \"SUFFIX\", \"\"))"]
+        "const REPLACEMENT = string(:new_value, get(ENV, \"SUFFIX\", \"\"))",
+        "const SETTINGS_FILE = Base.joinpath(@__DIR__, \"settings.toml\")"]
 end
 
 @testitem "concretization_patterns follows what JETLS outlines, includes and imports" setup=[Syntax] begin

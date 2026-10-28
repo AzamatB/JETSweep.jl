@@ -49,6 +49,30 @@ function _registered(name::String)
     return length(uuids) == 1 ? only(uuids) : nothing
 end
 
+"""
+A note on the package `name` from the registry if it resolves to `version`, older than its
+`newest` release by a breaking one, as the compat bounds of an environment can hold it back. It
+then may not load, or not as the code expects.
+"""
+function _held_back(name::String, version, newest)
+    version isa VersionNumber && newest isa VersionNumber && version < newest &&
+        !(newest in Pkg.Types.semver_spec(string(version))) || return nothing
+    return "$name resolves to $version, below its newest release, $newest: " *
+           "the compat bounds of this environment hold it back."
+end
+
+"The newest release the registries have of the package `uuid`, if any."
+function _newest(uuid::UUID)
+    versions = VersionNumber[]
+    for registry in Pkg.Registry.reachable_registries()
+        entry = get(registry, uuid, nothing)
+        entry === nothing && continue
+        info = Pkg.Registry.registry_info(registry, entry)
+        append!(versions, (version for (version, release) in info.version_info if !release.yanked))
+    end
+    return isempty(versions) ? nothing : maximum(versions)
+end
+
 function _context_files(context::Context)
     files = String[]
     owner = _project_file(context.owner)
@@ -670,11 +694,18 @@ function prepare(context::Context, directory::String; instantiate::Bool=true)
             continue
         end
         ready(environment) && !isempty(context.imports) || return environment
-        deps = keys(TOML.parsefile(joinpath(directory, "Project.toml"))["deps"])
-        added = sort!([name for name in keys(imports) if name in deps])
+        deps = TOML.parsefile(joinpath(directory, "Project.toml"))["deps"]
+        added = sort!([name for name in keys(imports) if haskey(deps, name)])
         dropped = sort!([name for name in keys(context.imports) if !(name in added)])
         notes = String[]
         isempty(added) || push!(notes, "It adds packages imported without being declared: $(join(added, ", ")).")
+        manifest = Pkg.Types.read_manifest(joinpath(directory, "Manifest.toml"))
+        for name in added
+            uuid = UUID(deps[name])
+            isempty(imports[name]) && haskey(manifest, uuid) || continue
+            note = _held_back(name, manifest[uuid].version, _newest(uuid))
+            note === nothing || push!(notes, note)
+        end
         isempty(dropped) || push!(notes, "Packages imported without being declared that could not be added: " *
             join(dropped, ", ") * (isempty(failure) ? "." : " ($failure)."))
         return Environment(:ready, directory, strip(join(notes, " ") * " " * environment.message))

@@ -39,14 +39,16 @@ end
 
 """
 The test driver that runs `file`: the nearest `runtests.jl` above it within its package's
-test directory, or the driver unit covering that file when another driver includes it.
+test directory, or the driver unit covering that file when another driver includes it. A
+driver above the swept directory runs it too.
 """
 function _driver(file::String, owner::String, covering::Dict{String,String})
     tests = joinpath(owner, "test")
     directory = dirname(file)
     while _within(directory, tests)
         candidate = joinpath(directory, "runtests.jl")
-        candidate != file && haskey(covering, candidate) && return covering[candidate]
+        candidate != file && (haskey(covering, candidate) || isfile(candidate)) &&
+            return get(covering, candidate, candidate)
         directory == tests && break
         directory = dirname(directory)
     end
@@ -126,24 +128,25 @@ function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String
     units = Unit[]
     covered = Set{String}()
     function add!(kind, entry, context, expected; driver="", extension="")
-        expected = sort!(collect(filter(file -> haskey(sources, file), expected)))
-        entry in expected || push!(expected, entry)
+        expected = sort!(unique!([filter(file -> haskey(sources, file), collect(expected)); entry]))
         union!(covered, expected)
         push!(units, Unit(_unit_id(kind, entry, root, extension), kind, entry, context, expected,
                           driver, extension, Overrides(), notes(expected)))
     end
     owned(owner) = file -> haskey(sources, file) && sources[file].owner == owner
 
+    # A package loads in the environment of the project it leaves a dependency's source to, if any.
+    hosts = Dict(project.dir => _host(project, projects) for project in inventory.projects if ispackage(project))
     for package in sort!(filter(ispackage, inventory.projects); by=project -> project.dir)
-        haskey(sources, package.entry) || continue
-        context = Context(package.dir, package.dir, false, Dict{String,String}())
         files = union(filter(owned(package.dir), _reach(package.entry, syntax; followed_only=false)),
                       (s.path for s in inventory.sources if s.owner == package.dir && s.kind === :package))
-        add!(:package, package.entry, context, files)
+        # A sweep of part of a package's sources, whose entry is above the root, analyzes the package.
+        (haskey(sources, package.entry) || !isempty(files)) &&
+            add!(:package, package.entry, Context(hosts[package.dir], package.dir, false, Dict{String,String}()), files)
         for (name, triggers) in sort!(collect(package.extensions); by=first)
             entry = _extension_entry(package, name)
             haskey(sources, entry) || continue
-            add!(:extension, entry, Context(package.dir, package.dir, false, triggers),
+            add!(:extension, entry, Context(hosts[package.dir], package.dir, false, triggers),
                  filter(owned(package.dir), _reach(entry, syntax; followed_only=false)); extension=name)
         end
     end
@@ -182,7 +185,8 @@ function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String
         name = length(parts) > 1 && haskey(package.extensions, first(parts)) &&
             !isempty(_extension_entry(package, first(parts))) ? first(parts) : ""
         triggers = isempty(name) ? Dict{String,String}() : package.extensions[name]
-        add!(:orphan, source.path, Context(package.dir, package.dir, false, triggers), [source.path]; extension=name)
+        add!(:orphan, source.path, Context(hosts[package.dir], package.dir, false, triggers), [source.path];
+             extension=name)
     end
 
     # Everything else is a script, analyzed in its nearest environment.
@@ -199,7 +203,7 @@ function plan(inventory::Inventory, config::Config=Config(); syntax::Dict{String
         end
     end
     sort!(units; by=unit -> (unit.entry, unit.extension))
-    return _imports!(_configure(units, config), syntax, inventory)
+    return _imports!(_configure(units, config, root), syntax, inventory)
 end
 
 """
@@ -246,6 +250,33 @@ function _imports!(units::Vector{Unit}, syntax::Dict{String,Syntax}, inventory::
                  unit.overrides, unit.notes) : unit for unit in units]
 end
 
+"""
+The project whose environment `package` loads in: that of an enclosing project that sources it by
+path, if it leaves the source of a dependency to that project, which is the dependency or sources
+it, as a test-only package that its parent's tests load does; else its own.
+"""
+function _host(package::Project, projects::Dict{String,Project})
+    data = TOML.tryparsefile(package.file)
+    data isa AbstractDict || return package.dir
+    deps, own = get(data, "deps", Dict()), get(data, "sources", Dict())
+    directory = package.dir
+    while dirname(directory) != directory
+        directory = dirname(directory)
+        haskey(projects, directory) || continue
+        host = TOML.tryparsefile(projects[directory].file)
+        host isa AbstractDict || continue
+        sources = get(host, "sources", Dict())
+        any(source -> source isa AbstractDict && get(source, "path", nothing) isa String &&
+                      _absolute(directory, source["path"]) == package.dir, values(sources)) || continue
+        declared = merge((get(host, section, Dict()) for section in ("deps", "weakdeps", "extras"))...)
+        provided(name, uuid) = !haskey(own, name) &&
+            (get(host, "name", nothing) == name && get(host, "uuid", nothing) == uuid ||
+             haskey(sources, name) && get(declared, name, nothing) == uuid)
+        return any(((name, uuid),) -> provided(name, uuid), deps) ? directory : package.dir
+    end
+    return package.dir
+end
+
 "Packages a source can name in `pkgdir(Name)` and `pathof(Name)`: its owner, statically."
 function _packages(source::Source, projects::Dict{String,Project})
     owner = get(projects, source.owner, nothing)
@@ -255,23 +286,28 @@ end
 "Whether `rule` of `config` selects the unit whose entry is `entry`."
 _selects(rule::ContextRule, config::Config, entry::String) = occursin(rule.pattern, _slash(relpath(entry, config.directory)))
 
-function _configure(units::Vector{Unit}, config::Config)
+function _configure(units::Vector{Unit}, config::Config, root::String)
     for rule in config.contexts
         set(key, value, current) = key in rule.keys ? value : current
         for (i, unit) in pairs(units)
             _selects(rule, config, unit.entry) || continue
-            context = unit.context
-            "project" in rule.keys && (context = Context(rule.project, context.owner, context.test, context.triggers))
-            current = unit.overrides
+            (; id, kind, context, driver) = unit
             # Only the generated entries of tests and scripts include setup files.
-            loaded = unit.kind in (:package, :extension, :orphan)
-            ignored = "$(config.file): setup does not apply to $(unit.kind) analysis, which loads the package itself"
+            loaded = kind in (:package, :extension, :orphan)
+            if "project" in rule.keys && loaded
+                context = Context(rule.project, context.owner, context.test, context.triggers)
+            elseif "project" in rule.keys
+                # A test or script runs in the configured environment alone: a script outside its package's tests.
+                context = Context(rule.project, "", false, Dict{String,String}())
+                id, kind, driver = _unit_id(:script, unit.entry, root), :script, ""
+            end
+            current = unit.overrides
+            ignored = "$(config.file): setup does not apply to $(kind) analysis, which loads the package itself"
             notes = loaded && !isempty(rule.setup) ? sort!(union(unit.notes, [ignored])) : unit.notes
             overrides = Overrides(loaded ? current.setup : set("setup", rule.setup, current.setup),
                                   set("args", rule.args, current.args), merge(current.env, rule.env),
                                   set("jetls_config", rule.jetls_config, current.jetls_config))
-            units[i] = Unit(unit.id, unit.kind, unit.entry, context, unit.expected, unit.driver,
-                            unit.extension, overrides, notes)
+            units[i] = Unit(id, kind, unit.entry, context, unit.expected, driver, unit.extension, overrides, notes)
         end
     end
     return units

@@ -407,6 +407,10 @@ const _PURE_NAMES = Set([:nothing, :missing, :true, :false, :Inf, :NaN, :pi, :π
 const _PROCESS_NAMES = Set([:ARGS, :ENV, :PROGRAM_FILE])
 "Pure functions whose values depend on where the program runs: its directory and files."
 const _RUN_DEPENDENT = Set([:abspath, :realpath, :pwd, :readdir, :read, :readlines, :readchomp, :parsefile])
+"The modules whose pure functions calls may name qualified, as `TOML.parsefile`."
+const _PURE_MODULES = (:Base, :Sys, :Meta, :TOML)
+"The names `_evaluated_symbols!` gives the run-dependent functions it finds named qualified, such as `TOML.parsefile`."
+const _QUALIFIED_RUN_DEPENDENT = Set(Symbol(m, '.', f) for m in _PURE_MODULES for f in _RUN_DEPENDENT)
 const _PURE_CALLS = Set(Symbol.(split("""
     joinpath normpath dirname basename splitext splitdir splitpath relpath isabspath isfile isdir
     ispath readdir read readlines readchomp parseall parsefile abspath realpath pwd pkgdir pathof string repr * + - / // ^ % ÷ \\ div rem mod fld cld min max abs sqrt cbrt exp
@@ -454,7 +458,7 @@ function _pure_callee(f, scope::_Scope)
     f isa Symbol && return (f in _PURE_CALLS || f === :isdefined) && !(f in scope.shadowed)
     f isa Expr || return false
     f.head === :curly && return _pure_callee(first(f.args), scope) && all(arg -> _pure_type(arg, scope), f.args[2:end])
-    return f.head === :. && first(f.args) in (:Base, :Sys, :Meta, :TOML) && Symbol(_name(f)) in _PURE_CALLS
+    return f.head === :. && first(f.args) in _PURE_MODULES && Symbol(_name(f)) in _PURE_CALLS
 end
 
 "A type parameter: the file's own types count, since naming a type runs no code."
@@ -905,12 +909,19 @@ function _closure(ex)
     return signature isa Expr && signature.head === :tuple
 end
 
-"Symbols `ex` evaluates: those outside quoted code, and those interpolated into it."
+"""
+Symbols `ex` evaluates: those outside quoted code, and those interpolated into it, with a
+run-dependent function named qualified, as `TOML.parsefile`, as `_QUALIFIED_RUN_DEPENDENT` names it.
+"""
 function _evaluated_symbols!(names::Set{Symbol}, ex, quoted::Bool=false)
     if ex isa Symbol
         quoted || push!(names, ex)
     elseif ex isa Expr
         quoted = ex.head === :quote ? true : ex.head === :$ ? false : quoted
+        if !quoted && ex.head === :. && length(ex.args) == 2 && last(ex.args) isa QuoteNode
+            name = Symbol(first(ex.args), '.', last(ex.args).value)
+            name in _QUALIFIED_RUN_DEPENDENT && push!(names, name)
+        end
         foreach(arg -> _evaluated_symbols!(names, arg, quoted), (quoted ? ex : something(_command(ex), ex)).args)
     end
     return names
@@ -1171,7 +1182,7 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set
     shadowed = Set{Symbol}()
     foreach(((i, ex),) -> (_binds!(shadowed, ex; soft=i in soft); _globals!(shadowed, ex)), pairs(expressions))
     scope = _Scope(setdiff(modules, shadowed), Set{Symbol}(), shadowed)
-    variable = setdiff(union(_PROCESS_NAMES, _RUN_DEPENDENT), shadowed)
+    variable = union(setdiff(union(_PROCESS_NAMES, _RUN_DEPENDENT), shadowed), _QUALIFIED_RUN_DEPENDENT)
     bound = Set{Symbol}()
     selected = Set{Int}()
     # Statements to evaluate where needed, with what they read and whether they are pure.

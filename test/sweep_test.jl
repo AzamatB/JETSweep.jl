@@ -92,9 +92,9 @@ end
 "Write `unit`'s JETLS configuration; returns the root its paths are relative to and the configuration."
 function execution_jetls(unit, root, separate=String[])
     directory = mktempdir()
-    config = JETSweep._write_jetls_config(unit, directory, execution_sweep(unit, root, directory), separate)
+    config, base = JETSweep._write_jetls_config(unit, directory, execution_sweep(unit, root, directory), separate)
     @test config == joinpath(directory, "config")
-    return root, TOML.parsefile(joinpath(config, ".JETLSConfig.toml"))
+    return base, TOML.parsefile(joinpath(config, ".JETLSConfig.toml"))
 end
 
 execution_touch(path, content="nothing\n") = (mkpath(dirname(path)); write(path, content); path)
@@ -647,7 +647,6 @@ end
 
 @testitem "JETLS configuration" setup=[Execution] begin
     mktempdir() do outer
-        write(joinpath(outer, ".JETLSConfig.toml"), "[diagnostic]\npatterns = []\n")
         root = joinpath(outer, "root")
         driver = execution_touch(joinpath(root, "Pkg", "test", "runtests.jl"), EXECUTION_DRIVER)
         helper = execution_touch(joinpath(root, "Pkg", "test", "helper.jl"),
@@ -735,6 +734,15 @@ end
         _, data = execution_jetls(execution_unit(listing), root, separate[2:2])
         @test execution_patterns(data) == [("const PICKED = list_tests()", "Listing/test/runtests.jl")]
         @test execution_skips(data) == [execution_skip("Pkg/test/second.jl")]
+
+        # A configuration above the root applies, its paths relative to its directory, where JETLS's root is then.
+        rm(joinpath(root, ".JETLSConfig.toml"))
+        execution_touch(joinpath(outer, ".JETLSConfig.toml"), EXECUTION_USER_JETLS)
+        base, data = execution_jetls(execution_unit(script; kind=:script), root)
+        @test base == outer
+        @test data["full_analysis"]["debounce"] == 2.0
+        @test execution_patterns(data) == [("const C_ = v_", ""), ("const N = 2 + 3", "root/scripts/deep/run.jl")]
+        @test execution_skips(data) == [execution_skip("src/generated.jl")]
     end
 end
 
@@ -1054,7 +1062,8 @@ end
         @test endswith(JETSweep._generated_entry(unit(items), String[], inventory, setups),
                        "include($(repr(shared)))\ninclude($(repr(other)))\ninclude($(repr(items)))\n")
         output = mktempdir()
-        config = JETSweep._write_jetls_config(unit(items), output, sweep, String[], String[], setups)
+        config, base = JETSweep._write_jetls_config(unit(items), output, sweep, String[], String[], setups)
+        @test base == root
         data = TOML.parsefile(joinpath(config, ".JETLSConfig.toml"))
         @test ("const ROOT = joinpath(@__DIR__, \"fixtures\")", "Pkg/test/shared_testsetup.jl") in execution_patterns(data)
     end
