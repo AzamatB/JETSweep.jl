@@ -57,9 +57,9 @@ function planning_invariants(inventory, units)
     @test issorted(units; by=unit -> (unit.entry, unit.extension))
 end
 
-export TOML, UUIDs, PLANNING_DATES, PLANNING_TEST, PLANNING_OTHER, planning_file, planning_project,
-    planning_package, planning_context, planning_plan, planning_unit, planning_entries, planning_noted,
-    planning_overrides, PLANNING_NONE, planning_invariants, uuid4, UUID
+export PLANNING_DATES, PLANNING_NONE, PLANNING_OTHER, PLANNING_TEST, TOML, UUID, UUIDs, planning_context,
+    planning_entries, planning_file, planning_invariants, planning_noted, planning_overrides, planning_package,
+    planning_plan, planning_project, planning_unit, uuid4
 end
 
 @testitem "package units cover the owned files their entry reaches and their other sources" setup=[Planning] begin

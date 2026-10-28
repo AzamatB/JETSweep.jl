@@ -175,12 +175,12 @@ function execution_report(output, units, results)
     return String(take!(io)), read(joinpath(output, "summary.txt"), String)
 end
 
-export TOML, execution_context, execution_task, execution_uncapped, execution_name, execution_trace, execution_alive,
-    execution_sh, execution_gone, execution_finding, execution_result, execution_inventory, execution_capture,
-    EXECUTION_PACKAGE, execution_unit, execution_sweep, execution_jetls, execution_touch, execution_patterns,
-    execution_skips, execution_skip, EXECUTION_DRIVER, EXECUTION_SELECTION, EXECUTION_USER_JETLS, EXECUTION_GLOB,
-    execution_selected, execution_concretized, execution_skipped, execution_script, execution_incomplete,
-    execution_report
+export EXECUTION_DRIVER, EXECUTION_GLOB, EXECUTION_PACKAGE, EXECUTION_SELECTION, EXECUTION_USER_JETLS, TOML,
+    execution_alive, execution_capture, execution_concretized, execution_context, execution_finding, execution_gone,
+    execution_incomplete, execution_inventory, execution_jetls, execution_name, execution_patterns, execution_report,
+    execution_result, execution_script, execution_selected, execution_sh, execution_skip, execution_skipped,
+    execution_skips, execution_sweep, execution_task, execution_touch, execution_trace, execution_uncapped,
+    execution_unit
 end
 
 @testitem "Dispatch runs every task once, in priority order, within capacity" setup=[Execution] begin

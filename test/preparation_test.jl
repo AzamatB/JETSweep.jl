@@ -82,10 +82,10 @@ _environments_entry(name, uuid; version=v"1.0.0", fields...) =
 
 _environments_test_uuid() = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
-export LibGit2, Pkg, TOML, UUIDs, _environments_write, _environments_package, _environments_sandbox,
-    _environments_context, _environments_prepare, _environments_ready, _environments_project, _environments_preferences,
-    _environments_manifest, _environments_path, _environments_tool, _environments_snapshot, _environments_run,
-    _environments_commit, _environments_seed, _environments_entry, _environments_test_uuid, uuid4, UUID
+export LibGit2, Pkg, TOML, UUID, UUIDs, _environments_commit, _environments_context, _environments_entry,
+    _environments_manifest, _environments_package, _environments_path, _environments_preferences, _environments_prepare,
+    _environments_project, _environments_ready, _environments_run, _environments_sandbox, _environments_seed,
+    _environments_snapshot, _environments_test_uuid, _environments_tool, _environments_write, uuid4
 end
 
 @testitem "package context: merged scratch environment with the analyzer" setup=[Environments, Analyzer] begin

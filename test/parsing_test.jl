@@ -93,9 +93,9 @@ function syntax_patterns(code::String)
     end
 end
 
-export SyntaxInclude, syntax_write, syntax_parse, syntax_targets, syntax_prelude, syntax_callee,
-    syntax_names!, syntax_names, syntax_imports, syntax_broken, syntax_parses, syntax_load, syntax_dynamic,
-    syntax_value, syntax_call, syntax_patterns
+export SyntaxInclude, syntax_broken, syntax_call, syntax_callee, syntax_dynamic, syntax_imports, syntax_load,
+    syntax_names, syntax_names!, syntax_parse, syntax_parses, syntax_patterns, syntax_prelude, syntax_targets,
+    syntax_value, syntax_write
 end
 
 @testitem "parse_source resolves literal and path-call targets" setup=[Syntax] begin
