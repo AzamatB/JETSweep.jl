@@ -175,12 +175,12 @@ function execution_report(output, units, results)
     return String(take!(io)), read(joinpath(output, "summary.txt"), String)
 end
 
-export TOML, execution_context, execution_task, execution_uncapped, execution_name, execution_trace, execution_alive,
-    execution_sh, execution_gone, execution_finding, execution_result, execution_inventory, execution_capture,
-    EXECUTION_PACKAGE, execution_unit, execution_sweep, execution_jetls, execution_touch, execution_patterns,
-    execution_skips, execution_skip, EXECUTION_DRIVER, EXECUTION_SELECTION, EXECUTION_USER_JETLS, EXECUTION_GLOB,
-    execution_selected, execution_concretized, execution_skipped, execution_script, execution_incomplete,
-    execution_report
+export EXECUTION_DRIVER, EXECUTION_GLOB, EXECUTION_PACKAGE, EXECUTION_SELECTION, EXECUTION_USER_JETLS, TOML,
+    execution_alive, execution_capture, execution_concretized, execution_context, execution_finding, execution_gone,
+    execution_incomplete, execution_inventory, execution_jetls, execution_name, execution_patterns, execution_report,
+    execution_result, execution_script, execution_selected, execution_sh, execution_skip, execution_skipped,
+    execution_skips, execution_sweep, execution_task, execution_touch, execution_trace, execution_uncapped,
+    execution_unit
 end
 
 @testitem "Dispatch runs every task once, in priority order, within capacity" setup=[Execution] begin
@@ -1023,5 +1023,39 @@ end
         @test JETSweep._worker_error(log, 137) === nothing
         write(log, "killed\n")
         @test JETSweep._worker_error(log, 1) === nothing
+    end
+end
+
+@testitem "A test unit includes the files that define the ReTestItems setups its test items name" setup=[Execution] begin
+    mktempdir() do directory
+        root = realpath(directory)
+        package = joinpath(root, "Pkg")
+        execution_touch(joinpath(package, "Project.toml"),
+                        "name = \"Pkg\"\nuuid = \"6a1f4f3e-2d5b-4c6e-8f7a-9b0c1d2e3f40\"\nversion = \"0.1.0\"\n")
+        execution_touch(joinpath(package, "src", "Pkg.jl"), "module Pkg\nend\n")
+        shared = execution_touch(joinpath(package, "test", "shared_testsetup.jl"),
+                                 "@testsetup module Shared\nconst ROOT = joinpath(@__DIR__, \"fixtures\")\nend\n")
+        other = execution_touch(joinpath(package, "test", "sub", "other_test.jl"),
+                                "@testsetup module Other\nend\n@testitem \"other\" setup=[Other] begin\nend\n")
+        items = execution_touch(joinpath(package, "test", "items_test.jl"),
+                                "@testsetup module Local\nend\n@testitem \"items\" setup=[Shared, Local, Other] begin\nend\n")
+        plain = execution_touch(joinpath(package, "test", "plain_test.jl"), "@testitem \"plain\" begin\nend\n")
+        inventory = discover(root)
+        sweep = JETSweep._Sweep(inventory, root, SweepOptions(), JETSweep.source_syntax(inventory),
+                                Dict{String,JETSweep.Unit}(), Dict{String,Vector{String}}(),
+                                Dict{Tuple{String,Vector{Symbol}},Vector{String}}())
+        context = JETSweep.Context(package, package, true, Dict{String,String}())
+        unit(entry) = JETSweep.Unit("test-unit", :test, entry, context, [entry], "", "", JETSweep.Overrides(), String[])
+        # Setups the unit defines itself need no file; nor do those of no test item.
+        setups = JETSweep._setup_files(unit(items), sweep)
+        @test setups == [shared, other]
+        @test isempty(JETSweep._setup_files(unit(plain), sweep)) && isempty(JETSweep._setup_files(unit(shared), sweep))
+        # They come before the entry, and their statements are concretized as the entry's are.
+        @test endswith(JETSweep._generated_entry(unit(items), String[], inventory, setups),
+                       "include($(repr(shared)))\ninclude($(repr(other)))\ninclude($(repr(items)))\n")
+        output = mktempdir()
+        config = JETSweep._write_jetls_config(unit(items), output, sweep, String[], String[], setups)
+        data = TOML.parsefile(joinpath(config, ".JETLSConfig.toml"))
+        @test ("const ROOT = joinpath(@__DIR__, \"fixtures\")", "Pkg/test/shared_testsetup.jl") in execution_patterns(data)
     end
 end

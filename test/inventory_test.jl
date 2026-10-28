@@ -75,9 +75,9 @@ const DISCOVERY_DATES = "ade2ca70-3891-5945-98fb-dc099432e06a"
 
 const DISCOVERY_TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
-export LibGit2, TOML, UUIDs, discovery_write, discovery_toml, discovery_package, discovery_git,
-    discovery_relative, discovery_files, discovery_dict, discovery_placement, discovery_reasons, discovery_project_at,
-    discovery_snapshot, DISCOVERY_DATES, DISCOVERY_TOML, uuid4, UUID
+export DISCOVERY_DATES, DISCOVERY_TOML, LibGit2, TOML, UUID, UUIDs, discovery_dict, discovery_files, discovery_git,
+    discovery_package, discovery_placement, discovery_project_at, discovery_reasons, discovery_relative,
+    discovery_snapshot, discovery_toml, discovery_write, uuid4
 end
 
 @testitem "Recursive inventory, source kinds and ownership" setup=[Discovery] begin

@@ -25,9 +25,13 @@ struct Syntax
     bindings::Dict{Symbol,String}
     "The modules it defines, by name."
     modules::Vector{String}
+    "The ReTestItems test setups it defines, by name."
+    setups::Vector{String}
+    "The test setups its ReTestItems test items name."
+    uses::Vector{String}
 end
 Syntax(includes::Vector{Include}, notes::Vector{String}, imports::Vector{String}=String[]) =
-    Syntax(includes, notes, imports, Dict{Symbol,String}(), String[])
+    Syntax(includes, notes, imports, Dict{Symbol,String}(), String[], String[], String[])
 
 _name(ex::Symbol) = String(ex)
 _name(ex::GlobalRef) = String(ex.name)
@@ -41,6 +45,18 @@ _signature(ex) = ex isa Expr && (ex.head === :call ||
     (ex.head in (:where, :(::)) && _signature(first(ex.args))))
 _method(ex) = ex isa Expr &&
     (ex.head in (:function, :macro, :->) || (ex.head === :(=) && _signature(first(ex.args))))
+"""
+The ReTestItems macro `ex` calls, `:testitem` or `:testsetup`, if it has the form ReTestItems
+accepts: `@testitem "name" options... begin ... end` or `@testsetup module Name ... end`.
+"""
+function _retest_macro(ex)
+    name = _macro_name(ex)
+    name == "@testitem" && length(ex.args) >= 4 && ex.args[3] isa String && Meta.isexpr(last(ex.args), :block) &&
+        return :testitem
+    name == "@testsetup" && length(ex.args) == 3 && Meta.isexpr(last(ex.args), :module) &&
+        last(ex.args).args[2] isa Symbol && return :testsetup
+    return nothing
+end
 "`include(path)`, `include(mapexpr, path)`, `Base.include(mod, path)` or `Base.include(mapexpr, mod, path)`."
 _is_include(ex) = ex isa Expr && ex.head === :call && _name(first(ex.args)) == "include" &&
     2 <= length(ex.args) <= 4
@@ -131,6 +147,8 @@ mutable struct _SourceFacts
     const notes::Vector{String}
     const imports::Vector{String}
     const modules::Vector{String}
+    const setups::Vector{String}
+    const uses::Vector{String}
     line::Int
 end
 
@@ -138,7 +156,7 @@ end
 function _source_facts!(facts::_SourceFacts, ex, bindings::Dict{Symbol,String}, followed::Bool, depth::Int=0)
     ex isa LineNumberNode && (facts.line = ex.line; return)
     ex isa Expr || return
-    (; file, packages, exports, includes, notes, imports, modules) = facts
+    (; file, packages, exports, includes, notes, imports, modules, setups, uses) = facts
     head = ex.head
     if head in (:error, :incomplete)
         push!(notes, "$file:$(facts.line): cannot be parsed")
@@ -173,6 +191,16 @@ function _source_facts!(facts::_SourceFacts, ex, bindings::Dict{Symbol,String}, 
         ex.args[2] isa Symbol && push!(modules, String(ex.args[2]))
         _source_facts!(facts, last(ex.args), Dict{Symbol,String}(), followed, depth + 1)
         return
+    elseif _retest_macro(ex) === :testsetup
+        push!(setups, String(last(ex.args).args[2]))
+    elseif _retest_macro(ex) === :testitem
+        # A test item runs as a module of its own, which imports the setups it names.
+        for option in ex.args[4:end-1]
+            Meta.isexpr(option, :(=), 2) && first(option.args) === :setup && Meta.isexpr(last(option.args), :vect) &&
+                append!(uses, (String(name) for name in last(option.args).args if name isa Symbol))
+        end
+        _source_facts!(facts, last(ex.args), Dict{Symbol,String}(), followed, depth + 1)
+        return
     elseif head === :(=) || head in _UPDATES
         _rebind!(bindings, ex, file, packages)
     end
@@ -197,15 +225,17 @@ constants they define, which code after including them can use.
 """
 function parse_source(file::String, packages::Dict{String,Project}=Dict{String,Project}();
                       exports::Dict{String,Dict{Symbol,String}}=Dict{String,Dict{Symbol,String}}())
-    includes, notes, imports, modules = Include[], String[], String[], String[]
+    includes, notes, imports, modules, setups, uses = Include[], String[], String[], String[], String[], String[]
     tree = try
         Meta.parseall(read(file, String); filename=file)
     catch err
         return Syntax(includes, ["$file: cannot be read: $(sprint(showerror, err))"])
     end
     top = Dict{Symbol,String}()
-    _source_facts!(_SourceFacts(file, packages, exports, includes, notes, imports, modules, 1), tree, top, true)
-    return Syntax(unique!(includes), unique!(notes), unique!(imports), top, unique!(modules))
+    _source_facts!(_SourceFacts(file, packages, exports, includes, notes, imports, modules, setups, uses, 1), tree, top,
+                   true)
+    return Syntax(unique!(includes), unique!(notes), unique!(imports), top, unique!(modules), unique!(setups),
+                  unique!(uses))
 end
 
 # Top-level statements
@@ -238,6 +268,8 @@ function _flatten!(statements::Vector{Tuple{JS.SyntaxNode,Any}}, node::JS.Syntax
         foreach(child -> _flatten!(statements, child; modules, blocks), _children(node))
     elseif modules && kind == JS.K"module"
         foreach(child -> _flatten!(statements, child; modules, blocks), _children(last(_children(node))))
+    elseif modules && (code = _retest_statements(node)) !== nothing
+        foreach(child -> _flatten!(statements, child; modules, blocks), code)
     elseif kind != JS.K"error"
         ex = try
             Expr(node)
@@ -248,6 +280,26 @@ function _flatten!(statements::Vector{Tuple{JS.SyntaxNode,Any}}, node::JS.Syntax
     end
     return statements
 end
+
+"""
+The statements of the ReTestItems code `node` holds, a test setup's module or a test item's body,
+if `node` is a call of `@testsetup` or `@testitem` that `_retest_macro` accepts.
+"""
+function _retest_statements(node::JS.SyntaxNode)
+    children = _children(node)
+    name = _macro_identifier(node)
+    if name === :testsetup && length(children) == 2 && JS.kind(last(children)) == JS.K"module"
+        return _children(last(_children(last(children))))
+    elseif name === :testitem && length(children) >= 3 && JS.kind(children[2]) == JS.K"string" &&
+           all(part -> JS.kind(part) == JS.K"String", _children(children[2])) && JS.kind(last(children)) == JS.K"block"
+        return _children(last(children))
+    end
+    return nothing
+end
+
+"Whether `node` is a statement of a test item that `_retest_statements` accepts."
+_item_statement(node::JS.SyntaxNode) = (body = node.parent) !== nothing && (item = body.parent) !== nothing &&
+    _macro_identifier(item) === :testitem && _retest_statements(item) !== nothing
 
 _source_text(node::JS.SyntaxNode, text::String) = String(codeunits(text)[JS.byte_range(node)])
 
@@ -435,10 +487,11 @@ function _pure(ex, scope::_Scope)
         length(ex.args) == 2 || return false
         base, field = ex.args
         # Reading a global of a known module is pure too, as in `Sys.KERNEL` or `Package.VERSION`;
-        # globals of modules the analyzed code defines may be left unevaluated.
+        # globals of modules the analyzed code defines may be left unevaluated, those of `Main` too.
         if field isa QuoteNode
             base in (:Base, :Core, :Sys, :Meta) && !(base in scope.shadowed) &&
                 return _pure_global(field.value, getglobal(Base, base))
+            base === :Main && !(base in scope.shadowed) && return _pure(field.value, scope)
             return _pure(base, scope)
         end
         # `f.(x)` broadcasts `f`
@@ -487,16 +540,21 @@ function _pure_generator(ex::Expr, scope::_Scope)
     return _pure(body, inner) && (condition === nothing || _pure(condition, inner))
 end
 
-"Names a top-level statement binds globally: assignments outside local scopes, definitions and imports."
-function _binds!(names::Set{Symbol}, ex)
+"""
+Names a top-level statement binds globally: assignments outside local scopes, definitions and
+imports, and with `soft`, as in soft scope, the assignments of its loops and `try` blocks too.
+"""
+function _binds!(names::Set{Symbol}, ex; soft::Bool=false)
     ex isa Expr || return names
     assignment = _assignment(ex)
     if assignment !== nothing
         union!(names, first(assignment))
     elseif ex.head in _UPDATES
         union!(names, _assignees(first(ex.args)))
-    elseif ex.head in (:block, :toplevel, :if, :elseif, :&&, :||)
-        foreach(arg -> _binds!(names, arg), ex.args)
+    elseif ex.head in (:block, :toplevel, :if, :elseif, :&&, :||) || (soft && ex.head === :try)
+        foreach(arg -> _binds!(names, arg; soft), ex.args)
+    elseif soft && ex.head in (:for, :while)
+        _binds!(names, last(ex.args); soft)
     elseif ex.head === :macrocall
         union!(names, _bound_names(ex))
         _macro_name(ex) == "@static" && foreach(arg -> _binds!(names, arg), ex.args)
@@ -660,7 +718,12 @@ end
 "Whether JET can analyze expression `ex` in a closure: one of calls and control flow, binding no names."
 _thunk_safe(ex) = !(ex isa Expr) || ex.head in (:quote, :inert) || _anonymous(ex) ||
     (ex.head === :do && _thunk_safe(first(ex.args)) && _closure(last(ex.args))) ||
+    (ex.head === :let && length(ex.args) == 2 && all(_thunk_safe_binding, _let_bindings(ex)) && _thunk_safe(last(ex.args))) ||
     (ex.head in _OUTLINABLE && all(_thunk_safe, ex.args))
+_let_bindings(ex) = Meta.isexpr(first(ex.args), :block) ? first(ex.args).args : Any[first(ex.args)]
+"A `let` binding binds a name of the block's own, to a value JET can analyze in a closure."
+_thunk_safe_binding(b) = b isa Union{Symbol,LineNumberNode} ||
+    (Meta.isexpr(b, :(=), 2) && first(b.args) isa Symbol && _thunk_safe(last(b.args)))
 
 "Whether `ex` defines an anonymous function, or a generator whose ranges JET can analyze in a closure."
 _anonymous(ex) = _closure(ex) || ex isa Expr && (
@@ -797,13 +860,16 @@ function _may_bind!(names::Set{Symbol}, ex)
     return names
 end
 
+"Macros that wrap their code in a closure, as `@async` does in a task."
+const _CLOSURE_MACROS = Set(["@async", "@task", "@spawn", "@threads"])
+
 """
 Whether `ex` defines a function, anonymous or local, in a branch, or with `nested` in a loop
 too.
 """
 function _controlled_function(ex, controlled::Bool=false; nested::Bool=false)
     ex isa Expr && !(ex.head in (:quote, :inert)) || return false
-    (_method(ex) || ex.head === :generator) && return controlled
+    (_method(ex) || ex.head === :generator || _macro_name(ex) in _CLOSURE_MACROS) && return controlled
     ex.head in (:if, :elseif, :&&, :||) &&
         return _controlled_function(first(ex.args), controlled; nested) ||
             any(arg -> _controlled_function(arg, true; nested), ex.args[2:end])
@@ -995,6 +1061,8 @@ function _visit_reads!(reads::_Reads, ex, controls::Vector{Any}, branches::Vecto
     elseif head === :macrocall
         name = _macro_name(ex)
         name in _TEST_MACROS && return     # JETLS outlines their closures into thunks
+        # A closure's body runs where the closure is called, but JETLS evaluates the conditions it is defined under.
+        name in _CLOSURE_MACROS && return (forced || _needs!(reads, branches, Any[]))
         # `@eval [module] code` evaluates its module, and the code at top level.
         name == "@eval" &&
             return (foreach(arg -> _code_reads!(reads.direct, arg), ex.args[2:end]); _needs!(reads, Any[], controls))
@@ -1095,11 +1163,13 @@ end
 Indices of the statements that analysis may evaluate. Run-dependent statements are evaluated
 only where needed, or where JETLS evaluates part of them anyway; impure assignments only
 where `include` and `eval` calls need them. A need selects the binding of a name that
-reaches the statement needing it. `excluded` statements are not evaluated.
+reaches the statement needing it. `excluded` statements are not evaluated, and `soft` ones
+run in soft scope.
 """
-function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set{Symbol}=Set{Symbol}())
+function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set{Symbol}=Set{Symbol}(),
+                      soft::Set{Int}=Set{Int}())
     shadowed = Set{Symbol}()
-    foreach(ex -> (_binds!(shadowed, ex); _globals!(shadowed, ex)), expressions)
+    foreach(((i, ex),) -> (_binds!(shadowed, ex; soft=i in soft); _globals!(shadowed, ex)), pairs(expressions))
     scope = _Scope(setdiff(modules, shadowed), Set{Symbol}(), shadowed)
     variable = setdiff(union(_PROCESS_NAMES, _RUN_DEPENDENT), shadowed)
     bound = Set{Symbol}()
@@ -1111,7 +1181,7 @@ function _concretized(expressions::Vector{Any}, excluded::Set{Int}, modules::Set
     need!(names, i, forced) = foreach(name -> push!(needs, (name, i, forced)), names)
     bindings = Dict{Symbol,Vector{Int}}()
     for (i, ex) in pairs(expressions)
-        binds = _binds!(Set{Symbol}(), ex)
+        binds = _binds!(Set{Symbol}(), ex; soft=i in soft)
         assignment = _assignment(ex)
         reads = _evaluated_symbols!(Set{Symbol}(), assignment === nothing ? ex : last(assignment))
         known = i in excluded ? nothing : _evaluable(ex, scope, bound)
@@ -1207,9 +1277,11 @@ imports, such as a test driver's prelude.
 function concretization_patterns(file::String; modules::Set{Symbol}=Set{Symbol}())
     text, statements = _statements(file; modules=true, blocks=false)
     expressions = Any[last(statement) for statement in statements]
+    # ReTestItems runs a test item's statements in soft scope.
+    soft = Set(i for (i, (node, _)) in pairs(statements) if _item_statement(node))
     excluded = Set{Int}()
     while true
-        selected = _concretized(expressions, excluded, modules)
+        selected = _concretized(expressions, excluded, modules, soft)
         # A pattern selects every statement of its file that it matches.
         conflicts = filter(i -> any(j -> !(j in selected) && _may_match(expressions[i], expressions[j]),
                                     eachindex(expressions)), selected)
@@ -1229,7 +1301,9 @@ end
 # depends on it. Statements keep their original source text, with `@__DIR__`, `@__FILE__`
 # and relative include paths pinned to their original file. Pure assignments and
 # conditionals are wrapped in `@eval`, which analysis always evaluates, since concretization
-# patterns cannot apply to the generated file.
+# patterns cannot apply to the generated file. A driver that runs ReTestItems sets up the
+# `Main` of its workers with the constants its `worker_init_expr` defines, so they count as
+# its assignments.
 
 function _macro_identifier(node::JS.SyntaxNode)
     JS.kind(node) == JS.K"macrocall" || return nothing
@@ -1340,6 +1414,13 @@ function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text
                 _driver_statements!(statements, path, next, seen, packages) && return true
         end
         _is_include(ex) && continue
+        for init in _worker_init(ex)
+            assignment = _assignment(init)
+            assignment === nothing && continue
+            # A worker's constant of the driver's value of the same name is the driver's.
+            first(assignment) == [last(assignment)] && continue
+            push!(statements, _DriverStatement(file, JS.source_line(node), init, first(assignment), string(init)))
+        end
         assignment = _assignment(ex)
         if assignment !== nothing
             names, value = assignment
@@ -1359,6 +1440,30 @@ function _driver_nodes!(statements::Vector{_DriverStatement}, file::String, text
     end
     return false
 end
+
+"""
+The statements ReTestItems runs in the `Main` of each worker before its test items: those of
+the `worker_init_expr` that `ex`, a call of `runtests`, passes, with what it interpolates
+evaluated there instead of in the driver.
+"""
+function _worker_init(ex)
+    ex isa Expr && !(ex.head in (:quote, :inert)) && !_method(ex) || return Any[]
+    if ex.head === :call && _name(first(ex.args)) == "runtests"
+        for arg in ex.args[2:end], option in (Meta.isexpr(arg, :parameters) ? arg.args : Any[arg])
+            Meta.isexpr(option, :kw, 2) && first(option.args) === :worker_init_expr &&
+                Meta.isexpr(last(option.args), :quote, 1) || continue
+            code = _unquoted(only(last(option.args).args))
+            return Meta.isexpr(code, :block) ? filter(statement -> !(statement isa LineNumberNode), code.args) : Any[code]
+        end
+    end
+    # As in `isempty(paths) || runtests(paths...; worker_init_expr=...)`.
+    for arg in ex.args
+        init = _worker_init(arg)
+        isempty(init) || return init
+    end
+    return Any[]
+end
+_unquoted(ex) = ex isa Expr ? (ex.head === :$ ? only(ex.args) : Expr(ex.head, map(_unquoted, ex.args)...)) : ex
 
 """
 The statements of the branch of the top-level conditional `ex`, parsed as `node`, that holds an
@@ -1404,18 +1509,19 @@ prelude_modules(drivers::Vector{String}, target::String; packages::Dict{String,P
     union(Set{Symbol}(), (_modules(statement.ex) for statement in _drivers_statements(drivers, target, packages))...)
 
 """
-    prelude(drivers, target; packages) -> String
+    prelude(drivers, target; packages, setups) -> String
 
 Source text recreating the context that `drivers`, outermost first, establish for `target`,
 which the last of them includes at run time: imports, definitions and the global
-assignments, modules and conditional definitions `target` transitively refers to, also from
-files the drivers include statically. `packages` are those whose `pkgdir` and `pathof` the
-files may name in include paths, by name.
+assignments, modules and conditional definitions `target` and the files `setups`, included
+before it, transitively refer to, also from files the drivers include statically. `packages`
+are those whose `pkgdir` and `pathof` the files may name in include paths, by name.
 """
-function prelude(drivers::Vector{String}, target::String; packages::Dict{String,Project}=Dict{String,Project}())
+function prelude(drivers::Vector{String}, target::String; packages::Dict{String,Project}=Dict{String,Project}(),
+                 setups::Vector{String}=String[])
     statements = _drivers_statements(drivers, target, packages)
     needed = Set{Symbol}()
-    pending, visited = [target], Set{String}()
+    pending, visited = [target; setups], Set{String}()
     while !isempty(pending)
         file = pop!(pending)
         (file in visited || !isfile(file)) && continue
