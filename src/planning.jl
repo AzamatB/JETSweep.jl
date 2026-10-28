@@ -269,9 +269,9 @@ function _host(package::Project, projects::Dict{String,Project})
     data = TOML.tryparsefile(package.file)
     data isa AbstractDict || return package.dir
     deps, own = get(data, "deps", Dict()), get(data, "sources", Dict())
-    directory = package.dir
-    while dirname(directory) != directory
-        directory = dirname(directory)
+    parent = package.dir
+    while dirname(parent) != parent
+        directory = parent = dirname(parent)
         haskey(projects, directory) || continue
         host = TOML.tryparsefile(projects[directory].file)
         host isa AbstractDict || continue

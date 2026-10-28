@@ -682,11 +682,11 @@ end
         root = realpath(directory)
         package = planning_package(root, "Pkg", "Pkg"; extras=Dict("Test" => PLANNING_TEST), targets=Dict("test" => ["Test"]))
         entry = planning_file(package, "src/Pkg.jl", "module Pkg\ninclude(\"sub/part.jl\")\nend\n")
-        part = planning_file(package, "src/sub/part.jl")
+        planning_file(package, "src/sub/part.jl")
         driver = planning_file(package, "test/runtests.jl", "using Test, Pkg\nfor file in ARGS\n    include(file)\nend\n")
         case = planning_file(package, "test/cases/case.jl", "@test true\n")
         environment = planning_project(root, "Pkg/validation")
-        script = planning_file(environment, "corpus/build.jl")
+        planning_file(environment, "corpus/build.jl")
         # A test item that includes a script of its package, outside the test directory, gets what it imports.
         sibling = planning_package(root, "Sibling", "Sibling")
         planning_file(sibling, "src/Sibling.jl", "module Sibling\nend\n")

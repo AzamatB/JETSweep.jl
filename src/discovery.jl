@@ -335,7 +335,7 @@ function discover(root::AbstractString; exclude::Vector{String}=String[], config
     directory = root
     while directory != homedir() && dirname(directory) != directory
         directory = dirname(directory)
-        found = findfirst(name -> isfile(joinpath(directory, name)), _PROJECT_FILES)
+        found = findfirst(isfile, joinpath.(directory, _PROJECT_FILES))
         found === nothing || push!(project_files[1], joinpath(directory, _PROJECT_FILES[found]))
     end
     projects = [_read_project(file, issues) for file in sort!(project_files[1])]

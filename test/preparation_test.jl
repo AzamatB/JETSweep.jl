@@ -961,7 +961,7 @@ end
           "newest release, 3.2.10: the compat bounds or locked versions of this environment hold it back."
     # Offline, resolution considers the installed releases alone.
     @test occursin("below its newest installed release, 3.2.10:",
-                   JETSweep._held_back("SnoopCompile", v"1.0.2", v"3.2.10"; installed=true))
+                   JETSweep._held_back("SnoopCompile", v"1.0.2", v"3.2.10"; installed=true)::String)
     @test JETSweep._held_back("JET", v"0.12.3", v"0.13.1") isa String
     @test JETSweep._held_back("SnoopCompile", v"3.1.0", v"3.2.10") === nothing
     @test JETSweep._held_back("SnoopCompile", v"3.2.10", v"3.2.10") === nothing
