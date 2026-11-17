@@ -2,7 +2,7 @@
 
 julia_version = "1.13.3"
 manifest_format = "2.1"
-project_hash = "aecf9f28b4335102621bb1405620f5d4c56883e9"
+project_hash = "19ad6f0eb817017bb8d44497e7a3b754412e1c12"
 
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
@@ -17,8 +17,8 @@ uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 version = "1.11.0"
 
 [[deps.BaseSyntax]]
-git-tree-sha1 = "c79baa5cb067418c2bf850c8fdd5d6f85fb9696f"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "ca84f832a19348cb51140e72d3f7df3c8aae1442"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/BaseSyntax"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "bfd32023-066c-5f76-8dc3-939c60a69aeb"
@@ -37,7 +37,7 @@ version = "3.0.2"
 [[deps.CodeTracking]]
 deps = ["InteractiveUtils", "REPL", "UUIDs"]
 git-tree-sha1 = "6da9d637da24c57280a0e97800a9d16492b68720"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/CodeTracking"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "29b28462-3302-58bb-873a-3f58224955cc"
@@ -49,8 +49,8 @@ registries = "General"
 uuid = "807dbc54-b67e-4c79-8afb-eafe4df6f2e1"
 version = "0.1.1"
 [[deps.Compiler]]
-git-tree-sha1 = "3083279895d7894c8c891ad1e47e4dc7b2d9d92c"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "ed73cee6ce9f9bc1745cbeabe7a18716557cea06"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/Compiler"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "8499cccf-07fb-5365-ac3a-39ae87615c05"
@@ -77,7 +77,7 @@ version = "1.11.0"
 
 [[deps.Glob]]
 git-tree-sha1 = "8c2d2434d5abb5b44e466091f1385be669a3204d"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/Glob"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "a6ef924f-2b2c-5d99-b812-8edbc1441234"
@@ -89,12 +89,12 @@ uuid = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
 version = "1.11.0"
 
 [[deps.JET]]
-git-tree-sha1 = "f69bdb6ab7c54eafefbedcfe74f39ae387a8075c"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "a5504fef78631ec990f7ce29f2190b416ca66d5f"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/JET"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "d18a8d2a-b6cf-5b35-ae77-db04d04d451d"
-version = "0.13.1"
+version = "0.13.2"
 
     [deps.JET.deps]
     CodeTracking = "29b28462-3302-58bb-873a-3f58224955cc"
@@ -110,11 +110,11 @@ version = "0.13.1"
     Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [[deps.JETLS]]
-git-tree-sha1 = "09a2fd8d558ffa66b86641c322a3c0c8f99e23ea"
-repo-rev = "c24f9a1f40fbe2873919b7af7da22af594e3566d"
+git-tree-sha1 = "664fb45493e903dbff01d219580b18136194a230"
+repo-rev = "56a6f4af733a23179f93c8d4c0360ac7ccaea519"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "a3b70258-0602-4ee2-b5a6-54c2470400db"
-version = "2026.10.26"
+version = "2026.11.16"
 
     [deps.JETLS.deps]
     BaseSyntax = "bfd32023-066c-5f76-8dc3-939c60a69aeb"
@@ -138,8 +138,8 @@ version = "2026.10.26"
     TestRunner = "65a77010-ae58-5cc9-8243-71cff1cf0f92"
 
 [[deps.JETLSCore]]
-git-tree-sha1 = "83d14e3018a9eb97a07ba30f33e2a2e10368acc8"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "d3b76be54de8274f8d6e0706f8fd0df405e5252d"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/JETLSCore"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "8d6afe4c-923b-5912-b63d-b990009c9e74"
@@ -169,34 +169,34 @@ version = "0.1.0"
 deps = ["JETLS", "LibGit2", "Pkg", "Revise", "SHA", "TOML"]
 path = "."
 uuid = "18e08a99-dc2d-4e8e-aade-23241d8adbd6"
-version = "0.5.3"
+version = "0.7.0"
 
 [[deps.JSON3]]
 deps = ["Dates", "Mmap", "Parsers", "PrecompileTools", "StructTypes", "UUIDs"]
-git-tree-sha1 = "ec2a44324038bf03a83261b39f476005eec385e0"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "0ddf2ef471d4cce344c7d10e35aefb652adfa908"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/JSON3"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "00ac8d46-747e-5902-8e12-fdfc767369c7"
-version = "1.14.3"
+version = "1.14.4"
 
 [[deps.JuliaInterpreter]]
-git-tree-sha1 = "50b25ca89ff3eadb73ef76b3c32d69e10417ae84"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "e8aa9a14f33e4e9e20a2844afd1994f8c361a1ba"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/JuliaInterpreter"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "87c368a4-672f-5de1-91ff-3cc7fc652fab"
-version = "0.12.1"
+version = "0.12.3"
 
     [deps.JuliaInterpreter.deps]
     CodeTracking = "29b28462-3302-58bb-873a-3f58224955cc"
     InteractiveUtils = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
     Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 [[deps.JuliaInterpreter]]
-git-tree-sha1 = "c35411a62b74a0288934ffcfad4fa8dd09b72630"
+git-tree-sha1 = "28cb2c1b2e8fe3a9aa50ac75f2eead535bc89f05"
 registries = "General"
 uuid = "aa1ae85d-cabe-5617-a682-6adf51b2e16a"
-version = "0.12.2"
+version = "0.12.3"
 
     [deps.JuliaInterpreter.deps]
     CodeTracking = "da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"
@@ -205,8 +205,8 @@ version = "0.12.2"
 
 [[deps.JuliaLowering]]
 deps = ["BaseSyntax", "JuliaSyntax"]
-git-tree-sha1 = "287c683d9dccade8bd400f52debfa31ec03dab88"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "1520792739b63308228b82bb06b491f115d22450"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/JuliaLowering"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "7ba39d99-9390-5ff4-b3a7-c9cea37c1861"
@@ -214,8 +214,8 @@ version = "1.0.0-DEV"
 
 [[deps.JuliaSyntax]]
 deps = ["BaseSyntax"]
-git-tree-sha1 = "c43787f30443cc8830b8e2481cb3db6ca3dbf7d9"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "48e7563b9d0a3b8dfdb1c84210629e571efb06ce"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/JuliaSyntax"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "02a177f8-2b16-5240-a0b4-02ed40703cda"
@@ -229,7 +229,7 @@ version = "1.12.0"
 [[deps.LSP]]
 deps = ["JSON3", "PrecompileTools", "StructTypes"]
 git-tree-sha1 = "95a473e4527c6eb56cf9809cdc19f7aa952271d7"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/LSP"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "ba3d5f2d-0240-5843-8ab5-e1c74856c201"
@@ -269,22 +269,22 @@ uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 version = "1.11.0"
 
 [[deps.LoweredCodeUtils]]
-git-tree-sha1 = "f0017e64c155b65d67ff41ae14d569cc9d014d07"
+git-tree-sha1 = "b3383cd2b17d8ad4ab7becf07cea43ad692c58bf"
 registries = "General"
 uuid = "6f1432cf-f94c-5a45-995e-cdbf5db27b0b"
-version = "3.10.1"
+version = "3.10.2"
 
     [deps.LoweredCodeUtils.deps]
     CodeTracking = "da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"
     Compiler = "807dbc54-b67e-4c79-8afb-eafe4df6f2e1"
     JuliaInterpreter = "aa1ae85d-cabe-5617-a682-6adf51b2e16a"
 [[deps.LoweredCodeUtils]]
-git-tree-sha1 = "fb58443c7062e311f611ac1537c0133421571d46"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "e322919ed609ad57a00a30b73f2cd13cf288d423"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/LoweredCodeUtils"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "01ede001-ea10-5720-9c31-2e53839707a9"
-version = "3.10.1"
+version = "3.10.2"
 
     [deps.LoweredCodeUtils.deps]
     CodeTracking = "29b28462-3302-58bb-873a-3f58224955cc"
@@ -293,7 +293,7 @@ version = "3.10.1"
 
 [[deps.MacroTools]]
 git-tree-sha1 = "4945d0d12e42a2bdae8087ae1dbd205a1257eea0"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/MacroTools"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "73a1cfca-4736-53e3-b924-35a7291c571e"
@@ -334,12 +334,12 @@ version = "10.47.0+0"
 
 [[deps.Parsers]]
 deps = ["Dates", "PrecompileTools", "UUIDs"]
-git-tree-sha1 = "185f581785ea7ccad3f2d436c4ebd38a9861803b"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "475afbc2c950475f3972e4f2e17df5f0531d8240"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/Parsers"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "2bf889ff-109e-5fa9-9ba3-339ee07cbe67"
-version = "2.8.8"
+version = "2.8.11"
 
 [[deps.Pkg]]
 deps = ["Artifacts", "Dates", "Downloads", "FileWatching", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "Random", "SHA", "TOML", "Tar", "UUIDs", "Zstd_jll", "p7zip_jll"]
@@ -351,12 +351,12 @@ weakdeps = ["REPL"]
     REPLExt = "REPL"
 
 [[deps.PrecompileTools]]
-git-tree-sha1 = "58143783e46599ada99a6f7a4f67dcf0853935ea"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "5c6bcf8f92015385deffc3e05252448f94b443e6"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/PrecompileTools"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "32931bc0-5014-5544-84d5-53636ff9f6c5"
-version = "1.3.4"
+version = "1.4.0"
 
     [deps.PrecompileTools.deps]
     Preferences = "cc588e5a-7be0-5224-8a6a-549b21958db9"
@@ -364,7 +364,7 @@ version = "1.3.4"
 [[deps.Preferences]]
 deps = ["TOML"]
 git-tree-sha1 = "c82bb259da5f89e9a9089b07b3ccfd142cee79e3"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/Preferences"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "cc588e5a-7be0-5224-8a6a-549b21958db9"
@@ -436,7 +436,7 @@ version = "1.11.0"
 [[deps.StructTypes]]
 deps = ["Dates", "UUIDs"]
 git-tree-sha1 = "8e724244965fef81bad850a64f242ecd979849a1"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/StructTypes"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "66bcceda-d870-5865-93dd-65803322e79e"
@@ -454,7 +454,7 @@ version = "1.0.3"
 [[deps.TOMLSource]]
 deps = ["Dates", "PrecompileTools", "TOML"]
 git-tree-sha1 = "709eba1987eec993f40049ee099d8a9df1f7ca7f"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/TOMLSource"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "7718a0b2-46c0-5f25-a46d-52644d8fb185"
@@ -471,8 +471,8 @@ uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 version = "1.11.0"
 
 [[deps.TestRunner]]
-git-tree-sha1 = "9b884662267b95fe6864426ab642d720cb213a77"
-repo-rev = "c7630c60e95c55b2b29a69200e6295d3988909ae"
+git-tree-sha1 = "7d66c7c4818af9f01316bfc7e6555ee587cfad55"
+repo-rev = "fba7c8b0332bc19aa2046502c40a21986b1560eb"
 repo-subdir = "vendor/TestRunner"
 repo-url = "https://github.com/aviatesk/JETLS.jl"
 uuid = "65a77010-ae58-5cc9-8243-71cff1cf0f92"
