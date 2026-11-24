@@ -12,11 +12,11 @@ SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
 [sources]
-JETLS = {url = "https://github.com/aviatesk/JETLS.jl", rev = "56a6f4af733a23179f93c8d4c0360ac7ccaea519"}
+JETLS = {rev = "bfa71ef3b9636cc65256fe6958f5db5ca46efefe", url = "https://github.com/aviatesk/JETLS.jl"}
 
 [compat]
 Dates = "1.11.0"
-JETLS = "=2026.11.16"
+JETLS = "=2026.11.23"
 LibGit2 = "1.11.0"
 Pkg = "1.13.0"
 ReTestItems = "1.35.3"
