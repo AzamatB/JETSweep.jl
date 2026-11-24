@@ -29,21 +29,32 @@ const WORKER_CHECKS = :(let checked = Main.MAIN_DISPATCH_CHECKUP == "checked"
 end)
 const SELECTED = isempty(ARGS) ? filter(endswith("_test.jl"), readdir(@__DIR__)) : ARGS
 
-# Workers load the analyzer compiled with Julia's default code generation flags and JETLS's development mode, as
-# prepared environments have it. Precompile one such environment while the first items run: the sweeps would
+# Workers run with Julia's default code generation flags, whatever flags this process has, so they need package images
+# of their own, which a fresh depot does not have. Analysis workers load the analyzer with JETLS's development mode, as
+# prepared environments have it: precompile one such environment while the first items run. The sweeps would
 # otherwise compile it once per environment they prepare at the same time, and the preparations in depots of their
-# own again. The items that start such workers (setup = [Analyzer]) wait until it has finished, when this process
-# makes the file ANALYZER_READY. A failed precompile costs only time: the sweeps then compile the analyzer
-# themselves.
+# own again. Preparation workers, and the workers some items start, load JETSweep itself from its own project: compile
+# its image for them too, and only its own. When a process loads a package that has no image, Julia precompiles all
+# the package's dependencies first, so without it the first such worker in each depot compiled JETLS, without the
+# development mode, for nothing that loads it: on a fresh 4-vCPU runner, the sweeps' first preparation and the Git
+# clone items' workers, in depots of their own, compiled JETLSCore four times, three of them at once, at 134 to 168 s
+# and 2.8 to 3.0 GiB each, and the sweeps' item ran out of time. The items that start such workers
+# (setup = [Analyzer]) wait until both have finished, when this process makes the file ANALYZER_READY. A failed
+# precompile costs only time: the workers then compile what they need themselves.
 const ANALYZER_READY = joinpath(mktempdir(), "analyzer-ready")
 if any(in(SELECTED), ("0_integration_test.jl", "preparation_test.jl"))
     let environment = JETSweep.prepare(JETSweep.Context("", "", false, Dict{String,String}()), mktempdir())
         JETSweep.ready(environment) || error("cannot prepare an analysis environment: ", environment.message)
         julia = joinpath(Sys.BINDIR, Base.julia_exename())
         command = `$julia --startup-file=no --project=$(environment.dir) -e 'using Pkg; Pkg.precompile()'`
-        process = run(addenv(command, "JULIA_LOAD_PATH" => "@:@stdlib"); wait=false)
+        analyzer = run(addenv(command, "JULIA_LOAD_PATH" => "@:@stdlib"); wait=false)
+        # JETSweep alone, in a process that `JETSweep.julia_command` starts, as its workers are.
+        script = joinpath(mktempdir(), "compile.jl")
+        write(script, "pkg = Base.identify_package(\"JETSweep\")\nBase.isprecompiled(pkg) || Base.compilecache(pkg)\n")
+        tool = run(JETSweep.julia_command(script, String[]; project=dirname(JETSweep.tool_project()), threads=1); wait=false)
         @async begin
-            success(process) || @warn "Precompiling the analyzer failed; the sweeps compile it themselves"
+            success(analyzer) || @warn "Precompiling the analyzer failed; the sweeps compile it themselves"
+            success(tool) || @warn "Precompiling JETSweep for its workers failed; they compile it themselves"
             touch(ANALYZER_READY)
         end
     end
@@ -54,8 +65,10 @@ end
 paths = isempty(ARGS) ? [@__DIR__] : [joinpath(@__DIR__, f) for f in ARGS]
 # (No full garbage collection after each item: these workers' heaps are large, and measured side by side, the runs
 # without it were faster.) The item timeout, 1200 s, is above the sweeps' own 900 s limit per unit, so a unit that
-# hangs is reported by its sweep, and leaves the sweeps' item room on CI's runner: it takes about 270 s on 8 vCPUs, and
-# 570 s on 4 vCPUs with 4 slots (the runner's memory allows 3).
+# hangs is reported by its sweep, and leaves the sweeps' item room on CI's runner. With CI's command and a fresh depot,
+# in a 4-vCPU, 16 GiB cgroup whose precompile step took 231 s (200 to 320 s on the hosted runners), the item took 617
+# to 669 s, of which 193 to 222 s waiting for the precompiles above, and 858 to 979 s before they included JETSweep's
+# image.
 ReTestItems.runtests(paths...; nworkers=NWORKERS, nworker_threads=1, retries=0, testitem_timeout=1200,
                      validate_paths=true, gc_between_testitems=false,
                      test_end_expr=Expr(:block, WRITE_COVERAGE, WORKER_CHECKS),
